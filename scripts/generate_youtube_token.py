@@ -65,12 +65,11 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"
 REDIRECT_PORT = 8976
 REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}"
 
-# Scopes needed for YouTube upload
-# youtube.upload = upload videos (narrower, easier to verify)
-# youtube = full YouTube management (broader, needed for metadata updates)
+# Scopes needed for YouTube upload + Drive storage
 SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube",
+    "https://www.googleapis.com/auth/drive.file",
 ]
 
 # Channel hints

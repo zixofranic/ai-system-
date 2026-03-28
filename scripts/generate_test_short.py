@@ -393,8 +393,9 @@ def generate_short(philosopher_name, topic, prompt_text, channel="wisdom"):
     config = PHILOSOPHER_CONFIG[philosopher_name]
     channel = config["channel"]  # Always use channel from config, not default
     output_dir = OUTPUT_DIRS[channel]
-    slug = philosopher_name.lower().replace(" ", "_")
-    prefix = f"test_{slug}_{datetime.now().strftime('%H%M')}"
+    first_name = philosopher_name.split()[0].lower()
+    date_str = datetime.now().strftime('%Y-%m-%d')
+    prefix = f"{date_str}_short_{first_name}"
 
     print(f"\n{'='*60}")
     print(f"  GENERATING: {philosopher_name} — {topic}")

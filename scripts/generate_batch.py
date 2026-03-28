@@ -240,8 +240,9 @@ def main():
         lora = PHILOSOPHER_LORA[philosopher]
         music_style = PHILOSOPHER_MUSIC[philosopher]
         art_prompt = PHILOSOPHER_ART_PROMPT[philosopher]
-        slug = philosopher.lower().replace(" ", "_")
-        prefix = f"batch_{slug}"
+        first_name = philosopher.split()[0].lower()
+        date_str = datetime.now().strftime('%Y-%m-%d')
+        prefix = f"{date_str}_short_{first_name}"
 
         print(f"\n[{i}/{len(BATCH)}] {philosopher}: {topic}")
 

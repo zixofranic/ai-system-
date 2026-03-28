@@ -385,8 +385,9 @@ def main():
     lora = PHILOSOPHER_LORA.get(philosopher, "stoic_classical_v1.safetensors")
     music_style = PHILOSOPHER_MUSIC.get(philosopher, "stoic_classical")
     voice_id = GIBRAN_VOICE if channel == "gibran" else WISDOM_VOICE
-    slug = philosopher.lower().replace(" ", "_")
-    prefix = f"story_{slug}_{datetime.now().strftime('%H%M')}"
+    first_name = philosopher.split()[0].lower()
+    date_str = datetime.now().strftime('%Y-%m-%d')
+    prefix = f"{date_str}_story_{first_name}"
 
     print(f"\n{'='*60}")
     print(f"  STORY VIDEO GENERATOR")
