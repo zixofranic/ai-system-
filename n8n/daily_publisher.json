@@ -1,0 +1,267 @@
+{
+  "name": "Daily Publisher",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      },
+      "id": "c3d4e5f6-0003-0003-0003-000000000001",
+      "name": "Cron - Daily 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://kwyqaewdvvdhodxieqrh.supabase.co/rest/v1/content_items",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "{{SUPABASE_SERVICE_KEY}}"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer {{SUPABASE_SERVICE_KEY}}"
+            }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "status",
+              "value": "eq.approved"
+            },
+            {
+              "name": "scheduled_at",
+              "value": "=lte.{{ $now.toISO() }}"
+            },
+            {
+              "name": "order",
+              "value": "scheduled_at.asc"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "c3d4e5f6-0003-0003-0003-000000000002",
+      "name": "GET Approved Content",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            {
+              "name": "run_date",
+              "value": "={{ $now.toISO() }}"
+            },
+            {
+              "name": "items_ready_to_publish",
+              "value": "={{ Array.isArray($json) ? $json.length : 0 }}"
+            },
+            {
+              "name": "items_detail",
+              "value": "={{ Array.isArray($json) ? $json.map(i => i.id + ':' + i.title).join(', ') : 'none' }}"
+            },
+            {
+              "name": "youtube_upload",
+              "value": "PENDING - not yet implemented"
+            },
+            {
+              "name": "note",
+              "value": "YouTube upload will be added in a future workflow version. Items above are ready to publish."
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "c3d4e5f6-0003-0003-0003-000000000003",
+      "name": "Log Publish Queue",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "has-items",
+              "leftValue": "={{ Array.isArray($node['GET Approved Content'].json) && $node['GET Approved Content'].json.length > 0 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c3d4e5f6-0003-0003-0003-000000000004",
+      "name": "Has Items to Publish?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "https://kwyqaewdvvdhodxieqrh.supabase.co/rest/v1/content_items",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "{{SUPABASE_SERVICE_KEY}}"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer {{SUPABASE_SERVICE_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=representation"
+            }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "status",
+              "value": "eq.approved"
+            },
+            {
+              "name": "scheduled_at",
+              "value": "lte.{{ $now.toISO() }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"status\": \"published\",\n  \"published_at\": \"{{ $now.toISO() }}\",\n  \"updated_at\": \"{{ $now.toISO() }}\"\n}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "c3d4e5f6-0003-0003-0003-000000000005",
+      "name": "Mark as Published",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 200]
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            {
+              "name": "status",
+              "value": "No items ready to publish today"
+            },
+            {
+              "name": "timestamp",
+              "value": "={{ $now.toISO() }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "c3d4e5f6-0003-0003-0003-000000000006",
+      "name": "Log No Items",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1120, 420]
+    }
+  ],
+  "connections": {
+    "Cron - Daily 09:00": {
+      "main": [
+        [
+          {
+            "node": "GET Approved Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GET Approved Content": {
+      "main": [
+        [
+          {
+            "node": "Log Publish Queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Publish Queue": {
+      "main": [
+        [
+          {
+            "node": "Has Items to Publish?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Items to Publish?": {
+      "main": [
+        [
+          {
+            "node": "Mark as Published",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log No Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["wisdom", "publisher", "content-pipeline"],
+  "triggerCount": 0,
+  "updatedAt": "2026-03-26T00:00:00.000Z",
+  "versionId": "1"
+}

@@ -1,0 +1,24 @@
+# ComfyUI (too large for git)
+ComfyUI/
+# Chatterbox TTS Server
+Chatterbox-TTS-Server/
+# kohya_ss
+kohya_ss/
+# Voice samples
+voice/
+# Music library
+music/
+# Python
+__pycache__/
+*.pyc
+# Env
+.env
+# OS
+Thumbs.db
+.DS_Store
+# Output files
+*.mp4
+*.mp3
+*.wav
+*.png
+*.jpg

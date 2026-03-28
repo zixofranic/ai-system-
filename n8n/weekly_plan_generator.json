@@ -1,0 +1,174 @@
+{
+  "name": "Weekly Plan Generator",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 22 * * 6"
+            }
+          ]
+        }
+      },
+      "id": "a1b2c3d4-0001-0001-0001-000000000001",
+      "name": "Cron - Saturday 22:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "command": "C:/Users/ziadf/miniconda3/envs/lora_train/python.exe C:/AI/wisdom/scripts/trend_scanner.py --push"
+      },
+      "id": "a1b2c3d4-0001-0001-0001-000000000002",
+      "name": "Run Trend Scanner",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "command": "C:/Users/ziadf/miniconda3/envs/lora_train/python.exe -c \"import sys; sys.path.insert(0, 'C:/AI/wisdom/scripts'); from ai_writer import generate_weekly_plan; generate_weekly_plan(push_to_supabase=True)\""
+      },
+      "id": "a1b2c3d4-0001-0001-0001-000000000003",
+      "name": "Generate Weekly Plan",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3000/api/machine/content",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "source",
+              "value": "weekly_plan_generator"
+            },
+            {
+              "name": "triggered_at",
+              "value": "={{ $now.toISO() }}"
+            },
+            {
+              "name": "trend_scanner_output",
+              "value": "={{ $node['Run Trend Scanner'].json.stdout }}"
+            },
+            {
+              "name": "plan_output",
+              "value": "={{ $node['Generate Weekly Plan'].json.stdout }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "a1b2c3d4-0001-0001-0001-000000000004",
+      "name": "POST to Dashboard API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            {
+              "name": "status",
+              "value": "Weekly plan generation complete"
+            },
+            {
+              "name": "timestamp",
+              "value": "={{ $now.toISO() }}"
+            },
+            {
+              "name": "trend_scanner_exit",
+              "value": "={{ $node['Run Trend Scanner'].json.exitCode }}"
+            },
+            {
+              "name": "plan_exit",
+              "value": "={{ $node['Generate Weekly Plan'].json.exitCode }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a1b2c3d4-0001-0001-0001-000000000005",
+      "name": "Log Results",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1120, 300]
+    }
+  ],
+  "connections": {
+    "Cron - Saturday 22:00": {
+      "main": [
+        [
+          {
+            "node": "Run Trend Scanner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Trend Scanner": {
+      "main": [
+        [
+          {
+            "node": "Generate Weekly Plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Weekly Plan": {
+      "main": [
+        [
+          {
+            "node": "POST to Dashboard API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "POST to Dashboard API": {
+      "main": [
+        [
+          {
+            "node": "Log Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["wisdom", "weekly-plan", "content-pipeline"],
+  "triggerCount": 0,
+  "updatedAt": "2026-03-26T00:00:00.000Z",
+  "versionId": "1"
+}

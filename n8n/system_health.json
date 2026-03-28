@@ -1,0 +1,253 @@
+{
+  "name": "System Health Check",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/15 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "d4e5f6a7-0004-0004-0004-000000000001",
+      "name": "Cron - Every 15 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 400]
+    },
+    {
+      "parameters": {
+        "command": "nvidia-smi --query-gpu=name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits"
+      },
+      "id": "d4e5f6a7-0004-0004-0004-000000000002",
+      "name": "Check GPU (nvidia-smi)",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [460, 180]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:8004/health",
+        "options": {
+          "timeout": 5000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "d4e5f6a7-0004-0004-0004-000000000003",
+      "name": "Check Chatterbox :8004",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 340]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:8188/system_stats",
+        "options": {
+          "timeout": 5000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "d4e5f6a7-0004-0004-0004-000000000004",
+      "name": "Check ComfyUI :8188",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 500]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:11434/api/tags",
+        "options": {
+          "timeout": 5000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "d4e5f6a7-0004-0004-0004-000000000005",
+      "name": "Check Ollama :11434",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 660]
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            {
+              "name": "checked_at",
+              "value": "={{ $now.toISO() }}"
+            },
+            {
+              "name": "gpu_raw",
+              "value": "={{ $node['Check GPU (nvidia-smi)'].json.stdout }}"
+            },
+            {
+              "name": "gpu_exit_code",
+              "value": "={{ $node['Check GPU (nvidia-smi)'].json.exitCode }}"
+            },
+            {
+              "name": "chatterbox_status",
+              "value": "={{ $node['Check Chatterbox :8004'].json.statusCode === 200 ? 'up' : 'down' }}"
+            },
+            {
+              "name": "comfyui_status",
+              "value": "={{ $node['Check ComfyUI :8188'].json.statusCode === 200 ? 'up' : 'down' }}"
+            },
+            {
+              "name": "ollama_status",
+              "value": "={{ $node['Check Ollama :11434'].json.statusCode === 200 ? 'up' : 'down' }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d4e5f6a7-0004-0004-0004-000000000006",
+      "name": "Aggregate Health Results",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [720, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3000/api/machine/status",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"checked_at\": \"{{ $now.toISO() }}\",\n  \"gpu\": {\n    \"available\": {{ $node['Check GPU (nvidia-smi)'].json.exitCode === 0 }},\n    \"raw\": \"{{ $node['Check GPU (nvidia-smi)'].json.stdout.trim() }}\"\n  },\n  \"services\": {\n    \"chatterbox\": {\n      \"port\": 8004,\n      \"status\": \"{{ $node['Check Chatterbox :8004'].json.statusCode === 200 ? 'up' : 'down' }}\",\n      \"status_code\": {{ $node['Check Chatterbox :8004'].json.statusCode || 0 }}\n    },\n    \"comfyui\": {\n      \"port\": 8188,\n      \"status\": \"{{ $node['Check ComfyUI :8188'].json.statusCode === 200 ? 'up' : 'down' }}\",\n      \"status_code\": {{ $node['Check ComfyUI :8188'].json.statusCode || 0 }}\n    },\n    \"ollama\": {\n      \"port\": 11434,\n      \"status\": \"{{ $node['Check Ollama :11434'].json.statusCode === 200 ? 'up' : 'down' }}\",\n      \"status_code\": {{ $node['Check Ollama :11434'].json.statusCode || 0 }}\n    }\n  }\n}",
+        "options": {
+          "timeout": 10000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "d4e5f6a7-0004-0004-0004-000000000007",
+      "name": "POST Status to Dashboard",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [940, 400]
+    }
+  ],
+  "connections": {
+    "Cron - Every 15 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Check GPU (nvidia-smi)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Check Chatterbox :8004",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Check ComfyUI :8188",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Check Ollama :11434",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check GPU (nvidia-smi)": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Health Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Chatterbox :8004": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Health Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check ComfyUI :8188": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Health Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Ollama :11434": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Health Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Health Results": {
+      "main": [
+        [
+          {
+            "node": "POST Status to Dashboard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["wisdom", "health-check", "monitoring"],
+  "triggerCount": 0,
+  "updatedAt": "2026-03-26T00:00:00.000Z",
+  "versionId": "1"
+}
