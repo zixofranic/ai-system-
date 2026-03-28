@@ -1030,7 +1030,7 @@ def _batch_process(items: list):
         cid = content["id"]
         philosopher = content["philosopher"]
         topic = content.get("topic", "life and wisdom")
-        content_type = content.get("content_type", "short")
+        content_type = content.get("format", "short")
         work = _content_work_dir(cid)
 
         try:
@@ -1073,7 +1073,7 @@ def _batch_process(items: list):
         content = data["content"]
         philosopher = content["philosopher"]
         lora = PHILOSOPHER_TO_LORA.get(philosopher, "stoic_classical_v1")
-        content_type = content.get("content_type", "short")
+        content_type = content.get("format", "short")
         work = data["work"]
 
         # Determine dimensions based on format
@@ -1147,7 +1147,7 @@ def _batch_process(items: list):
         content = data["content"]
         philosopher = content["philosopher"]
         topic = content.get("topic", "life and wisdom")
-        content_type = content.get("content_type", "short")
+        content_type = content.get("format", "short")
         channel = content.get("channels", {})
         channel_name = channel.get("name", "Wisdom")
         channel_slug = channel.get("slug", "wisdom")
@@ -1284,7 +1284,7 @@ def main():
         for item in queued:
             print(
                 f"{item['id']:<40} "
-                f"{item.get('content_type', '?'):<10} "
+                f"{item.get('format', '?'):<10} "
                 f"{item['philosopher']:<25} "
                 f"{item.get('topic', '?')}"
             )
@@ -1295,11 +1295,10 @@ def main():
         # Sequential, one-by-one (simpler, no VRAM optimization)
         for content in queued:
             try:
-                content_type = content.get("content_type", "short")
-                if content_type == "short":
+                content_type = content.get("format", "short")
+                if content_type in ("short", "story"):
                     process_short(content)
-                elif content_type in ("longform", "compilation"):
-                    # Midform handler works for multi-quote formats
+                elif content_type in ("midform", "longform", "compilation"):
                     process_midform(content)
                 else:
                     process_short(content)

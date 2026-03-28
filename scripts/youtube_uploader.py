@@ -273,9 +273,9 @@ def _download_from_drive(drive_url: str, access_token: str,
 def _is_short(content: dict) -> bool:
     """
     Determine whether a content item should be uploaded as a YouTube Short.
-    Shorts are vertical-format videos ≤60 seconds (content_type='short').
+    Shorts are vertical-format videos ≤60 seconds (format='short').
     """
-    return content.get("content_type", "short") == "short"
+    return content.get("format", "short") == "short"
 
 
 def _build_video_metadata(content: dict) -> dict:
@@ -494,14 +494,27 @@ def upload_to_youtube(content_id: str, dry_run: bool = False) -> str:
         print("  [dry-run] Would upload. Skipping actual upload.")
         return "(dry-run)"
 
-    # --- 3. Get access token ---
+    # --- 3. Get access tokens ---
+    # YouTube token (Brand Account) for uploading to YouTube
+    # Drive token (personal account) for downloading from Google Drive
     try:
-        access_token = _get_access_token(channel)
-        print(f"  [auth] Access token obtained for '{channel_name}'")
+        yt_access_token = _get_access_token(channel)
+        print(f"  [auth] YouTube token obtained for '{channel_name}'")
     except Exception as e:
         _update_content(content_id, {"status": "failed",
                                      "rejection_reason": str(e)})
         raise
+
+    # Drive download uses google_refresh_token (personal account that owns the Drive files)
+    drive_refresh = settings.get("google_refresh_token")
+    if drive_refresh:
+        drive_token_resp = requests.post(GOOGLE_TOKEN_URL, data={
+            "client_id": GOOGLE_CLIENT_ID, "client_secret": GOOGLE_CLIENT_SECRET,
+            "refresh_token": drive_refresh, "grant_type": "refresh_token"}, timeout=30)
+        drive_access_token = drive_token_resp.json().get("access_token", yt_access_token)
+        print(f"  [auth] Drive token obtained (personal account)")
+    else:
+        drive_access_token = yt_access_token  # fallback
 
     # --- 4. Download video from Drive ---
     tmp_dir = Path(tempfile.gettempdir()) / "wisdom_yt_upload"
@@ -509,7 +522,7 @@ def upload_to_youtube(content_id: str, dry_run: bool = False) -> str:
     tmp_video = str(tmp_dir / f"{content_id[:8]}.mp4")
 
     try:
-        _download_from_drive(drive_url, access_token, tmp_video)
+        _download_from_drive(drive_url, drive_access_token, tmp_video)
     except Exception as e:
         err = f"Drive download failed: {e}"
         _update_content(content_id, {"status": "failed",
@@ -522,7 +535,7 @@ def upload_to_youtube(content_id: str, dry_run: bool = False) -> str:
         is_short = _is_short(content)
         print(f"  [yt] Format: {'Short' if is_short else 'Standard'}")
 
-        video_id = _youtube_resumable_upload(access_token, tmp_video,
+        video_id = _youtube_resumable_upload(yt_access_token, tmp_video,
                                              metadata, is_short)
     except Exception as e:
         err = f"YouTube upload failed: {e}"
