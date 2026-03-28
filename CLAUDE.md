@@ -44,8 +44,23 @@ C:\AI\system\START_ALL.bat
 | ComfyUI-LatentSyncWrapper | LatentSync 1.6 lip sync | Simpler OS help videos |
 | ComfyUI-Manager | Node management | All projects |
 
+## CHANNEL SEPARATION (NON-NEGOTIABLE)
+
+Each channel is a completely separate project. NEVER mix content, output, or assets between them.
+
+| | Gibran Channel | Wisdom Channel |
+|---|---|---|
+| **Directory** | `C:\AI\gibran\` | `C:\AI\wisdom\` |
+| **Output** | `C:\AI\gibran\output\shorts\` | `C:\AI\wisdom\output\shorts\` |
+| **LoRA** | `gibran_style_v1.safetensors` | `stoic_classical_v1.safetensors` (+ others) |
+| **Voice** | `R68HwD2GzEdWfqYZP9FQ` | `0ABJJI7ZYmWZBiUBMHUW` (James Burton) |
+| **Ollama** | `gibran` | `marcus_aurelius`, `seneca`, etc. |
+| **Texts** | `C:\AI\gibran\scripts\raw\` | `C:\AI\wisdom\authors\` |
+
+When generating content, ALWAYS verify the output path matches the channel.
+
 ## Projects Using This Infrastructure
 
-- `C:\AI\gibran\` — Gibran partnership channel
-- `C:\AI\wisdom\` — Wisdom solo channel
+- `C:\AI\gibran\` — Gibran partnership channel (with Elias)
+- `C:\AI\wisdom\` — Wisdom solo channel (Ziad only)
 - `C:\AI\simpler.os\` — Simpler RE OS help video system (Digital Joe tutorials)

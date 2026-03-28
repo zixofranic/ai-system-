@@ -118,7 +118,7 @@ def generate_weekly_plan(trending_topics: list, channels: list) -> list:
         - channel: str
         - philosopher: str
         - topic: str
-        - format: str (short | midform | longform)
+        - format: str (short | story | midform | longform)
         - hook: str (opening line / angle)
         - reasoning: str
     """
@@ -141,13 +141,19 @@ For each day (Monday through Sunday), suggest one video. Return a JSON array of 
     "channel": "channel name",
     "philosopher": "philosopher name",
     "topic": "specific topic title",
-    "format": "short | midform | longform",
+    "format": "short | story | midform | longform",
     "hook": "compelling opening angle",
     "reasoning": "why this topic now"
   }}
 ]
 
-Mix formats across the week. Prioritize shorts on Mon/Wed/Fri, midform on Tue/Thu, longform on weekends.
+Formats:
+- short: 30-60s single quote with art (daily)
+- story: 3-5 min original FICTION that embeds philosophy through narrative, not lectures (2-3x/week)
+- midform: 3-5 min multi-quote direct philosophical exploration (2x/week)
+- longform: 15-25 min deep essay (weekends)
+
+Mix formats across the week. Include at least 2 stories per week.
 Match philosophers to topics naturally. Ensure variety across philosophers and channels."""
 
     response = _call_anthropic(HAIKU_MODEL, system, user, max_tokens=2048)
@@ -290,6 +296,116 @@ Each quote should be 1-3 sentences. The quotes should form a narrative arc:
     result = _parse_json_response(response)
     result["philosopher"] = philosopher
     result["topic"] = topic
+    return result
+
+
+def generate_story_script(philosopher: str, theme: str,
+                          setting: str = None, era: str = None,
+                          mood: str = None, notes: str = None) -> dict:
+    """
+    Generate an original fiction story (3-5 min) that embeds philosophical
+    teachings naturally through narrative, characters, and emotion.
+
+    NOT a lecture. NOT biographical. Original fiction that makes the viewer
+    FEEL the philosophy through story.
+
+    Args:
+        philosopher: The philosophical lens (e.g., "Marcus Aurelius", "Rumi")
+        theme: The emotional/philosophical theme (e.g., "betrayal", "letting go")
+        setting: Optional setting (e.g., "modern Beirut", "1920s Paris", "ancient Rome")
+        era: Optional era hint (e.g., "modern", "medieval", "last century")
+        mood: Optional mood (e.g., "dark", "dreamy", "bittersweet")
+        notes: Optional creative direction
+
+    Returns:
+        Dict with: title, description, tags, story_script (full narration),
+                   scenes (list of scene dicts), music_mood, suno_prompt,
+                   philosopher, theme, closing_attribution
+    """
+    setting_line = f"Setting: {setting}" if setting else "Setting: Choose a compelling setting that fits the theme — can be modern, historical, or timeless."
+    era_line = f"Era: {era}" if era else ""
+    mood_line = f"Mood: {mood}" if mood else "Mood: Choose what fits — dark, dreamy, bittersweet, tense, tender, whatever serves the story."
+    notes_line = f"Creative direction: {notes}" if notes else ""
+
+    system = """You are an extraordinary fiction writer who weaves philosophy into stories so naturally that the viewer never feels preached to.
+
+Your stories have:
+- Real characters with names, faces, and flaws
+- Specific sensory details — what the air smells like, what the walls look like
+- Conflict, tension, turning points — not just atmosphere
+- Dialogue that reveals character, not lectures
+- The philosophical teaching EMBEDDED in action and consequence, never stated directly
+- An ending that lands emotionally — the viewer feels the wisdom, they don't hear it
+
+You write like Hemingway meets Khalil Gibran — spare, vivid, poetic where it counts, never flowery for the sake of it.
+
+Output valid JSON only."""
+
+    user = f"""Write an original short fiction story (500-800 words, 3-5 minutes when narrated) that carries the philosophical spirit of {philosopher} on the theme of "{theme}".
+
+{setting_line}
+{era_line}
+{mood_line}
+{notes_line}
+
+CRITICAL RULES:
+- This is FICTION. Original characters, original plot.
+- NEVER quote the philosopher directly in the story
+- NEVER mention the philosopher's name in the story — not even as a character name
+- NEVER name a character after ANY philosopher (no Marcus, no Seneca, no Rumi, etc.)
+- NEVER use phrases like "as the ancients said" or "wisdom teaches us"
+- The philosophy must be FELT through what happens, not TOLD
+- The philosopher's name only appears in the closing attribution
+- Use simple ASCII punctuation only — no em dashes, curly quotes, or special Unicode
+
+CHARACTER CONSISTENCY (CRITICAL FOR AI ART):
+You must define ONE main character with a FIXED appearance that stays the same across all scenes.
+Include a "character" field in your JSON that describes the protagonist precisely:
+gender, approximate age, ethnicity, hair, clothing, and one distinguishing feature.
+Example: "A woman in her early 30s, East Asian, shoulder-length black hair, wearing a dark grey wool coat, small scar above her left eyebrow"
+
+EVERY scene's art_prompt MUST include this exact character description so AI-generated images stay consistent.
+
+ART STYLE CONSISTENCY (CRITICAL):
+Include a "visual_style" field that defines the consistent look for ALL scenes.
+Example: "muted cinematic realism, desaturated warm tones, soft natural lighting, painterly brushwork, film grain texture"
+EVERY scene's art_prompt MUST begin with this visual_style prefix.
+
+Return JSON:
+{{
+  "title": "YouTube title (compelling, under 70 chars, does NOT mention the philosopher)",
+  "description": "YouTube description (3-4 lines, mention philosopher + theme, hashtags)",
+  "tags": ["tag1", "tag2", "..."],
+  "character": "Precise physical description of the protagonist — gender, age, ethnicity, hair, clothing, distinguishing feature",
+  "visual_style": "Consistent art direction for all scenes — color palette, rendering style, lighting, texture",
+  "story_script": "The complete narration script — the full story as it will be read aloud. 500-800 words.",
+  "scenes": [
+    {{
+      "scene_number": 1,
+      "narration": "The portion of narration for this scene",
+      "art_prompt": "[visual_style], [character description], [scene-specific details — location, action, composition, lighting]",
+      "mood": "emotional tone of this scene"
+    }}
+  ],
+  "closing_attribution": "A single line like: Inspired by the philosophy of [philosopher name]",
+  "music_mood": "overall mood for background music",
+  "suno_prompt": "Suno AI music prompt (under 80 words, describe instruments, tempo, feel)"
+}}
+
+Break the story into 4-6 scenes. Each scene is a visual beat — a new location, a shift in tension, a revelation.
+
+THE STORY ARC:
+1. Ground us — where are we, who is this person, what do they want
+2. Tension — something goes wrong, a choice must be made, pressure builds
+3. The turn — the moment where the philosophical insight manifests through ACTION
+4. Resolution — not a happy ending necessarily, but a true one"""
+
+    response = _call_anthropic(SONNET_MODEL, system, user, max_tokens=4000,
+                               temperature=0.85)
+    result = _parse_json_response(response)
+    result["philosopher"] = philosopher
+    result["theme"] = theme
+    result["format"] = "story"
     return result
 
 

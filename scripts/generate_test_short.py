@@ -29,8 +29,12 @@ ELEVENLABS_KEY = os.environ["ELEVENLABS_API_KEY"]
 WISDOM_VOICE = os.environ.get("ELEVENLABS_VOICE_WISDOM", "0ABJJI7ZYmWZBiUBMHUW")
 GIBRAN_VOICE = os.environ.get("ELEVENLABS_VOICE_GIBRAN", "R68HwD2GzEdWfqYZP9FQ")
 
-OUTPUT_DIR = Path("C:/AI/wisdom/output/shorts")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIRS = {
+    "wisdom": Path("C:/AI/wisdom/output/shorts"),
+    "gibran": Path("C:/AI/gibran/output/shorts"),
+}
+for d in OUTPUT_DIRS.values():
+    d.mkdir(parents=True, exist_ok=True)
 
 # Philosopher configs
 PHILOSOPHER_CONFIG = {
@@ -45,7 +49,7 @@ PHILOSOPHER_CONFIG = {
     "Gibran": {
         "lora": "gibran_style_v1.safetensors",
         "music": "gibran",
-        "art_prompt": "ethereal mystical painting, prophet standing on hilltop overlooking vast sea at twilight, flowing robes in wind, warm golden amber light, oil painting masterpiece",
+        "art_prompt": "gibran_style painting, prophet standing on hilltop overlooking vast sea at twilight, flowing robes in wind, warm golden amber light, oil painting masterpiece",
         "ollama_model": "gibran",
         "voice": GIBRAN_VOICE,
         "channel": "gibran",
@@ -72,6 +76,12 @@ def generate_voice_with_timestamps(text, voice_id, output_path):
     Returns list of word dicts: [{"word": "...", "start": float, "end": float}, ...]
     """
     print("  Generating voice with timestamps...")
+    # Sanitize special chars to prevent mojibake in captions
+    text = text.replace("\u2014", " - ").replace("\u2013", " - ")
+    text = text.replace("\u2018", "'").replace("\u2019", "'")
+    text = text.replace("\u201c", '"').replace("\u201d", '"')
+    text = text.replace("\u2026", "...").replace("\u00a0", " ")
+
     client = ElevenLabs(api_key=ELEVENLABS_KEY)
 
     result = client.text_to_speech.convert_with_timestamps(
@@ -180,24 +190,30 @@ def generate_art(lora, art_prompt, output_prefix):
 def build_synced_captions(words, voice_offset):
     """
     Build caption groups from word timestamps.
-    Groups words into readable chunks (max ~6-7 words per caption line),
-    using actual voice timing for start/end.
+    Each caption is a single line (~6-8 words), breaking at natural points
+    (after punctuation like commas, periods, semicolons).
 
     voice_offset: seconds of silence before narration starts in video
     """
     if not words:
         return []
 
-    # Group words into chunks of ~6 words for readability
-    MAX_WORDS_PER_CHUNK = 6
+    MAX_WORDS = 5
+    PUNCTUATION = {",", ".", "!", "?", ";", ":"}
+
     chunks = []
     current_words = []
 
     for w in words:
         current_words.append(w)
-        if len(current_words) >= MAX_WORDS_PER_CHUNK:
+        word_text = w["word"]
+        at_punctuation = any(word_text.endswith(p) for p in PUNCTUATION)
+
+        # Break at punctuation if we have 2+ words, or at max words
+        if (at_punctuation and len(current_words) >= 2) or len(current_words) >= MAX_WORDS:
             chunks.append(current_words)
             current_words = []
+
     if current_words:
         chunks.append(current_words)
 
@@ -207,9 +223,9 @@ def build_synced_captions(words, voice_offset):
         text = " ".join(w["word"] for w in chunk)
         start = chunk[0]["start"] + voice_offset
         end = chunk[-1]["end"] + voice_offset
-        # Minimum duration of 1.5s for readability
-        if end - start < 1.5:
-            end = start + 1.5
+        # Minimum duration for readability
+        if end - start < 1.2:
+            end = start + 1.2
         captions.append({"text": text, "start": start, "end": end})
 
     return captions
@@ -235,12 +251,10 @@ def assemble_video(quote, philosopher, voice_path, art_path, music_path, output_
         return 1 + 0.08 * (t / duration)
     bg = bg.resize(zoom_in)
 
-    # Dark overlay for text readability
-    dark_overlay = (ColorClip(size=(1080, 700), color=(0, 0, 0))
-                    .set_duration(duration)
-                    .set_position((0, 1200))
-                    .set_opacity(0.55)
-                    .crossfadein(2))
+    # No wide overlay — each caption gets its own tight dark pill behind it
+    # Text positioned in the middle third of the frame (y ~750-900)
+    CAPTION_Y = 820
+    AUTHOR_Y = 1680
 
     # Build captions from word timestamps
     caption_clips = []
@@ -249,44 +263,62 @@ def assemble_video(quote, philosopher, voice_path, art_path, music_path, output_
         print(f"  Building {len(captions)} synced caption segments")
 
         for cap in captions:
-            # Wrap text into readable lines (max 4 words per line)
-            words = cap["text"].split()
-            lines = []
-            for i in range(0, len(words), 4):
-                lines.append(" ".join(words[i:i+4]))
-            display_text = "\n".join(lines)
+            display_text = cap["text"].lower()
 
-            txt = (TextClip(display_text,
-                            fontsize=60,
-                            color="white",
-                            font="Georgia-Bold",
-                            method="caption",
-                            size=(900, None),
-                            align="center",
-                            interline=8)
-                   .set_position(("center", 1320))
+            # Create text clip — use caption method with max width to prevent overflow
+            txt = TextClip(display_text,
+                           fontsize=54,
+                           color="white",
+                           font="Georgia-Bold",
+                           method="caption",
+                           size=(950, None),
+                           align="center")
+            txt_w, txt_h = txt.size
+
+            # Tight dark pill behind text (padding around text)
+            pad_x, pad_y = 30, 14
+            pill_w = min(txt_w + pad_x * 2, 1020)  # never wider than frame
+            pill = (ColorClip(size=(pill_w, txt_h + pad_y * 2), color=(0, 0, 0))
+                    .set_opacity(0.6)
+                    .set_position(("center", CAPTION_Y - pad_y))
+                    .set_start(cap["start"])
+                    .set_duration(cap["end"] - cap["start"])
+                    .crossfadein(0.15)
+                    .crossfadeout(0.15))
+
+            txt = (txt
+                   .set_position(("center", CAPTION_Y))
                    .set_start(cap["start"])
                    .set_duration(cap["end"] - cap["start"])
-                   .crossfadein(0.2)
-                   .crossfadeout(0.2))
+                   .crossfadein(0.15)
+                   .crossfadeout(0.15))
+
+            caption_clips.append(pill)
             caption_clips.append(txt)
     else:
-        # Fallback: estimate timing from text (same as generate_batch.py)
+        # Fallback: estimate timing from text
         print("  No timestamps — using estimated timing")
         raw_sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', quote) if s.strip()]
         if not raw_sentences:
             raw_sentences = [quote]
 
+        # Break into phrase-sized chunks (~6-8 words, break at punctuation)
         chunks = []
-        current_chunk = ""
-        for s in raw_sentences:
-            if current_chunk and len((current_chunk + " " + s).split()) > 15:
-                chunks.append(current_chunk)
-                current_chunk = s
+        for sentence in raw_sentences:
+            words = sentence.split()
+            if len(words) <= 8:
+                chunks.append(sentence)
             else:
-                current_chunk = (current_chunk + " " + s).strip() if current_chunk else s
-        if current_chunk:
-            chunks.append(current_chunk)
+                # Split at commas or mid-point
+                parts = re.split(r',\s*', sentence)
+                for part in parts:
+                    pw = part.split()
+                    if len(pw) <= 8:
+                        chunks.append(part)
+                    else:
+                        mid = len(pw) // 2
+                        chunks.append(" ".join(pw[:mid]))
+                        chunks.append(" ".join(pw[mid:]))
 
         total_words = sum(len(c.split()) for c in chunks)
         current_time = voice_start + 0.5
@@ -295,26 +327,41 @@ def assemble_video(quote, philosopher, voice_path, art_path, music_path, output_
         for chunk in chunks:
             word_count = len(chunk.split())
             chunk_duration = (word_count / total_words) * available_time
-            chunk_duration = max(chunk_duration, 2.0)
+            chunk_duration = max(chunk_duration, 1.8)
 
-            words = chunk.split()
-            display = "\n".join([" ".join(words[i:i+5]) for i in range(0, len(words), 5)])
-            txt = (TextClip(display, fontsize=58, color="white", font="Georgia-Bold",
-                            method="caption", size=(900, None), align="center", interline=6)
-                   .set_position(("center", 1350)).set_start(current_time)
-                   .set_duration(chunk_duration).crossfadein(0.3).crossfadeout(0.3))
+            display_text = chunk.lower()
+            txt = TextClip(display_text, fontsize=54, color="white",
+                           font="Georgia-Bold", method="caption",
+                           size=(950, None), align="center")
+            txt_w, txt_h = txt.size
+
+            pad_x, pad_y = 30, 14
+            pill_w = min(txt_w + pad_x * 2, 1020)
+            pill = (ColorClip(size=(pill_w, txt_h + pad_y * 2), color=(0, 0, 0))
+                    .set_opacity(0.6)
+                    .set_position(("center", CAPTION_Y - pad_y))
+                    .set_start(current_time)
+                    .set_duration(chunk_duration)
+                    .crossfadein(0.15).crossfadeout(0.15))
+
+            txt = (txt.set_position(("center", CAPTION_Y))
+                   .set_start(current_time)
+                   .set_duration(chunk_duration)
+                   .crossfadein(0.15).crossfadeout(0.15))
+
+            caption_clips.append(pill)
             caption_clips.append(txt)
-            current_time += chunk_duration + 0.15
+            current_time += chunk_duration + 0.1
 
-    # Author attribution
-    author_clip = (TextClip(f"— {philosopher}", fontsize=38, color="#D4AF37",
+    # Author attribution — bottom area
+    author_clip = (TextClip(f"— {philosopher}", fontsize=36, color="#D4AF37",
                             font="Georgia-Italic", method="label")
-                   .set_position(("center", 1750))
+                   .set_position(("center", AUTHOR_Y))
                    .set_start(voice_start + 0.5)
                    .set_duration(duration - voice_start - 1.5)
                    .crossfadein(1))
 
-    # Channel watermark
+    # Channel watermark — top
     watermark = (TextClip("Deep Echoes of Wisdom", fontsize=22, color="white",
                           font="Arial", method="label")
                  .set_position(("center", 50))
@@ -329,8 +376,8 @@ def assemble_video(quote, philosopher, voice_path, art_path, music_path, output_
     music = music.subclip(0, duration).volumex(0.15)
     final_audio = CompositeAudioClip([music, narration])
 
-    # Compose
-    all_clips = [bg, dark_overlay] + caption_clips + [author_clip, watermark]
+    # Compose — no wide overlay, just pill + text pairs
+    all_clips = [bg] + caption_clips + [author_clip, watermark]
     video = (CompositeVideoClip(all_clips, size=(1080, 1920))
              .set_audio(final_audio)
              .fadein(2.5)
@@ -344,12 +391,15 @@ def assemble_video(quote, philosopher, voice_path, art_path, music_path, output_
 def generate_short(philosopher_name, topic, prompt_text, channel="wisdom"):
     """Generate a complete Short for the given philosopher."""
     config = PHILOSOPHER_CONFIG[philosopher_name]
+    channel = config["channel"]  # Always use channel from config, not default
+    output_dir = OUTPUT_DIRS[channel]
     slug = philosopher_name.lower().replace(" ", "_")
     prefix = f"test_{slug}_{datetime.now().strftime('%H%M')}"
 
     print(f"\n{'='*60}")
     print(f"  GENERATING: {philosopher_name} — {topic}")
     print(f"  Channel: {channel}")
+    print(f"  Output: {output_dir}")
     print(f"{'='*60}")
 
     # 1. Quote
@@ -357,12 +407,12 @@ def generate_short(philosopher_name, topic, prompt_text, channel="wisdom"):
     print(f"  Quote: {quote}")
 
     # 2. Voice with timestamps
-    voice_path = str(OUTPUT_DIR / f"{prefix}_voice.mp3")
+    voice_path = str(output_dir / f"{prefix}_voice.mp3")
     word_timestamps = generate_voice_with_timestamps(quote, config["voice"], voice_path)
 
     if word_timestamps:
         # Save timestamps for debugging
-        ts_path = str(OUTPUT_DIR / f"{prefix}_timestamps.json")
+        ts_path = str(output_dir / f"{prefix}_timestamps.json")
         with open(ts_path, "w") as f:
             json.dump(word_timestamps, f, indent=2)
         print(f"  Timestamps saved: {ts_path}")
@@ -383,7 +433,7 @@ def generate_short(philosopher_name, topic, prompt_text, channel="wisdom"):
     print(f"  Music: {Path(music_path).name}")
 
     # 5. Assemble video
-    video_path = str(OUTPUT_DIR / f"{prefix}_short.mp4")
+    video_path = str(output_dir / f"{prefix}_short.mp4")
     assemble_video(quote, philosopher_name, voice_path, art_path, music_path,
                    video_path, word_timestamps)
 
