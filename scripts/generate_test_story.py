@@ -275,18 +275,19 @@ def generate_scene_art(art_prompt, output_prefix, reference_image_path=None):
                        "model": ["1", 0],
                        "preset": "STANDARD (medium strength)",
                    }},
-            # Apply IP-Adapter with reference image
-            # Low weight + early-only: sets character likeness but lets
-            # the text prompt control the scene composition
-            "13": {"class_type": "IPAdapter",
+            # Apply IP-Adapter — style transfer only (layer 6 in SDXL)
+            # Transfers art style/palette/mood without constraining composition
+            "13": {"class_type": "IPAdapterAdvanced",
                    "inputs": {
                        "model": ["12", 0],
                        "ipadapter": ["12", 1],
                        "image": ["10", 0],
-                       "weight": 0.3,
+                       "weight": 0.5,
+                       "weight_type": "style transfer",
                        "start_at": 0.0,
-                       "end_at": 0.4,
-                       "weight_type": "standard",
+                       "end_at": 0.3,
+                       "combine_embeds": "concat",
+                       "embeds_scaling": "K+V w/ C penalty",
                    }},
             # Sample with IP-Adapter-conditioned model
             "6": {"class_type": "KSampler",
@@ -354,6 +355,97 @@ def find_scene_word_boundaries(words, scenes_narration):
         word_idx = best_end
 
     return boundaries
+
+
+def _build_waveform_pulse(voice_path, total_duration, fps, canvas_w, canvas_h,
+                          voice_start=0.0, color="#D4AF37", n_points=48,
+                          wave_height=30, y_position=850):
+    """
+    Build a smooth waveform/pulse animation synced to the narration.
+    Renders as a glowing horizontal waveform line that pulses with the voice.
+    Positioned just above the captions.
+    """
+    import numpy as np
+    import librosa
+    from scipy.ndimage import uniform_filter1d
+    from moviepy.editor import VideoClip
+
+    # Analyze audio energy — single band (overall amplitude)
+    y, sr = librosa.load(voice_path, sr=22050, mono=True)
+    hop = int(sr / fps)
+    # RMS energy per frame
+    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop)[0]
+    rms = rms / (rms.max() + 1e-8)  # normalize to [0, 1]
+    rms = uniform_filter1d(rms, size=3)  # smooth
+    rms = np.clip(rms, 0.0, 1.0)
+
+    # Also get spectral centroid for wave shape variation
+    cent = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop)[0]
+    cent = cent / (cent.max() + 1e-8)
+    cent = uniform_filter1d(cent, size=5)
+
+    hex_c = color.lstrip("#")
+    cr, cg, cb = (int(hex_c[i:i+2], 16) for i in (0, 2, 4))
+
+    def make_frame(t):
+        frame = np.zeros((canvas_h, canvas_w, 4), dtype=np.uint8)
+        adj_t = t - voice_start
+        if adj_t < 0 or adj_t * fps >= len(rms):
+            return frame
+
+        idx = min(int(adj_t * fps), len(rms) - 1)
+        amplitude = rms[idx]
+        shape_var = cent[min(idx, len(cent) - 1)]
+
+        # Draw a smooth waveform across the width
+        wave_w = int(canvas_w * 0.75)
+        x_start = (canvas_w - wave_w) // 2
+
+        for p in range(n_points):
+            px = x_start + int(p * wave_w / n_points)
+            px2 = x_start + int((p + 1) * wave_w / n_points)
+
+            # Create organic wave shape using sin with varying frequency
+            import math
+            phase = (p / n_points) * math.pi * 2
+            freq_mod = 2.0 + shape_var * 3.0
+            wave_val = math.sin(phase * freq_mod + adj_t * 4.0)
+            h = int(abs(wave_val) * amplitude * wave_height)
+            h = max(2, h)
+
+            # Center line at y_position
+            y1 = y_position - h
+            y2 = y_position + h
+
+            # Clamp
+            y1 = max(0, min(y1, canvas_h - 1))
+            y2 = max(0, min(y2, canvas_h - 1))
+            if y2 <= y1:
+                continue
+
+            # Draw with alpha gradient (brighter at center)
+            mid = (y1 + y2) // 2
+            for row in range(y1, y2):
+                dist = abs(row - mid) / max(h, 1)
+                alpha = int(200 * (1.0 - dist * 0.6) * amplitude)
+                alpha = max(0, min(255, alpha))
+                frame[row, px:px2, 0] = cr
+                frame[row, px:px2, 1] = cg
+                frame[row, px:px2, 2] = cb
+                frame[row, px:px2, 3] = alpha
+
+        return frame
+
+    def rgb_frame(t):
+        return make_frame(t)[:, :, :3]
+
+    def mask_frame(t):
+        return make_frame(t)[:, :, 3].astype(float) / 255.0
+
+    rgb_clip = VideoClip(rgb_frame, duration=total_duration).set_fps(fps)
+    mask_clip = VideoClip(mask_frame, duration=total_duration, ismask=True).set_fps(fps)
+    rgb_clip = rgb_clip.set_mask(mask_clip)
+    return rgb_clip
 
 
 def assemble_story_video(story_data, voice_path, word_timestamps, art_paths,
@@ -491,6 +583,10 @@ def assemble_story_video(story_data, voice_path, word_timestamps, art_paths,
                  .set_duration(total_duration)
                  .set_opacity(0.35))
 
+    # --- Waveform pulse visualizer (synced to narration) ---
+    waveform_clip = _build_waveform_pulse(voice_path, total_duration, 30,
+                                           1920, 1080, voice_start)
+
     # Audio
     narration_audio = narration.set_start(voice_start)
     music = AudioFileClip(music_path)
@@ -500,7 +596,7 @@ def assemble_story_video(story_data, voice_path, word_timestamps, art_paths,
     final_audio = CompositeAudioClip([music, narration_audio])
 
     # Compose everything
-    all_clips = scene_clips + caption_clips + [attr_clip, watermark]
+    all_clips = scene_clips + caption_clips + [waveform_clip, attr_clip, watermark]
     video = (CompositeVideoClip(all_clips, size=(1920, 1080))
              .set_duration(total_duration)
              .set_audio(final_audio)
