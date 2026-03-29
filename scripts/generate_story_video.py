@@ -284,11 +284,11 @@ def step_convert_remotion(script_path, ts_path, art_paths_path, voice_path, musi
 # ---------------------------------------------------------------------------
 def step_render(output_name, out_path):
     print(f"\n[6/6] Rendering via Remotion -> {out_path}")
-    subprocess.run([
-        "npx", "remotion", "render", output_name,
-        str(out_path),
-        "--codec=h264", "--crf=18",
-    ], cwd=str(VIDEO_ENGINE), check=True, timeout=600)
+    remotion_cmd = str(VIDEO_ENGINE / "node_modules" / ".bin" / "remotion.cmd")
+    subprocess.run(
+        f'"{remotion_cmd}" render {output_name} "{out_path}" --codec=h264 --crf=18',
+        cwd=str(VIDEO_ENGINE), check=True, timeout=600, shell=True,
+    )
     print(f"  DONE: {out_path}")
 
 
@@ -318,7 +318,7 @@ def main():
     first_name = philosopher.split()[0].lower()
     date_str = datetime.now().strftime('%Y-%m-%d')
     prefix = f"{date_str}_story_{first_name}"
-    output_name = f"{prefix}"
+    output_name = prefix.replace("_", "-")
 
     print(f"\n{'='*60}")
     print(f"  STORY VIDEO PIPELINE")
@@ -346,7 +346,8 @@ def main():
         ts_path = script_path.parent / f"{base}_timestamps.json"
         art_paths_path = script_path.parent / f"{base}_art_paths.json"
         video_path = script_path.parent / f"{base}_video.mp4"
-        output_name = base
+        composition_name = base.replace("_", "-")
+        output_name = composition_name
         philosopher = story.get("philosopher", philosopher)
     else:
         story = step_generate_script(philosopher, args.theme, args.setting, args.mood, args.notes)
@@ -391,11 +392,111 @@ def main():
     # Step 6: Render
     step_render(output_name, str(video_path))
 
+    # Step 7: Update Supabase content row with metadata (if connected)
+    step_update_supabase(story, str(video_path))
+
     print(f"\n{'='*60}")
     print(f"  COMPLETE")
     print(f"  Video: {video_path}")
     print(f"  Script: {script_path}")
     print(f"{'='*60}")
+
+
+# ---------------------------------------------------------------------------
+# Step 7: Push metadata to Supabase
+# ---------------------------------------------------------------------------
+def step_update_supabase(story, video_path):
+    """Update Supabase content row with title, description, tags, and local path."""
+    supabase_url = os.getenv("SUPABASE_URL", "")
+    supabase_key = os.getenv("SUPABASE_SERVICE_KEY", "")
+    if not supabase_url or not supabase_key:
+        print("\n[7/7] Supabase not configured, skipping metadata push")
+        return
+
+    print("\n[7/7] Updating Supabase with video metadata...")
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    philosopher = story.get("philosopher", "")
+    title = story.get("title", "")
+    description = story.get("description", "")
+    tags = story.get("tags", [])
+
+    # Find matching content row by philosopher + format
+    resp = requests.get(
+        f"{supabase_url}/rest/v1/content",
+        headers=headers,
+        params={
+            "philosopher": f"eq.{philosopher}",
+            "format": "eq.story",
+            "status": "in.(queued,ready)",
+            "deleted_at": "is.null",
+            "order": "created_at.desc",
+            "limit": "1",
+        },
+    )
+
+    rows = resp.json() if resp.status_code == 200 else []
+    if not rows:
+        # Create new content row
+        payload = {
+            "title": title,
+            "description": description,
+            "philosopher": philosopher,
+            "topic": story.get("theme", ""),
+            "quote_text": story.get("story_script", "")[:500],
+            "format": "story",
+            "status": "ready",
+            "local_machine_path": video_path,
+            "generation_params": {
+                "tags": tags,
+                "closing_attribution": story.get("closing_attribution", ""),
+                "writer_style": story.get("writer_style", ""),
+                "comic_artist": story.get("comic_artist", ""),
+            },
+            "is_system_generated": True,
+        }
+        # Get channel ID
+        ch_resp = requests.get(
+            f"{supabase_url}/rest/v1/channels",
+            headers=headers,
+            params={"slug": f"eq.{'gibran' if philosopher == 'Gibran' else 'wisdom'}"},
+        )
+        channels = ch_resp.json() if ch_resp.status_code == 200 else []
+        if channels:
+            payload["channel_id"] = channels[0]["id"]
+
+        resp = requests.post(f"{supabase_url}/rest/v1/content", headers=headers, json=payload)
+        if resp.status_code in (200, 201):
+            print(f"  Created content row: {title}")
+        else:
+            print(f"  Failed to create: {resp.text[:200]}")
+    else:
+        # Update existing row
+        content_id = rows[0]["id"]
+        payload = {
+            "title": title,
+            "description": description,
+            "status": "ready",
+            "local_machine_path": video_path,
+            "generation_params": {
+                **({} if not rows[0].get("generation_params") else rows[0]["generation_params"]),
+                "tags": tags,
+                "closing_attribution": story.get("closing_attribution", ""),
+            },
+        }
+        resp = requests.patch(
+            f"{supabase_url}/rest/v1/content?id=eq.{content_id}",
+            headers=headers, json=payload,
+        )
+        if resp.status_code in (200, 204):
+            print(f"  Updated content: {title}")
+        else:
+            print(f"  Failed to update: {resp.text[:200]}")
 
 
 if __name__ == "__main__":
