@@ -187,21 +187,24 @@ def push_weekly_plan_to_supabase(plan: list, channel_map: dict = None) -> str:
     # Supabase returns a list when Prefer: return=representation is set
     weekly_plan_id = wp_data[0]["id"] if isinstance(wp_data, list) else wp_data["id"]
 
-    # --- Step 2: Create plan_topics rows ---
+    # --- Step 2: Create plan_topics + content rows ---
     for item in plan:
         philosopher = item.get("philosopher", "")
         day_name = item.get("day", "Monday")
+        fmt = item.get("format", "short")
+        channel_slug = item.get("channel", "wisdom")
 
-        # Resolve channel_id
-        channel_id = cmap.get(philosopher)
-        if not channel_id:
-            # Default: everything that isn't explicitly mapped goes to Wisdom
-            channel_id = _WISDOM_CHANNEL_ID
+        # Resolve channel_id from slug or philosopher
+        if channel_slug == "gibran" or "Gibran" in philosopher:
+            channel_id = _DEFAULT_CHANNEL_MAP.get("Gibran Khalil Gibran",
+                                                   _WISDOM_CHANNEL_ID)
+        else:
+            channel_id = cmap.get(philosopher, _WISDOM_CHANNEL_ID)
 
-        # Calculate scheduled_date from day name
         day_offset = _DAY_OFFSETS.get(day_name, 0)
         scheduled_date = (monday + timedelta(days=day_offset)).isoformat()
 
+        # Create plan_topic row
         topic_payload = {
             "plan_id": weekly_plan_id,
             "title": item.get("topic", ""),
@@ -213,14 +216,35 @@ def push_weekly_plan_to_supabase(plan: list, channel_map: dict = None) -> str:
         }
         tp_resp = requests.post(
             f"{SUPABASE_URL}/rest/v1/plan_topics",
-            headers=headers,
-            json=topic_payload,
-            timeout=30,
+            headers=headers, json=topic_payload, timeout=30,
         )
-        tp_resp.raise_for_status()
+        if tp_resp.status_code not in (200, 201):
+            print(f"[ai_writer] plan_topic failed: {tp_resp.text[:100]}")
+            continue
+        tp_data = tp_resp.json()
+        tp_id = tp_data[0]["id"] if isinstance(tp_data, list) else tp_data.get("id")
+
+        # Create matching content row (so it shows on the Plan page)
+        content_payload = {
+            "channel_id": channel_id,
+            "title": item.get("topic", ""),
+            "philosopher": philosopher,
+            "topic": item.get("topic", ""),
+            "quote_text": "Pending generation",
+            "format": fmt,
+            "status": "planned",
+            "scheduled_at": scheduled_date + "T09:00:00Z",
+            "is_system_generated": True,
+        }
+        if tp_id:
+            content_payload["plan_topic_id"] = tp_id
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/content",
+            headers=headers, json=content_payload, timeout=30,
+        )
 
     print(f"[ai_writer] Weekly plan {weekly_plan_id} pushed to Supabase "
-          f"(week of {monday.isoformat()}, {len(plan)} topics)")
+          f"(week of {monday.isoformat()}, {len(plan)} items)")
     return weekly_plan_id
 
 
@@ -230,57 +254,68 @@ def push_weekly_plan_to_supabase(plan: list, channel_map: dict = None) -> str:
 
 def generate_weekly_plan(trending_topics: list, channels: list) -> list:
     """
-    Use Claude Haiku to create 7 daily topic suggestions from trends.
+    Use Claude to create a full weekly content plan with the correct quotas.
 
-    Args:
-        trending_topics: List of dicts with keys like 'topic', 'source', 'score'.
-        channels: List of channel names (e.g., ['Wisdom', 'Gibran Wisdom']).
+    Weekly quota per channel:
+      - 7 shorts (1 per day)
+      - 3 stories (Mon/Wed/Fri)
+      - 2 midform (Tue/Thu)
+      - 1 longform (Saturday or Sunday)
+      = 13 items per channel
+
+    Wisdom channel philosophers: Marcus Aurelius, Seneca, Epictetus, Rumi,
+      Lao Tzu, Nietzsche, Emerson, Thoreau, Dostoevsky, Wilde, etc.
+    Gibran channel: Gibran Khalil Gibran only.
 
     Returns:
-        List of 7 dicts, one per day, each with:
-        - day: str (Monday-Sunday)
-        - channel: str
-        - philosopher: str
-        - topic: str
-        - format: str (short | story | midform | longform)
-        - hook: str (opening line / angle)
-        - reasoning: str
+        List of dicts with: day, channel, philosopher, topic, format, hook
     """
     system = (
         "You are a content strategist for philosophical YouTube channels. "
         "You create weekly content plans that balance trending relevance with "
         "timeless philosophical wisdom. Output valid JSON only."
     )
-    user = f"""Create a 7-day content plan based on these trending topics and channels.
+    user = f"""Create a FULL weekly content plan for TWO channels based on trending topics.
 
 Trending topics:
 {json.dumps(trending_topics, indent=2)}
 
-Channels: {', '.join(channels)}
+CHANNEL 1: "Deep Echoes of Wisdom" (slug: wisdom)
+  Philosophers: Marcus Aurelius, Seneca, Epictetus, Rumi, Lao Tzu, Nietzsche, Emerson, Thoreau, Dostoevsky, Wilde, Musashi, Confucius
 
-For each day (Monday through Sunday), suggest one video. Return a JSON array of 7 objects:
+CHANNEL 2: "Gibran Khalil Gibran" (slug: gibran)
+  Philosopher: Gibran Khalil Gibran ONLY
+
+WEEKLY QUOTA PER CHANNEL:
+  - 7 shorts (one per day, Mon-Sun)
+  - 3 stories (Mon, Wed, Fri)
+  - 2 midform (Tue, Thu)
+  - 1 longform (Sat or Sun)
+  Total: 13 items per channel, 26 items total
+
+Return a JSON array of 26 objects:
 [
   {{
     "day": "Monday",
-    "channel": "channel name",
+    "channel": "wisdom" or "gibran",
     "philosopher": "philosopher name",
-    "topic": "specific topic title",
+    "topic": "specific compelling topic title",
     "format": "short | story | midform | longform",
-    "hook": "compelling opening angle",
-    "reasoning": "why this topic now"
+    "hook": "compelling opening angle (1 sentence)"
   }}
 ]
 
-Formats:
-- short: 30-60s single quote with art (daily)
-- story: 3-5 min original FICTION that embeds philosophy through narrative, not lectures (2-3x/week)
-- midform: 3-5 min multi-quote direct philosophical exploration (2x/week)
-- longform: 15-25 min deep essay (weekends)
+RULES:
+- Every day MUST have 1 short for wisdom AND 1 short for gibran
+- Stories on Mon/Wed/Fri for each channel
+- Midform on Tue/Thu for each channel
+- Longform on Sat or Sun for each channel
+- Vary philosophers across the week (no same philosopher 2 days in a row for wisdom)
+- Topics should be inspired by trending data but framed through the philosopher's lens
+- Each topic title should be compelling and specific, not generic
+- Gibran topics should draw from themes in The Prophet, The Broken Wings, Sand and Foam"""
 
-Mix formats across the week. Include at least 2 stories per week.
-Match philosophers to topics naturally. Ensure variety across philosophers and channels."""
-
-    response = _call_anthropic(HAIKU_MODEL, system, user, max_tokens=2048)
+    response = _call_anthropic(SONNET_MODEL, system, user, max_tokens=4000)
     result = _parse_json_response(response)
     if isinstance(result, list):
         plan = result
