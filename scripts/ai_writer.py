@@ -166,8 +166,11 @@ def push_weekly_plan_to_supabase(plan: list, channel_map: dict = None) -> str:
         cmap.update(channel_map)
 
     # --- Step 1: Create weekly_plans row ---
+    iso_week = monday.isocalendar()[1]
     wp_payload = {
         "week_start": monday.isoformat(),
+        "week_number": iso_week,
+        "year": monday.year,
         "status": "draft",
     }
     wp_resp = requests.post(
@@ -197,12 +200,12 @@ def push_weekly_plan_to_supabase(plan: list, channel_map: dict = None) -> str:
         scheduled_date = (monday + timedelta(days=day_offset)).isoformat()
 
         topic_payload = {
-            "weekly_plan_id": weekly_plan_id,
+            "plan_id": weekly_plan_id,
             "title": item.get("topic", ""),
             "philosopher": philosopher,
             "channel_id": channel_id,
             "scheduled_date": scheduled_date,
-            "format": item.get("format", "short"),
+            "day_of_week": day_offset,
             "status": "suggested",
         }
         tp_resp = requests.post(
