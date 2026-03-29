@@ -61,6 +61,31 @@ def check_queued_content():
         return []
 
 
+def promote_scheduled_content():
+    """Promote scheduled content whose publish time has arrived to approved."""
+    try:
+        now_iso = datetime.utcnow().isoformat() + "Z"
+        url = f"{SUPABASE_URL}/rest/v1/content"
+        params = {
+            "select": "id,title",
+            "status": "eq.scheduled",
+            "scheduled_at": f"lte.{now_iso}",
+            "deleted_at": "is.null",
+        }
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        items = resp.json() if resp.status_code == 200 else []
+        for item in items:
+            requests.patch(
+                f"{url}?id=eq.{item['id']}",
+                headers=HEADERS,
+                json={"status": "approved"},
+                timeout=10,
+            )
+            print(f"  Promoted scheduled -> approved: {item.get('title', item['id'][:8])}")
+    except Exception as e:
+        print(f"  Error promoting scheduled: {e}")
+
+
 def check_approved_content():
     """Check Supabase for approved content with youtube_publish_requested and no youtube_video_id."""
     try:
@@ -247,6 +272,9 @@ def main():
                 print(f"[{now}] Generation batch complete.")
             else:
                 print(f"[{now}] No queued content.")
+
+            # --- Check for scheduled content whose time has arrived ---
+            promote_scheduled_content()
 
             # --- Check for approved content to publish to YouTube ---
             approved = check_approved_content()
