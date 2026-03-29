@@ -15,8 +15,6 @@ import {
   DARK_GRADIENT_TOP,
   FPS,
   GOLD,
-  SHORT_HEIGHT,
-  SHORT_WIDTH,
 } from "../lib/constants";
 import { TimelineSchema } from "../lib/types";
 import { calculateFrameTiming, getAudioPath, getImagePath } from "../lib/utils";
@@ -213,12 +211,6 @@ const ShortBackground: React.FC<{
   const frame = useCurrentFrame();
   const localMs = (frame / FPS) * 1000;
   const { width, height } = useVideoConfig();
-
-  // For portrait: cover the 1080x1920 frame
-  const coverScale = Math.max(
-    width / SHORT_WIDTH,
-    height / SHORT_HEIGHT,
-  );
 
   // Use image natural ratio — we assume source images may be landscape
   // so we scale to cover the portrait frame

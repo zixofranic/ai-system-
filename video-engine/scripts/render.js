@@ -34,23 +34,37 @@ let compositionId = args.composition;
 // Step 1: Convert if we have source data
 if (!compositionId && args.script) {
   compositionId = args.output || "story";
-  console.log(`\n=== Converting story data ===`);
-  const convertArgs = [
-    `--script "${args.script}"`,
-    `--timestamps "${args.timestamps}"`,
-    `--art-paths "${args["art-paths"]}"`,
-    `--voice "${args.voice}"`,
-    args.music ? `--music "${args.music}"` : "",
-    `--output "${compositionId}"`,
-    `--format "${args.format || "story"}"`,
-  ]
-    .filter(Boolean)
-    .join(" ");
+  const format = args.format || "story";
 
-  execSync(`node "${path.join(__dirname, "convert-story.js")}" ${convertArgs}`, {
-    stdio: "inherit",
-    cwd: projectRoot,
-  });
+  // Route to format-specific converter
+  const converterMap = {
+    story: "convert-story.js",
+    short: "convert-short.js",
+    midform: "convert-midform.js",
+    longform: "convert-longform.js",
+  };
+  const converterFile = converterMap[format] || converterMap.story;
+
+  console.log(`\n=== Converting ${format} data ===`);
+
+  // Build args based on format
+  const convertArgs = [];
+  convertArgs.push(`--script "${args.script}"`);
+  if (args.timestamps) convertArgs.push(`--timestamps "${args.timestamps}"`);
+  if (args["art-paths"]) convertArgs.push(`--art-paths "${args["art-paths"]}"`);
+  if (args.image) convertArgs.push(`--image "${args.image}"`);
+  if (args.voice) convertArgs.push(`--voice "${args.voice}"`);
+  if (args.music) convertArgs.push(`--music "${args.music}"`);
+  convertArgs.push(`--output "${compositionId}"`);
+  if (format !== "short") convertArgs.push(`--format "${format}"`);
+
+  execSync(
+    `node "${path.join(__dirname, converterFile)}" ${convertArgs.join(" ")}`,
+    {
+      stdio: "inherit",
+      cwd: projectRoot,
+    },
+  );
 }
 
 if (!compositionId) {

@@ -19,8 +19,6 @@ export const Background: React.FC<{
   const localMs = (frame / FPS) * 1000;
   const { width, height } = useVideoConfig();
 
-  const imageRatio = IMAGE_HEIGHT / IMAGE_WIDTH;
-
   // Scale image to cover the full frame (landscape)
   const coverScale = Math.max(width / IMAGE_WIDTH, height / IMAGE_HEIGHT);
   const imgWidth = IMAGE_WIDTH * coverScale;
