@@ -81,9 +81,77 @@ def _sanitize_text(text):
     return text
 
 
-def generate_voice_with_timestamps(text, voice_id, output_path):
-    """Generate voice with word-level timestamps."""
-    print("  Generating voice with timestamps...")
+def _generate_voice_chatterbox(text, output_path, exaggeration=0.5, cfg_weight=0.5):
+    """Generate voice via local Chatterbox TTS (free, unlimited)."""
+    print("  Generating voice via Chatterbox TTS...")
+    text = _sanitize_text(text)
+    payload = {"text": text, "exaggeration": exaggeration, "cfg_weight": cfg_weight}
+
+    voice_ref = Path("C:/AI/system/voice/recordings/ziad_reference_voice.wav")
+    if voice_ref.exists():
+        payload["reference_audio"] = str(voice_ref)
+
+    resp = requests.post(f"http://localhost:8004/tts", json=payload, timeout=300)
+    resp.raise_for_status()
+
+    # Chatterbox returns WAV — save it, then convert to MP3 for consistency
+    wav_path = output_path.replace(".mp3", ".wav")
+    with open(wav_path, "wb") as f:
+        f.write(resp.content)
+
+    # Convert WAV to MP3 via ffmpeg
+    import subprocess
+    subprocess.run(["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame",
+                    "-b:a", "128k", output_path], capture_output=True)
+    print(f"  Voice saved: {output_path}")
+    return output_path
+
+
+def _extract_timestamps_whisper(audio_path):
+    """Extract word-level timestamps from audio using Whisper."""
+    print("  Extracting word timestamps via Whisper...")
+    try:
+        import whisper
+        model = whisper.load_model("base")
+        result = model.transcribe(audio_path, word_timestamps=True)
+
+        words = []
+        for segment in result.get("segments", []):
+            for w in segment.get("words", []):
+                words.append({
+                    "word": w["word"].strip(),
+                    "start": w["start"],
+                    "end": w["end"],
+                })
+
+        if words:
+            print(f"  Whisper: {len(words)} words, {words[-1]['end']:.1f}s")
+        return words if words else None
+    except ImportError:
+        print("  WARNING: whisper not installed, falling back to even-split timestamps")
+        return None
+
+
+def _generate_timestamps_from_text(text, audio_path):
+    """Fallback: estimate word timestamps by evenly distributing across audio duration."""
+    from moviepy.editor import AudioFileClip
+    duration = AudioFileClip(audio_path).duration
+    words_list = _sanitize_text(text).split()
+    time_per_word = duration / len(words_list)
+    words = []
+    for i, w in enumerate(words_list):
+        words.append({
+            "word": w,
+            "start": i * time_per_word,
+            "end": (i + 1) * time_per_word,
+        })
+    print(f"  Even-split timestamps: {len(words)} words, {duration:.1f}s")
+    return words
+
+
+def _generate_voice_elevenlabs(text, voice_id, output_path):
+    """Generate voice via ElevenLabs with word-level timestamps (paid API)."""
+    print("  Generating voice via ElevenLabs...")
     text = _sanitize_text(text)
     client = ElevenLabs(api_key=ELEVENLABS_KEY)
     result = client.text_to_speech.convert_with_timestamps(
@@ -121,6 +189,31 @@ def generate_voice_with_timestamps(text, voice_id, output_path):
 
     print(f"  Voice: {len(words)} words, {words[-1]['end']:.1f}s")
     return words
+
+
+def generate_voice_with_timestamps(text, voice_id, output_path, use_elevenlabs=False):
+    """
+    Generate voice + word-level timestamps.
+    Default: Chatterbox (free) + Whisper for timestamps.
+    Fallback: ElevenLabs (paid, has built-in timestamps).
+    """
+    if use_elevenlabs:
+        return _generate_voice_elevenlabs(text, voice_id, output_path)
+
+    # Try Chatterbox first
+    try:
+        _generate_voice_chatterbox(text, output_path)
+    except Exception as e:
+        print(f"  Chatterbox failed: {e}")
+        print("  Falling back to ElevenLabs...")
+        return _generate_voice_elevenlabs(text, voice_id, output_path)
+
+    # Get word timestamps via Whisper, or fallback to even-split
+    timestamps = _extract_timestamps_whisper(output_path)
+    if not timestamps:
+        timestamps = _generate_timestamps_from_text(text, output_path)
+
+    return timestamps
 
 
 def _copy_to_input(image_path):
@@ -428,6 +521,8 @@ def main():
     parser.add_argument("--mood", default=None)
     parser.add_argument("--script-json", default=None,
                         help="Path to pre-generated story script JSON (skip generation)")
+    parser.add_argument("--use-elevenlabs", action="store_true",
+                        help="Use ElevenLabs for voice (default: Chatterbox)")
     args = parser.parse_args()
 
     philosopher = args.philosopher
@@ -473,14 +568,22 @@ def main():
     word_count = len(story['story_script'].split())
     print(f"  Words: {word_count} (~{word_count // 150} min narration)")
 
-    # 2. Generate voice for the full story
+    # 2. Generate voice for the full story (skip if voice + timestamps already exist)
     voice_path = str(output_dir / f"{prefix}_voice.mp3")
-    word_timestamps = generate_voice_with_timestamps(story["story_script"], voice_id, voice_path)
+    ts_path = str(output_dir / f"{prefix}_timestamps.json")
 
-    if word_timestamps:
-        ts_path = str(output_dir / f"{prefix}_timestamps.json")
-        with open(ts_path, "w") as f:
-            json.dump(word_timestamps, f, indent=2)
+    if Path(voice_path).exists() and Path(ts_path).exists():
+        print(f"  Voice already exists: {voice_path}")
+        with open(ts_path) as f:
+            word_timestamps = json.load(f)
+        print(f"  Timestamps loaded: {len(word_timestamps)} words")
+    else:
+        word_timestamps = generate_voice_with_timestamps(
+            story["story_script"], voice_id, voice_path,
+            use_elevenlabs=args.use_elevenlabs)
+        if word_timestamps:
+            with open(ts_path, "w") as f:
+                json.dump(word_timestamps, f, indent=2)
 
     # 3. Generate art for each scene (IP-Adapter for character consistency)
     print(f"\n  Generating {len(story['scenes'])} scene images...")
