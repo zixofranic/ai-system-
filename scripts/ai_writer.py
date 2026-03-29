@@ -129,11 +129,14 @@ def _supabase_headers():
     }
 
 
-def _monday_of_current_week() -> datetime:
-    """Return the Monday of the current ISO week at midnight UTC."""
+def _monday_of_next_week() -> datetime:
+    """Return the Monday of NEXT week at midnight UTC.
+    Planning always targets the upcoming week, not the current one."""
     today = datetime.now(timezone.utc).date()
-    monday = today - timedelta(days=today.weekday())  # weekday() 0=Mon
-    return monday
+    days_until_monday = (7 - today.weekday()) % 7
+    if days_until_monday == 0:
+        days_until_monday = 7  # if today is Monday, target next Monday
+    return today + timedelta(days=days_until_monday)
 
 
 def push_weekly_plan_to_supabase(plan: list, channel_map: dict = None) -> str:
@@ -158,7 +161,7 @@ def push_weekly_plan_to_supabase(plan: list, channel_map: dict = None) -> str:
         )
 
     headers = _supabase_headers()
-    monday = _monday_of_current_week()
+    monday = _monday_of_next_week()
 
     # Merge provided channel_map with defaults
     cmap = dict(_DEFAULT_CHANNEL_MAP)
