@@ -33,10 +33,32 @@ const TextElementSchema = TimelineElementSchema.extend({
     z.literal("center"),
   ]),
   animations: z.array(ElementAnimationSchema).optional(),
+  // Extended fields for shorts / midform / longform
+  role: z
+    .union([
+      z.literal("caption"),
+      z.literal("quote"),
+      z.literal("attribution"),
+      z.literal("narration"),
+      z.literal("chapter-title"),
+    ])
+    .optional(),
+  attribution: z.string().optional(),
 });
 
 const AudioElementSchema = TimelineElementSchema.extend({
   audioUrl: z.string(),
+});
+
+const MetadataSchema = z.object({
+  format: z.string().optional(),
+  width: z.number().optional(),
+  height: z.number().optional(),
+  fps: z.number().optional(),
+  philosopher: z.string().optional(),
+  channel: z.string().optional(),
+  closingAttribution: z.string().optional(),
+  watermark: z.string().optional(),
 });
 
 const TimelineSchema = z.object({
@@ -44,6 +66,8 @@ const TimelineSchema = z.object({
   elements: z.array(BackgroundElementSchema),
   text: z.array(TextElementSchema),
   audio: z.array(AudioElementSchema),
+  // Extended fields for shorts / midform / longform
+  metadata: MetadataSchema.optional(),
 });
 
 export type BackgroundTransitionType = z.infer<
@@ -55,6 +79,7 @@ export type ElementAnimation = z.infer<typeof ElementAnimationSchema>;
 export type BackgroundElement = z.infer<typeof BackgroundElementSchema>;
 export type TextElement = z.infer<typeof TextElementSchema>;
 export type AudioElement = z.infer<typeof AudioElementSchema>;
+export type Metadata = z.infer<typeof MetadataSchema>;
 export type Timeline = z.infer<typeof TimelineSchema>;
 
 export {
@@ -62,6 +87,7 @@ export {
   BackgroundElementSchema,
   BackgroundTransitionTypeSchema,
   ElementAnimationSchema,
+  MetadataSchema,
   TextElementSchema,
   TimelineElementSchema,
   TimelineSchema,

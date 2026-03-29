@@ -387,6 +387,12 @@ def _build_waveform_pulse(voice_path, total_duration, fps, canvas_w, canvas_h,
     hex_c = color.lstrip("#")
     cr, cg, cb = (int(hex_c[i:i+2], 16) for i in (0, 2, 4))
 
+    # Pre-compute wave x positions
+    wave_w = int(canvas_w * 0.75)
+    x_start = (canvas_w - wave_w) // 2
+    seg_w = wave_w // n_points
+    phases = np.linspace(0, np.pi * 2, n_points)
+
     def make_frame(t):
         frame = np.zeros((canvas_h, canvas_w, 4), dtype=np.uint8)
         adj_t = t - voice_start
@@ -397,42 +403,25 @@ def _build_waveform_pulse(voice_path, total_duration, fps, canvas_w, canvas_h,
         amplitude = rms[idx]
         shape_var = cent[min(idx, len(cent) - 1)]
 
-        # Draw a smooth waveform across the width
-        wave_w = int(canvas_w * 0.75)
-        x_start = (canvas_w - wave_w) // 2
+        freq_mod = 2.0 + shape_var * 3.0
+        wave_vals = np.abs(np.sin(phases * freq_mod + adj_t * 4.0))
+        heights = np.maximum(2, (wave_vals * amplitude * wave_height).astype(int))
 
         for p in range(n_points):
-            px = x_start + int(p * wave_w / n_points)
-            px2 = x_start + int((p + 1) * wave_w / n_points)
+            px = x_start + p * seg_w
+            px2 = px + seg_w
+            h = heights[p]
 
-            # Create organic wave shape using sin with varying frequency
-            import math
-            phase = (p / n_points) * math.pi * 2
-            freq_mod = 2.0 + shape_var * 3.0
-            wave_val = math.sin(phase * freq_mod + adj_t * 4.0)
-            h = int(abs(wave_val) * amplitude * wave_height)
-            h = max(2, h)
-
-            # Center line at y_position
-            y1 = y_position - h
-            y2 = y_position + h
-
-            # Clamp
-            y1 = max(0, min(y1, canvas_h - 1))
-            y2 = max(0, min(y2, canvas_h - 1))
+            y1 = max(0, y_position - h)
+            y2 = min(canvas_h - 1, y_position + h)
             if y2 <= y1:
                 continue
 
-            # Draw with alpha gradient (brighter at center)
-            mid = (y1 + y2) // 2
-            for row in range(y1, y2):
-                dist = abs(row - mid) / max(h, 1)
-                alpha = int(200 * (1.0 - dist * 0.6) * amplitude)
-                alpha = max(0, min(255, alpha))
-                frame[row, px:px2, 0] = cr
-                frame[row, px:px2, 1] = cg
-                frame[row, px:px2, 2] = cb
-                frame[row, px:px2, 3] = alpha
+            alpha = int(180 * amplitude)
+            frame[y1:y2, px:px2, 0] = cr
+            frame[y1:y2, px:px2, 1] = cg
+            frame[y1:y2, px:px2, 2] = cb
+            frame[y1:y2, px:px2, 3] = alpha
 
         return frame
 
