@@ -33,7 +33,8 @@ import argparse
 import traceback
 import requests
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import calendar
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -559,9 +560,110 @@ def _get_google_access_token(channel: dict) -> str:
     return _refresh_google_token(channel["id"], refresh_token)
 
 
+def _week_folder_name(target_date: datetime = None) -> str:
+    """
+    Build the weekly folder name: ``Month-W#-MonDD-MonDD``
+
+    Examples:
+        ``March-W1-Feb23-Mar1``   (week spans two months)
+        ``March-W4-Mar22-Mar28``  (week within one month)
+
+    The week number is relative to the month: W1 contains the first Monday
+    that falls on or after the 1st, and so on.
+    """
+    if target_date is None:
+        target_date = datetime.now(timezone.utc).date()
+    elif hasattr(target_date, "date"):
+        target_date = target_date.date()
+
+    # Monday of the target date's week
+    monday = target_date - timedelta(days=target_date.weekday())
+    sunday = monday + timedelta(days=6)
+
+    # Month name comes from the target date (the date we are scheduling for)
+    month_name = calendar.month_name[target_date.month]
+
+    # Week number within the month: how many Mondays from the 1st to this Monday
+    first_of_month = target_date.replace(day=1)
+    # Find the first Monday on or after the 1st
+    days_until_monday = (7 - first_of_month.weekday()) % 7
+    first_monday = first_of_month + timedelta(days=days_until_monday)
+    if monday < first_monday:
+        week_num = 1
+    else:
+        week_num = ((monday - first_monday).days // 7) + 1
+        if first_of_month.weekday() != 0:
+            week_num += 1  # account for partial first week
+
+    # Short month abbreviations for range
+    mon_start = f"{calendar.month_abbr[monday.month]}{monday.day}"
+    mon_end = f"{calendar.month_abbr[sunday.month]}{sunday.day}"
+
+    return f"{month_name}-W{week_num}-{mon_start}-{mon_end}"
+
+
+def _find_drive_subfolder(access_token: str, parent_id: str,
+                          folder_name: str) -> str | None:
+    """Search for an existing subfolder by name inside a parent Drive folder."""
+    query = (
+        f"'{parent_id}' in parents "
+        f"and name = '{folder_name}' "
+        f"and mimeType = 'application/vnd.google-apps.folder' "
+        f"and trashed = false"
+    )
+    resp = requests.get(
+        "https://www.googleapis.com/drive/v3/files",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"q": query, "fields": "files(id,name)", "pageSize": 1},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    files = resp.json().get("files", [])
+    return files[0]["id"] if files else None
+
+
+def _create_drive_subfolder(access_token: str, parent_id: str,
+                            folder_name: str) -> str:
+    """Create a new subfolder inside a parent Drive folder. Returns the new folder id."""
+    metadata = {
+        "name": folder_name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    }
+    resp = requests.post(
+        "https://www.googleapis.com/drive/v3/files",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json=metadata,
+        params={"fields": "id"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["id"]
+
+
+def _get_or_create_week_folder(access_token: str, parent_folder_id: str) -> str:
+    """
+    Ensure a weekly subfolder exists under the channel's root Drive folder.
+    Returns the subfolder id to upload into.
+    """
+    folder_name = _week_folder_name()
+    existing_id = _find_drive_subfolder(access_token, parent_folder_id, folder_name)
+    if existing_id:
+        print(f"  [drive] Using existing week folder: {folder_name}")
+        return existing_id
+
+    new_id = _create_drive_subfolder(access_token, parent_folder_id, folder_name)
+    print(f"  [drive] Created week folder: {folder_name}")
+    return new_id
+
+
 def upload_to_drive(file_path: str, channel: dict) -> str:
     """
-    Upload a video file to the channel's Google Drive folder.
+    Upload a video file to the channel's Google Drive folder inside a
+    weekly subfolder (``Month-W#-MonDD-MonDD``).
     Returns the Drive web view URL.
     """
     access_token = _get_google_access_token(channel)
@@ -571,14 +673,17 @@ def upload_to_drive(file_path: str, channel: dict) -> str:
             f"No Google Drive folder configured for channel '{channel.get('name', '?')}'"
         )
 
+    # Resolve (or create) the weekly subfolder
+    week_folder_id = _get_or_create_week_folder(access_token, folder_id)
+
     filename = Path(file_path).name
     file_size = Path(file_path).stat().st_size
 
     # Use multipart upload for files under 5MB, resumable for larger
     if file_size < 5 * 1024 * 1024:
-        return _upload_multipart(access_token, folder_id, file_path, filename)
+        return _upload_multipart(access_token, week_folder_id, file_path, filename)
     else:
-        return _upload_resumable(access_token, folder_id, file_path, filename)
+        return _upload_resumable(access_token, week_folder_id, file_path, filename)
 
 
 def _upload_multipart(access_token: str, folder_id: str,

@@ -26,7 +26,7 @@
     {
       "parameters": {
         "method": "GET",
-        "url": "https://kwyqaewdvvdhodxieqrh.supabase.co/rest/v1/content_items",
+        "url": "https://kwyqaewdvvdhodxieqrh.supabase.co/rest/v1/content",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -84,7 +84,7 @@
     {
       "parameters": {
         "method": "PATCH",
-        "url": "https://kwyqaewdvvdhodxieqrh.supabase.co/rest/v1/content_items",
+        "url": "https://kwyqaewdvvdhodxieqrh.supabase.co/rest/v1/content",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [

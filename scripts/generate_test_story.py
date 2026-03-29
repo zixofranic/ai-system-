@@ -123,33 +123,83 @@ def generate_voice_with_timestamps(text, voice_id, output_path):
     return words
 
 
-def generate_scene_art(art_prompt, output_prefix, use_lora=None):
+def _copy_to_input(image_path):
+    """Copy an image to ComfyUI's input directory so LoadImage can find it."""
+    import shutil
+    input_dir = Path("C:/AI/system/ComfyUI/input")
+    input_dir.mkdir(exist_ok=True)
+    dest = input_dir / Path(image_path).name
+    shutil.copy2(image_path, dest)
+    return dest.name
+
+
+def _submit_and_wait(workflow, output_prefix):
+    """Submit a ComfyUI workflow and wait for the result image path."""
+    resp = requests.post(f"{COMFYUI_URL}/prompt", json={"prompt": workflow})
+    data = resp.json()
+    if "prompt_id" not in data:
+        print(f"    ComfyUI error: {data}")
+        return None
+    prompt_id = data["prompt_id"]
+    for i in range(120):
+        time.sleep(2)
+        hist = requests.get(f"{COMFYUI_URL}/history/{prompt_id}").json()
+        if prompt_id in hist:
+            outputs = hist[prompt_id].get("outputs", {})
+            if "8" in outputs:
+                filename = outputs["8"]["images"][0]["filename"]
+                return f"C:/AI/system/ComfyUI/output/{filename}"
+    return None
+
+
+def generate_scene_art(art_prompt, output_prefix, reference_image_path=None):
     """
     Generate art for a single scene via ComfyUI.
-    Stories use base SDXL (no LoRA) for style flexibility.
-    Shorts use philosopher-specific LoRAs.
+    If reference_image_path is provided, uses IP-Adapter to maintain
+    character consistency with the reference image.
     """
-    if use_lora:
-        # With LoRA (for Shorts)
-        lora_trigger = use_lora.replace("_v1.safetensors", "").replace("_", " ")
-        full_prompt = f"{lora_trigger}, {art_prompt}"
+    neg_prompt = "blurry, low quality, text, watermark, anime, cartoon, 3d render, deformed face, extra limbs, disfigured, bad anatomy, multiple people where one expected"
+
+    if reference_image_path:
+        # IP-Adapter workflow: use reference image for character consistency
+        # IPAdapterUnifiedLoader auto-selects the right IP-Adapter model
         workflow = {
             "1": {"class_type": "CheckpointLoaderSimple",
                   "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
-            "2": {"class_type": "LoraLoader",
-                  "inputs": {"lora_name": use_lora, "strength_model": 0.8, "strength_clip": 0.8,
-                              "model": ["1", 0], "clip": ["1", 1]}},
             "3": {"class_type": "CLIPTextEncode",
-                  "inputs": {"text": full_prompt, "clip": ["2", 1]}},
+                  "inputs": {"text": art_prompt, "clip": ["1", 1]}},
             "4": {"class_type": "CLIPTextEncode",
-                  "inputs": {"text": "blurry, low quality, text, watermark, anime, cartoon, 3d render, deformed face, extra limbs",
-                              "clip": ["2", 1]}},
+                  "inputs": {"text": neg_prompt, "clip": ["1", 1]}},
             "5": {"class_type": "EmptyLatentImage",
                   "inputs": {"width": 1216, "height": 832, "batch_size": 1}},
+            # Load reference image — copy to ComfyUI input dir first
+            "10": {"class_type": "LoadImage",
+                   "inputs": {"image": _copy_to_input(reference_image_path)}},
+            # Unified loader: auto-loads IP-Adapter + CLIP Vision
+            # Use STANDARD preset — PLUS (high strength) copies entire composition
+            "12": {"class_type": "IPAdapterUnifiedLoader",
+                   "inputs": {
+                       "model": ["1", 0],
+                       "preset": "STANDARD (medium strength)",
+                   }},
+            # Apply IP-Adapter with reference image
+            # Low weight + early-only: sets character likeness but lets
+            # the text prompt control the scene composition
+            "13": {"class_type": "IPAdapter",
+                   "inputs": {
+                       "model": ["12", 0],
+                       "ipadapter": ["12", 1],
+                       "image": ["10", 0],
+                       "weight": 0.3,
+                       "start_at": 0.0,
+                       "end_at": 0.4,
+                       "weight_type": "standard",
+                   }},
+            # Sample with IP-Adapter-conditioned model
             "6": {"class_type": "KSampler",
-                  "inputs": {"seed": random.randint(1, 999999), "steps": 28, "cfg": 7.0,
+                  "inputs": {"seed": random.randint(1, 999999), "steps": 30, "cfg": 7.0,
                               "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
-                              "model": ["2", 0], "positive": ["3", 0], "negative": ["4", 0],
+                              "model": ["13", 0], "positive": ["3", 0], "negative": ["4", 0],
                               "latent_image": ["5", 0]}},
             "7": {"class_type": "VAEDecode",
                   "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
@@ -157,15 +207,14 @@ def generate_scene_art(art_prompt, output_prefix, use_lora=None):
                   "inputs": {"filename_prefix": output_prefix, "images": ["7", 0]}},
         }
     else:
-        # No LoRA — base SDXL for stories (better style flexibility)
+        # No reference — base SDXL (Scene 1, establishing shot)
         workflow = {
             "1": {"class_type": "CheckpointLoaderSimple",
                   "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
             "3": {"class_type": "CLIPTextEncode",
                   "inputs": {"text": art_prompt, "clip": ["1", 1]}},
             "4": {"class_type": "CLIPTextEncode",
-                  "inputs": {"text": "blurry, low quality, text, watermark, anime, cartoon, 3d render, deformed face, extra limbs, disfigured, bad anatomy",
-                              "clip": ["1", 1]}},
+                  "inputs": {"text": neg_prompt, "clip": ["1", 1]}},
             "5": {"class_type": "EmptyLatentImage",
                   "inputs": {"width": 1216, "height": 832, "batch_size": 1}},
             "6": {"class_type": "KSampler",
@@ -179,17 +228,7 @@ def generate_scene_art(art_prompt, output_prefix, use_lora=None):
                   "inputs": {"filename_prefix": output_prefix, "images": ["7", 0]}},
         }
 
-    resp = requests.post(f"{COMFYUI_URL}/prompt", json={"prompt": workflow})
-    prompt_id = resp.json()["prompt_id"]
-    for i in range(120):
-        time.sleep(2)
-        hist = requests.get(f"{COMFYUI_URL}/history/{prompt_id}").json()
-        if prompt_id in hist:
-            outputs = hist[prompt_id].get("outputs", {})
-            if "8" in outputs:
-                filename = outputs["8"]["images"][0]["filename"]
-                return f"C:/AI/system/ComfyUI/output/{filename}"
-    return None
+    return _submit_and_wait(workflow, output_prefix)
 
 
 def find_scene_word_boundaries(words, scenes_narration):
@@ -242,23 +281,35 @@ def assemble_story_video(story_data, voice_path, word_timestamps, art_paths,
     # Map word timestamps to scene boundaries
     boundaries = find_scene_word_boundaries(word_timestamps, scenes_narration)
 
+    # Base background — prevents black frames during any timing gaps
+    base_bg = ColorClip(size=(1920, 1080), color=(0, 0, 0)).set_duration(total_duration)
+    scene_clips = [base_bg]
+
     # Build scene clips — each scene gets its own art background
-    scene_clips = []
+    # Pre-calculate all scene boundaries so we can close timing gaps
+    scene_times = []
+    for i in range(len(scenes)):
+        start_idx, end_idx = boundaries[i] if i < len(boundaries) else (0, len(word_timestamps) - 1)
+        s_start = word_timestamps[start_idx]["start"] + voice_start
+        s_end = word_timestamps[min(end_idx, len(word_timestamps) - 1)]["end"] + voice_start
+        if i == 0:
+            s_start = 0
+        if i == len(scenes) - 1:
+            s_end = total_duration
+        scene_times.append((s_start, s_end))
+
+    # Close gaps: each scene starts where the previous one ended
+    for i in range(1, len(scene_times)):
+        prev_end = scene_times[i - 1][1]
+        curr_start = scene_times[i][0]
+        if curr_start > prev_end:
+            scene_times[i] = (prev_end, scene_times[i][1])
+
     for i, (scene, art_path) in enumerate(zip(scenes, art_paths)):
         if not art_path:
             continue
 
-        start_idx, end_idx = boundaries[i] if i < len(boundaries) else (0, len(word_timestamps) - 1)
-
-        # Scene timing from word timestamps
-        scene_start = word_timestamps[start_idx]["start"] + voice_start
-        scene_end = word_timestamps[min(end_idx, len(word_timestamps) - 1)]["end"] + voice_start
-
-        # First scene starts at 0, last scene extends to end
-        if i == 0:
-            scene_start = 0
-        if i == len(scenes) - 1:
-            scene_end = total_duration
+        scene_start, scene_end = scene_times[i]
 
         scene_duration = scene_end - scene_start
 
@@ -431,16 +482,30 @@ def main():
         with open(ts_path, "w") as f:
             json.dump(word_timestamps, f, indent=2)
 
-    # 3. Generate art for each scene
+    # 3. Generate art for each scene (IP-Adapter for character consistency)
     print(f"\n  Generating {len(story['scenes'])} scene images...")
+    print(f"  IP-Adapter: Scene 1 = hero shot, Scenes 2+ use Scene 1 as reference")
     art_paths = []
+    reference_image = None  # Scene 1 becomes the reference for all subsequent scenes
+
     for i, scene in enumerate(story["scenes"]):
         scene_prefix = f"{prefix}_scene{i+1}"
         print(f"  Scene {i+1}/{len(story['scenes'])}: {scene.get('mood', '')}")
-        # Stories use base SDXL (no LoRA) for style flexibility and consistency
-        art_path = generate_scene_art(scene["art_prompt"], scene_prefix)
+
+        if i == 0:
+            # Scene 1: no reference, establish the character
+            art_path = generate_scene_art(scene["art_prompt"], scene_prefix)
+            if art_path:
+                reference_image = art_path  # Save as reference for subsequent scenes
+                print(f"    Art (hero): {Path(art_path).name}")
+        else:
+            # Scenes 2+: use Scene 1 as IP-Adapter reference
+            art_path = generate_scene_art(scene["art_prompt"], scene_prefix,
+                                           reference_image_path=reference_image)
+            if art_path:
+                print(f"    Art (ref): {Path(art_path).name}")
+
         if art_path:
-            print(f"    Art: {Path(art_path).name}")
             art_paths.append(art_path)
         else:
             print(f"    ART FAILED for scene {i+1}")

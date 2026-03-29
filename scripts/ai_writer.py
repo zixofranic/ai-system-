@@ -21,6 +21,7 @@ import sys
 import re
 import requests
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 import anthropic
@@ -101,6 +102,123 @@ def _parse_json_response(text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Supabase helpers
+# ---------------------------------------------------------------------------
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+
+# Channel IDs (hardcoded defaults, overridable via channel_map)
+_DEFAULT_CHANNEL_MAP = {
+    "Gibran Khalil Gibran": "ff18bcb2-21db-4320-89ad-c24d04f0dad3",  # Gibran channel
+}
+_WISDOM_CHANNEL_ID = "1b3ba813-31c5-42b3-a270-67e85fcc7123"
+
+_DAY_OFFSETS = {
+    "Monday": 0, "Tuesday": 1, "Wednesday": 2, "Thursday": 3,
+    "Friday": 4, "Saturday": 5, "Sunday": 6,
+}
+
+
+def _supabase_headers():
+    """Standard headers for Supabase REST API calls."""
+    return {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+
+def _monday_of_current_week() -> datetime:
+    """Return the Monday of the current ISO week at midnight UTC."""
+    today = datetime.now(timezone.utc).date()
+    monday = today - timedelta(days=today.weekday())  # weekday() 0=Mon
+    return monday
+
+
+def push_weekly_plan_to_supabase(plan: list, channel_map: dict = None) -> str:
+    """
+    Write a generated weekly plan to Supabase.
+
+    Creates one row in `weekly_plans` and one row per plan item in
+    `plan_topics`.
+
+    Args:
+        plan: List of 7 dicts from generate_weekly_plan().
+        channel_map: Optional dict mapping philosopher name -> channel UUID.
+                     Falls back to: Gibran -> Gibran channel, everyone else
+                     -> Wisdom channel.
+
+    Returns:
+        The UUID of the created weekly_plan row.
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        raise RuntimeError(
+            "SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in environment"
+        )
+
+    headers = _supabase_headers()
+    monday = _monday_of_current_week()
+
+    # Merge provided channel_map with defaults
+    cmap = dict(_DEFAULT_CHANNEL_MAP)
+    if channel_map:
+        cmap.update(channel_map)
+
+    # --- Step 1: Create weekly_plans row ---
+    wp_payload = {
+        "week_start": monday.isoformat(),
+        "status": "draft",
+    }
+    wp_resp = requests.post(
+        f"{SUPABASE_URL}/rest/v1/weekly_plans",
+        headers=headers,
+        json=wp_payload,
+        timeout=30,
+    )
+    wp_resp.raise_for_status()
+    wp_data = wp_resp.json()
+    # Supabase returns a list when Prefer: return=representation is set
+    weekly_plan_id = wp_data[0]["id"] if isinstance(wp_data, list) else wp_data["id"]
+
+    # --- Step 2: Create plan_topics rows ---
+    for item in plan:
+        philosopher = item.get("philosopher", "")
+        day_name = item.get("day", "Monday")
+
+        # Resolve channel_id
+        channel_id = cmap.get(philosopher)
+        if not channel_id:
+            # Default: everything that isn't explicitly mapped goes to Wisdom
+            channel_id = _WISDOM_CHANNEL_ID
+
+        # Calculate scheduled_date from day name
+        day_offset = _DAY_OFFSETS.get(day_name, 0)
+        scheduled_date = (monday + timedelta(days=day_offset)).isoformat()
+
+        topic_payload = {
+            "weekly_plan_id": weekly_plan_id,
+            "title": item.get("topic", ""),
+            "philosopher": philosopher,
+            "channel_id": channel_id,
+            "scheduled_date": scheduled_date,
+            "format": item.get("format", "short"),
+            "status": "suggested",
+        }
+        tp_resp = requests.post(
+            f"{SUPABASE_URL}/rest/v1/plan_topics",
+            headers=headers,
+            json=topic_payload,
+            timeout=30,
+        )
+        tp_resp.raise_for_status()
+
+    print(f"[ai_writer] Weekly plan {weekly_plan_id} pushed to Supabase "
+          f"(week of {monday.isoformat()}, {len(plan)} topics)")
+    return weekly_plan_id
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -159,8 +277,18 @@ Match philosophers to topics naturally. Ensure variety across philosophers and c
     response = _call_anthropic(HAIKU_MODEL, system, user, max_tokens=2048)
     result = _parse_json_response(response)
     if isinstance(result, list):
-        return result
-    return result.get("plan", result.get("raw", []))
+        plan = result
+    else:
+        plan = result.get("plan", result.get("raw", []))
+
+    # Push plan to Supabase if credentials are available
+    if isinstance(plan, list) and plan and SUPABASE_URL and SUPABASE_SERVICE_KEY:
+        try:
+            push_weekly_plan_to_supabase(plan)
+        except Exception as e:
+            print(f"[ai_writer] WARNING: Failed to push weekly plan to Supabase: {e}")
+
+    return plan
 
 
 def generate_short_script(philosopher: str, topic: str,
@@ -327,21 +455,38 @@ def generate_story_script(philosopher: str, theme: str,
     mood_line = f"Mood: {mood}" if mood else "Mood: Choose what fits — dark, dreamy, bittersweet, tense, tender, whatever serves the story."
     notes_line = f"Creative direction: {notes}" if notes else ""
 
-    system = """You are an extraordinary fiction writer who weaves philosophy into stories so naturally that the viewer never feels preached to.
+    # Match writer style to mood
+    WRITER_STYLES = {
+        "dark": ("Cormac McCarthy", "Sparse, brutal prose. No quotation marks around dialogue. Short declarative sentences. Visceral imagery. Violence implied, never glorified. The landscape is a character."),
+        "tense": ("Cormac McCarthy", "Sparse, brutal prose. No quotation marks around dialogue. Short declarative sentences. Let silence do the work."),
+        "bittersweet": ("Raymond Carver", "Minimalist domestic realism. Small moments that devastate. Understatement is everything. What is NOT said matters more than what is. Working-class characters. No melodrama."),
+        "dreamy": ("Ocean Vuong", "Lyrical, sensory, aching prose. Time moves strangely. Memory and present blur. Immigrant textures. The body remembers what the mind forgets. Poetic but never pretentious."),
+        "psychological": ("Dostoevsky", "Deep interior monologue. The character argues with themselves. Moral weight in every small decision. Long sentences that spiral inward. Existential claustrophobia."),
+        "sharp": ("Hemingway", "Iceberg theory. What is unsaid carries the weight. Declarative sentences. Dialogue that sounds real but cuts. No adjectives you do not need. Every word earns its place."),
+        "tender": ("Marilynne Robinson", "Luminous attention to ordinary things. Grief and grace intertwined. Long pastoral sentences. The sacred in the mundane. Silence between people who love each other."),
+        "noir": ("Raymond Chandler", "First person. Cynical narrator. Sharp metaphors. City at night. Everyone has a secret. Moral ambiguity. Dark humor."),
+    }
+
+    mood_key = (mood or "sharp").lower().split(",")[0].strip()
+    writer_name, writer_desc = WRITER_STYLES.get(mood_key, WRITER_STYLES["sharp"])
+
+    system = f"""You are a world-class fiction writer. For this story, write in the literary style of {writer_name}.
+
+STYLE GUIDE FOR {writer_name.upper()}:
+{writer_desc}
 
 Your stories have:
 - Real characters with names, faces, and flaws
-- Specific sensory details — what the air smells like, what the walls look like
-- Conflict, tension, turning points — not just atmosphere
+- Specific sensory details that put the viewer INSIDE the scene
+- Conflict, tension, turning points -- not just atmosphere
 - Dialogue that reveals character, not lectures
-- The philosophical teaching EMBEDDED in action and consequence, never stated directly
-- An ending that lands emotionally — the viewer feels the wisdom, they don't hear it
-
-You write like Hemingway meets Khalil Gibran — spare, vivid, poetic where it counts, never flowery for the sake of it.
+- The philosophical teaching EMBEDDED in action and consequence, never stated
+- An ending that LANDS -- the viewer feels the story is complete, not cut off
+- Every sentence earns its place. Cut anything that does not serve the story.
 
 Output valid JSON only."""
 
-    user = f"""Write an original short fiction story (500-800 words, 3-5 minutes when narrated) that carries the philosophical spirit of {philosopher} on the theme of "{theme}".
+    user = f"""Write an original short fiction story (500-700 words, 3 minutes when narrated) that carries the philosophical spirit of {philosopher} on the theme of "{theme}".
 
 {setting_line}
 {era_line}
@@ -351,54 +496,64 @@ Output valid JSON only."""
 CRITICAL RULES:
 - This is FICTION. Original characters, original plot.
 - NEVER quote the philosopher directly in the story
-- NEVER mention the philosopher's name in the story — not even as a character name
+- NEVER mention the philosopher's name in the story -- not even as a character name
 - NEVER name a character after ANY philosopher (no Marcus, no Seneca, no Rumi, etc.)
 - NEVER use phrases like "as the ancients said" or "wisdom teaches us"
 - The philosophy must be FELT through what happens, not TOLD
 - The philosopher's name only appears in the closing attribution
-- Use simple ASCII punctuation only — no em dashes, curly quotes, or special Unicode
+- Use simple ASCII punctuation only -- no em dashes, curly quotes, or special Unicode
+- The ending must feel COMPLETE. End on a concrete action or image that resolves the emotional arc. The viewer should exhale, not wonder if the video glitched.
 
 CHARACTER CONSISTENCY (CRITICAL FOR AI ART):
-You must define ONE main character with a FIXED appearance that stays the same across all scenes.
-Include a "character" field in your JSON that describes the protagonist precisely:
-gender, approximate age, ethnicity, hair, clothing, and one distinguishing feature.
-Example: "A woman in her early 30s, East Asian, shoulder-length black hair, wearing a dark grey wool coat, small scar above her left eyebrow"
-
-EVERY scene's art_prompt MUST include this exact character description so AI-generated images stay consistent.
+Define ONE main character with a FIXED appearance. Include a "character" field:
+gender, approximate age, ethnicity, hair, clothing, one distinguishing feature.
+Keep this description SHORT (under 25 words) so it does not overwhelm the scene prompt.
 
 ART STYLE CONSISTENCY (CRITICAL):
-Include a "visual_style" field that defines the consistent look for ALL scenes.
-Example: "muted cinematic realism, desaturated warm tones, soft natural lighting, painterly brushwork, film grain texture"
-EVERY scene's art_prompt MUST begin with this visual_style prefix.
+Include a "visual_style" field (under 20 words). Brief palette and rendering note only.
+
+SCENE COUNT: Create 8-10 short scenes (not 4-5). Each scene is 15-20 seconds of narration.
+More frequent visual cuts = more cinematic, more engaging. Think music video pacing, not stage play.
+
+ART PROMPT STRUCTURE (CRITICAL -- FOLLOW EXACTLY):
+Each scene's art_prompt MUST lead with the UNIQUE scene content. SDXL only reads the first ~60 words.
+If you bury the scene-specific details after the style/character block, they get IGNORED and every image looks identical.
+
+Format: "[SCENE ACTION AND SETTING FIRST -- what is happening, where, what objects are visible], [character in 10-15 words], [visual_style in 10-15 words]"
+
+GOOD example: "A weathered hand pressing flat against a rough concrete footing inside a half-built cinder block church, tools scattered on the ground. Black American man 50s in orange safety vest crouching. Cinematic digital painting, muted industrial palette, chiaroscuro lighting."
+BAD example: "Cinematic digital painting, muted industrial palette of rust orange, ash gray, cold blue, high contrast chiaroscuro lighting, gritty photorealistic texture... [character description 50 words]... crouching at a concrete footing."
+
+Each scene MUST depict a DIFFERENT location, action, or composition. No two scenes should have the same background.
 
 Return JSON:
 {{
   "title": "YouTube title (compelling, under 70 chars, does NOT mention the philosopher)",
   "description": "YouTube description (3-4 lines, mention philosopher + theme, hashtags)",
   "tags": ["tag1", "tag2", "..."],
-  "character": "Precise physical description of the protagonist — gender, age, ethnicity, hair, clothing, distinguishing feature",
-  "visual_style": "Consistent art direction for all scenes — color palette, rendering style, lighting, texture",
-  "story_script": "The complete narration script — the full story as it will be read aloud. 500-800 words.",
+  "writer_style": "{writer_name}",
+  "character": "Precise physical description of the protagonist (under 25 words)",
+  "visual_style": "Brief art direction (under 20 words) -- palette, rendering, lighting",
+  "story_script": "The complete narration script. 500-700 words.",
   "scenes": [
     {{
       "scene_number": 1,
-      "narration": "The portion of narration for this scene",
-      "art_prompt": "[visual_style], [character description], [scene-specific details — location, action, composition, lighting]",
-      "mood": "emotional tone of this scene"
+      "narration": "15-20 seconds of narration for this scene",
+      "art_prompt": "[UNIQUE scene action/setting/objects FIRST], [brief character], [brief style]",
+      "mood": "emotional tone"
     }}
   ],
-  "closing_attribution": "A single line like: Inspired by the philosophy of [philosopher name]",
+  "closing_attribution": "Inspired by the philosophy of [philosopher name]",
   "music_mood": "overall mood for background music",
-  "suno_prompt": "Suno AI music prompt (under 80 words, describe instruments, tempo, feel)"
+  "suno_prompt": "Suno AI music prompt (under 80 words)"
 }}
 
-Break the story into 4-6 scenes. Each scene is a visual beat — a new location, a shift in tension, a revelation.
-
 THE STORY ARC:
-1. Ground us — where are we, who is this person, what do they want
-2. Tension — something goes wrong, a choice must be made, pressure builds
-3. The turn — the moment where the philosophical insight manifests through ACTION
-4. Resolution — not a happy ending necessarily, but a true one"""
+1. Cold open -- drop us into the middle of something. No setup. First sentence hooks.
+2. Ground us -- who is this person, what just happened or is about to happen
+3. Tension builds -- escalating stakes, internal or external
+4. The turn -- the moment where the philosophical insight manifests through ACTION
+5. Resolution -- a concrete ending. The character DOES something that shows they have changed. Not ambiguous. Not a metaphor. An action."""
 
     response = _call_anthropic(SONNET_MODEL, system, user, max_tokens=4000,
                                temperature=0.85)
