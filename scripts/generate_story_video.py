@@ -283,7 +283,7 @@ def step_convert_remotion(script_path, ts_path, art_paths_path, voice_path, musi
 # Step 6: Render via Remotion
 # ---------------------------------------------------------------------------
 def step_render(output_name, out_path):
-    print(f"\n[6/6] Rendering via Remotion → {out_path}")
+    print(f"\n[6/6] Rendering via Remotion -> {out_path}")
     subprocess.run([
         "npx", "remotion", "render", output_name,
         str(out_path),
