@@ -62,13 +62,15 @@ def check_queued_content():
 
 
 def check_approved_content():
-    """Check Supabase for content with status='approved' and video_drive_url set."""
+    """Check Supabase for approved content with youtube_publish_requested and no youtube_video_id."""
     try:
         url = f"{SUPABASE_URL}/rest/v1/content"
         params = {
             "select": "id,philosopher,topic,channel_id",
             "status": "eq.approved",
             "video_drive_url": "not.is.null",
+            "generation_params->youtube_publish_requested": "eq.true",
+            "youtube_video_id": "is.null",
             "deleted_at": "is.null",
             "order": "created_at.asc",
             "limit": "10",
@@ -254,7 +256,11 @@ def main():
                 for item in approved:
                     print(f"  - [{item['id'][:8]}] {item.get('philosopher','?')}: "
                           f"{item.get('topic','?')}")
-                run_youtube_uploader()
+                exit_code = run_youtube_uploader()
+                if exit_code == 0:
+                    # Mark published items: set status to 'published'
+                    for item in approved:
+                        update_status(item["id"], "published")
                 print(f"[{now}] YouTube publish batch complete.")
             else:
                 print(f"[{now}] No approved content awaiting YouTube upload.")

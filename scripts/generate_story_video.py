@@ -23,8 +23,9 @@ import random
 import shutil
 import subprocess
 import requests
+import calendar
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 load_dotenv("C:/AI/.env")
@@ -392,20 +393,291 @@ def main():
     # Step 6: Render
     step_render(output_name, str(video_path))
 
+    # Step 6b: Upload to Google Drive
+    drive_url = step_upload_drive(str(video_path), channel)
+
     # Step 7: Update Supabase content row with metadata (if connected)
-    step_update_supabase(story, str(video_path))
+    step_update_supabase(story, str(video_path), video_drive_url=drive_url)
 
     print(f"\n{'='*60}")
     print(f"  COMPLETE")
     print(f"  Video: {video_path}")
+    if drive_url:
+        print(f"  Drive: {drive_url}")
     print(f"  Script: {script_path}")
     print(f"{'='*60}")
 
 
 # ---------------------------------------------------------------------------
+# Step 6b: Upload to Google Drive
+# ---------------------------------------------------------------------------
+def _supabase_headers():
+    return {
+        "apikey": os.environ["SUPABASE_SERVICE_KEY"],
+        "Authorization": f"Bearer {os.environ['SUPABASE_SERVICE_KEY']}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+
+def _refresh_google_token(channel_id, refresh_token):
+    """Refresh Google access token using the stored refresh token."""
+    resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": os.environ.get("GOOGLE_CLIENT_ID", ""),
+            "client_secret": os.environ.get("GOOGLE_CLIENT_SECRET", ""),
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    new_token = data["access_token"]
+    expires_in = data.get("expires_in", 3600)
+
+    # Update stored token in Supabase channel settings
+    ch_url = f"{os.environ['SUPABASE_URL']}/rest/v1/channels?id=eq.{channel_id}&select=settings"
+    ch_resp = requests.get(ch_url, headers=_supabase_headers(), timeout=15)
+    ch_resp.raise_for_status()
+    channels = ch_resp.json()
+    if channels:
+        existing_settings = channels[0].get("settings", {}) or {}
+        existing_settings["google_access_token"] = new_token
+        expiry = datetime.now(timezone.utc).timestamp() + expires_in
+        existing_settings["google_token_expiry"] = (
+            datetime.fromtimestamp(expiry, tz=timezone.utc).isoformat()
+        )
+        update_url = f"{os.environ['SUPABASE_URL']}/rest/v1/channels?id=eq.{channel_id}"
+        requests.patch(
+            update_url, headers=_supabase_headers(),
+            json={"settings": existing_settings}, timeout=15,
+        )
+
+    return new_token
+
+
+def _get_google_access_token(channel):
+    """Get a valid Google access token for a channel, refreshing if needed."""
+    settings = channel.get("settings", {}) or {}
+    refresh_token = settings.get("google_refresh_token")
+    if not refresh_token:
+        raise ValueError(
+            f"Google not connected for channel '{channel.get('name', '?')}'"
+        )
+
+    token_expiry_str = settings.get("google_token_expiry", "")
+    if token_expiry_str:
+        try:
+            expiry = datetime.fromisoformat(token_expiry_str.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            if (expiry - now).total_seconds() > 300:
+                existing_token = settings.get("google_access_token", "")
+                if existing_token:
+                    return existing_token
+        except (ValueError, TypeError):
+            pass
+
+    return _refresh_google_token(channel["id"], refresh_token)
+
+
+def _week_folder_name(target_date=None):
+    """Build the weekly folder name: Month-W#-MonDD-MonDD"""
+    if target_date is None:
+        target_date = datetime.now(timezone.utc).date()
+    elif hasattr(target_date, "date"):
+        target_date = target_date.date()
+
+    monday = target_date - timedelta(days=target_date.weekday())
+    sunday = monday + timedelta(days=6)
+    month_name = calendar.month_name[target_date.month]
+
+    first_of_month = target_date.replace(day=1)
+    days_until_monday = (7 - first_of_month.weekday()) % 7
+    first_monday = first_of_month + timedelta(days=days_until_monday)
+    if monday < first_monday:
+        week_num = 1
+    else:
+        week_num = ((monday - first_monday).days // 7) + 1
+        if first_of_month.weekday() != 0:
+            week_num += 1
+
+    mon_start = f"{calendar.month_abbr[monday.month]}{monday.day}"
+    mon_end = f"{calendar.month_abbr[sunday.month]}{sunday.day}"
+    return f"{month_name}-W{week_num}-{mon_start}-{mon_end}"
+
+
+def _find_drive_subfolder(access_token, parent_id, folder_name):
+    query = (
+        f"'{parent_id}' in parents "
+        f"and name = '{folder_name}' "
+        f"and mimeType = 'application/vnd.google-apps.folder' "
+        f"and trashed = false"
+    )
+    resp = requests.get(
+        "https://www.googleapis.com/drive/v3/files",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"q": query, "fields": "files(id,name)", "pageSize": 1},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    files = resp.json().get("files", [])
+    return files[0]["id"] if files else None
+
+
+def _create_drive_subfolder(access_token, parent_id, folder_name):
+    metadata = {
+        "name": folder_name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    }
+    resp = requests.post(
+        "https://www.googleapis.com/drive/v3/files",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json=metadata,
+        params={"fields": "id"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["id"]
+
+
+def _get_or_create_week_folder(access_token, parent_folder_id):
+    folder_name = _week_folder_name()
+    existing_id = _find_drive_subfolder(access_token, parent_folder_id, folder_name)
+    if existing_id:
+        print(f"  [drive] Using existing week folder: {folder_name}")
+        return existing_id
+    new_id = _create_drive_subfolder(access_token, parent_folder_id, folder_name)
+    print(f"  [drive] Created week folder: {folder_name}")
+    return new_id
+
+
+def _upload_multipart(access_token, folder_id, file_path, filename):
+    metadata = json.dumps({"name": filename, "parents": [folder_id]})
+    boundary = "-------wisdom_upload_boundary"
+
+    with open(file_path, "rb") as f:
+        file_data = f.read()
+
+    body = (
+        f"--{boundary}\r\n"
+        f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+        f"{metadata}\r\n"
+        f"--{boundary}\r\n"
+        f"Content-Type: video/mp4\r\n\r\n"
+    ).encode("utf-8") + file_data + f"\r\n--{boundary}--".encode("utf-8")
+
+    resp = requests.post(
+        "https://www.googleapis.com/upload/drive/v3/files"
+        "?uploadType=multipart&fields=id,webViewLink",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": f"multipart/related; boundary={boundary}",
+        },
+        data=body,
+        timeout=120,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    return result.get("webViewLink",
+                      f"https://drive.google.com/file/d/{result['id']}/view")
+
+
+def _upload_resumable(access_token, folder_id, file_path, filename):
+    metadata = json.dumps({"name": filename, "parents": [folder_id]})
+
+    init_resp = requests.post(
+        "https://www.googleapis.com/upload/drive/v3/files"
+        "?uploadType=resumable&fields=id,webViewLink",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": "video/mp4",
+        },
+        data=metadata,
+        timeout=30,
+    )
+    init_resp.raise_for_status()
+    upload_url = init_resp.headers["Location"]
+
+    with open(file_path, "rb") as f:
+        file_data = f.read()
+
+    resp = requests.put(
+        upload_url,
+        headers={"Content-Type": "video/mp4"},
+        data=file_data,
+        timeout=300,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    return result.get("webViewLink",
+                      f"https://drive.google.com/file/d/{result['id']}/view")
+
+
+def step_upload_drive(video_path, channel):
+    """Upload video to Google Drive under weekly subfolder."""
+    supabase_url = os.getenv("SUPABASE_URL", "")
+    supabase_key = os.getenv("SUPABASE_SERVICE_KEY", "")
+    if not supabase_url or not supabase_key:
+        print("\n[6b] Supabase not configured, skipping Drive upload")
+        return None
+
+    print("\n[6b] Uploading to Google Drive...")
+
+    # Fetch channel info from Supabase
+    slug = "gibran" if channel == "gibran" else "wisdom"
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json",
+    }
+    resp = requests.get(
+        f"{supabase_url}/rest/v1/channels",
+        headers=headers,
+        params={
+            "slug": f"eq.{slug}",
+            "select": "id,name,slug,google_drive_folder_id,settings",
+        },
+        timeout=15,
+    )
+    if resp.status_code != 200 or not resp.json():
+        print(f"  Could not fetch channel '{slug}': {resp.text[:200]}")
+        return None
+
+    ch = resp.json()[0]
+    folder_id = ch.get("google_drive_folder_id")
+    if not folder_id:
+        print(f"  No Google Drive folder configured for channel '{slug}'")
+        return None
+
+    try:
+        access_token = _get_google_access_token(ch)
+        week_folder_id = _get_or_create_week_folder(access_token, folder_id)
+        filename = Path(video_path).name
+        file_size = Path(video_path).stat().st_size
+
+        if file_size < 5 * 1024 * 1024:
+            drive_url = _upload_multipart(access_token, week_folder_id, video_path, filename)
+        else:
+            drive_url = _upload_resumable(access_token, week_folder_id, video_path, filename)
+
+        print(f"  Drive URL: {drive_url}")
+        return drive_url
+    except Exception as e:
+        print(f"  Drive upload failed: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Step 7: Push metadata to Supabase
 # ---------------------------------------------------------------------------
-def step_update_supabase(story, video_path):
+def step_update_supabase(story, video_path, video_drive_url=None):
     """Update Supabase content row with title, description, tags, and local path."""
     supabase_url = os.getenv("SUPABASE_URL", "")
     supabase_key = os.getenv("SUPABASE_SERVICE_KEY", "")
@@ -452,6 +724,7 @@ def step_update_supabase(story, video_path):
             "format": "story",
             "status": "ready",
             "local_machine_path": video_path,
+            "scheduled_at": datetime.now(timezone.utc).isoformat(),
             "generation_params": {
                 "tags": tags,
                 "closing_attribution": story.get("closing_attribution", ""),
@@ -460,6 +733,8 @@ def step_update_supabase(story, video_path):
             },
             "is_system_generated": True,
         }
+        if video_drive_url:
+            payload["video_drive_url"] = video_drive_url
         # Get channel ID
         ch_resp = requests.get(
             f"{supabase_url}/rest/v1/channels",
@@ -483,12 +758,15 @@ def step_update_supabase(story, video_path):
             "description": description,
             "status": "ready",
             "local_machine_path": video_path,
+            "scheduled_at": datetime.now(timezone.utc).isoformat(),
             "generation_params": {
                 **({} if not rows[0].get("generation_params") else rows[0]["generation_params"]),
                 "tags": tags,
                 "closing_attribution": story.get("closing_attribution", ""),
             },
         }
+        if video_drive_url:
+            payload["video_drive_url"] = video_drive_url
         resp = requests.patch(
             f"{supabase_url}/rest/v1/content?id=eq.{content_id}",
             headers=headers, json=payload,
