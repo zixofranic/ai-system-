@@ -467,8 +467,21 @@ def generate_story_script(philosopher: str, theme: str,
         "noir": ("Raymond Chandler", "First person. Cynical narrator. Sharp metaphors. City at night. Everyone has a secret. Moral ambiguity. Dark humor."),
     }
 
+    # Match comic artist style to mood for visual direction
+    COMIC_STYLES = {
+        "dark": ("Frank Miller", "Sin City style, extreme chiaroscuro, heavy black ink, stark white highlights, noir shadows, graphic novel panels"),
+        "tense": ("Frank Miller", "300 style, high contrast, desaturated with single accent color, dramatic angles, brutal compositions"),
+        "bittersweet": ("Bill Sienkiewicz", "Expressionistic painted style, loose brushwork, emotional color bleeding, mixed media texture, raw and intimate"),
+        "dreamy": ("Moebius", "Ethereal linework, vast surreal landscapes, jewel-tone watercolor washes, intricate detail, otherworldly light"),
+        "psychological": ("Dave McKean", "Sandman-style mixed media, collage textures, dark painterly layers, photographic fragments, haunting and layered"),
+        "sharp": ("Sean Murphy", "Clean dynamic linework, gritty urban atmosphere, cinematic framing, high contrast ink, modern graphic novel"),
+        "tender": ("Moebius", "Delicate precise linework, soft pastel palette, luminous open spaces, gentle detail, contemplative compositions"),
+        "noir": ("Sean Murphy", "Stark black and white, rain-slicked streets, dramatic shadows, angular compositions, pulp noir atmosphere"),
+    }
+
     mood_key = (mood or "sharp").lower().split(",")[0].strip()
     writer_name, writer_desc = WRITER_STYLES.get(mood_key, WRITER_STYLES["sharp"])
+    comic_artist, comic_desc = COMIC_STYLES.get(mood_key, COMIC_STYLES["sharp"])
 
     system = f"""You are a world-class fiction writer. For this story, write in the literary style of {writer_name}.
 
@@ -502,29 +515,10 @@ CRITICAL RULES:
 - The philosophy must be FELT through what happens, not TOLD
 - The philosopher's name only appears in the closing attribution
 - Use simple ASCII punctuation only -- no em dashes, curly quotes, or special Unicode
-- The ending must feel COMPLETE. End on a concrete action or image that resolves the emotional arc. The viewer should exhale, not wonder if the video glitched.
+- The ending must feel COMPLETE. End on a concrete action or image that resolves the emotional arc.
 
-CHARACTER CONSISTENCY (CRITICAL FOR AI ART):
-Define ONE main character with a FIXED appearance. Include a "character" field:
-gender, approximate age, ethnicity, hair, clothing, one distinguishing feature.
-Keep this description SHORT (under 25 words) so it does not overwhelm the scene prompt.
-
-ART STYLE CONSISTENCY (CRITICAL):
-Include a "visual_style" field (under 20 words). Brief palette and rendering note only.
-
-SCENE COUNT: Create 8-10 short scenes (not 4-5). Each scene is 15-20 seconds of narration.
-More frequent visual cuts = more cinematic, more engaging. Think music video pacing, not stage play.
-
-ART PROMPT STRUCTURE (CRITICAL -- FOLLOW EXACTLY):
-Each scene's art_prompt MUST lead with the UNIQUE scene content. SDXL only reads the first ~60 words.
-If you bury the scene-specific details after the style/character block, they get IGNORED and every image looks identical.
-
-Format: "[SCENE ACTION AND SETTING FIRST -- what is happening, where, what objects are visible], [character in 10-15 words], [visual_style in 10-15 words]"
-
-GOOD example: "A weathered hand pressing flat against a rough concrete footing inside a half-built cinder block church, tools scattered on the ground. Black American man 50s in orange safety vest crouching. Cinematic digital painting, muted industrial palette, chiaroscuro lighting."
-BAD example: "Cinematic digital painting, muted industrial palette of rust orange, ash gray, cold blue, high contrast chiaroscuro lighting, gritty photorealistic texture... [character description 50 words]... crouching at a concrete footing."
-
-Each scene MUST depict a DIFFERENT location, action, or composition. No two scenes should have the same background.
+CHARACTER (CRITICAL FOR AI ART):
+Define ONE main character with a FIXED appearance (under 25 words).
 
 Return JSON:
 {{
@@ -532,28 +526,25 @@ Return JSON:
   "description": "YouTube description (3-4 lines, mention philosopher + theme, hashtags)",
   "tags": ["tag1", "tag2", "..."],
   "writer_style": "{writer_name}",
+  "comic_artist": "{comic_artist}",
+  "comic_style": "{comic_desc}",
   "character": "Precise physical description of the protagonist (under 25 words)",
   "visual_style": "Brief art direction (under 20 words) -- palette, rendering, lighting",
   "story_script": "The complete narration script. 500-700 words.",
-  "scenes": [
-    {{
-      "scene_number": 1,
-      "narration": "15-20 seconds of narration for this scene",
-      "art_prompt": "[UNIQUE scene action/setting/objects FIRST], [brief character], [brief style]",
-      "mood": "emotional tone"
-    }}
-  ],
   "closing_attribution": "Inspired by the philosophy of [philosopher name]",
   "music_mood": "overall mood for background music",
   "suno_prompt": "Suno AI music prompt (under 80 words)"
 }}
+
+NOTE: Do NOT include scenes or art_prompts. Art prompts will be generated separately
+from the actual narration timing after voice synthesis. Just write the story.
 
 THE STORY ARC:
 1. Cold open -- drop us into the middle of something. No setup. First sentence hooks.
 2. Ground us -- who is this person, what just happened or is about to happen
 3. Tension builds -- escalating stakes, internal or external
 4. The turn -- the moment where the philosophical insight manifests through ACTION
-5. Resolution -- a concrete ending. The character DOES something that shows they have changed. Not ambiguous. Not a metaphor. An action."""
+5. Resolution -- a concrete ending. The character DOES something that shows they have changed."""
 
     response = _call_anthropic(SONNET_MODEL, system, user, max_tokens=4000,
                                temperature=0.85)
@@ -562,6 +553,76 @@ THE STORY ARC:
     result["theme"] = theme
     result["format"] = "story"
     return result
+
+
+def generate_art_prompts_from_chunks(story_data: dict, text_chunks: list) -> list:
+    """
+    Generate image prompts for each time-chunk of narration text.
+
+    Called AFTER voice generation, when we know exactly what text plays at each
+    time window. Each chunk is ~18-25 seconds of narration.
+
+    Args:
+        story_data: The story script dict (has character, visual_style, comic_style)
+        text_chunks: List of strings, each being the narration text for one scene
+
+    Returns:
+        List of art_prompt strings, one per chunk.
+    """
+    character = story_data.get("character", "")
+    visual_style = story_data.get("visual_style", "")
+    comic_artist = story_data.get("comic_artist", "")
+    comic_style = story_data.get("comic_style", "")
+
+    chunks_text = ""
+    for i, chunk in enumerate(text_chunks):
+        chunks_text += f"\n--- CHUNK {i+1} ---\n{chunk}\n"
+
+    system = (
+        "You are a visual director creating image prompts for an AI art generator (SDXL). "
+        "Each prompt must describe a UNIQUE scene that matches the narration text. "
+        "Output valid JSON only."
+    )
+
+    user = f"""Generate one image prompt for each narration chunk below. Each image will be shown
+while that chunk is being narrated aloud, so the image MUST depict what is being described.
+
+CHARACTER (same person in every image): {character}
+VISUAL STYLE: {visual_style}
+COMIC ARTIST INFLUENCE: {comic_artist} -- {comic_style}
+
+NARRATION CHUNKS:{chunks_text}
+
+RULES:
+- Each prompt starts with the SCENE ACTION/SETTING (what is happening, where, objects visible)
+- Then brief character reference (10 words max)
+- Then brief style note including "{comic_artist} style" (10 words max)
+- Total prompt under 50 words
+- Every image must show a DIFFERENT composition, angle, or setting
+- Match the emotion and content of the narration text exactly
+- If the text describes hands folding paper, show hands folding paper
+- If the text describes walking across a parking lot, show that
+- Do NOT repeat backgrounds or compositions
+
+Return JSON:
+{{
+  "prompts": [
+    "prompt for chunk 1",
+    "prompt for chunk 2",
+    "..."
+  ]
+}}"""
+
+    response = _call_anthropic(SONNET_MODEL, system, user, max_tokens=2000,
+                               temperature=0.7)
+    result = _parse_json_response(response)
+    prompts = result.get("prompts", [])
+
+    # Pad if needed
+    while len(prompts) < len(text_chunks):
+        prompts.append(f"{text_chunks[len(prompts)][:30]}, {character}, {comic_artist} style {visual_style}")
+
+    return prompts
 
 
 def generate_longform_script(philosopher: str, topic: str,
