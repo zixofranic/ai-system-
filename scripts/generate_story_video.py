@@ -95,7 +95,7 @@ def step_generate_voice(text, output_path, ts_path):
     print("\n[2/6] Generating voice via Chatterbox TTS...")
     text = _sanitize_text(text)
     payload = {"text": text, "exaggeration": 0.5, "cfg_weight": 0.5}
-    voice_ref = Path("C:/AI/system/voice/cloned/wisdom_voice.wav")
+    voice_ref = Path("C:/AI/system/voice/cloned/wisdom_burton.mp3")
     if voice_ref.exists():
         payload["reference_audio"] = str(voice_ref)
 

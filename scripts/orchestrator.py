@@ -59,7 +59,7 @@ OLLAMA_URL = "http://localhost:11434"
 COMFYUI_URL = "http://localhost:8188"
 CHATTERBOX_URL = "http://localhost:8004"
 
-VOICE_REFERENCE = "C:/AI/system/voice/cloned/wisdom_voice.wav"
+VOICE_REFERENCE = "C:/AI/system/voice/cloned/wisdom_burton.mp3"
 MUSIC_ROOT = Path("C:/AI/system/music")
 WORK_DIR = Path("C:/AI/system/pipeline_work")
 
