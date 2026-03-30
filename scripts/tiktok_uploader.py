@@ -249,6 +249,43 @@ def upload_to_tiktok(video_path, title, token, open_id):
     return publish_id  # Return publish_id even if status check times out
 
 
+def build_tiktok_caption(content):
+    """Build TikTok caption from title, description, and tags."""
+    title = content.get("title", "")
+    description = content.get("description", "")
+    params = content.get("generation_params") or {}
+    if isinstance(params, str):
+        params = json.loads(params)
+    tags = params.get("tags", [])
+
+    # Build caption: title + key hashtags (TikTok limit ~2200 chars)
+    caption = title
+    if description:
+        # Take first 1-2 sentences of description
+        first_line = description.split("\n")[0][:200]
+        caption = f"{title}\n\n{first_line}"
+
+    # Add hashtags
+    hashtags = []
+    if tags:
+        for tag in tags[:8]:
+            ht = "#" + tag.replace(" ", "").replace("-", "")
+            hashtags.append(ht)
+    # Always add these
+    for ht in ["#Philosophy", "#Wisdom", "#Shorts", "#DeepEchoesOfWisdom"]:
+        if ht not in hashtags:
+            hashtags.append(ht)
+
+    philosopher = content.get("philosopher", "")
+    if philosopher:
+        phil_tag = "#" + philosopher.replace(" ", "")
+        if phil_tag not in hashtags:
+            hashtags.insert(0, phil_tag)
+
+    caption += "\n\n" + " ".join(hashtags)
+    return caption[:2200]
+
+
 def process_content(content, dry_run=False):
     """Process a single content item for TikTok upload."""
     content_id = content["id"]
@@ -277,8 +314,9 @@ def process_content(content, dry_run=False):
         # Download video
         video_path = download_from_drive(content["video_drive_url"], channel)
 
-        # Upload
-        tiktok_id = upload_to_tiktok(video_path, title, token, open_id)
+        # Upload with full caption
+        caption = build_tiktok_caption(content)
+        tiktok_id = upload_to_tiktok(video_path, caption, token, open_id)
 
         # Update Supabase
         requests.patch(
@@ -323,7 +361,7 @@ def main():
             f"{SUPABASE_URL}/rest/v1/content",
             headers=HEADERS,
             params={
-                "select": "id,title,channel_id,video_drive_url,generation_params",
+                "select": "id,title,description,philosopher,channel_id,video_drive_url,generation_params",
                 "status": "eq.approved",
                 "video_drive_url": "not.is.null",
                 "tiktok_video_id": "is.null",
