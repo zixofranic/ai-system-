@@ -30,8 +30,9 @@ load_dotenv("C:/AI/.env")
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
-TIKTOK_CLIENT_KEY = os.environ.get("TIKTOK_CLIENT_KEY", "")
-TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
+# Use sandbox keys if available (sandbox app issued the tokens), fall back to production
+TIKTOK_CLIENT_KEY = os.environ.get("TIKTOK_SANDBOX_CLIENT_KEY") or os.environ.get("TIKTOK_CLIENT_KEY", "")
+TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_SANDBOX_CLIENT_SECRET") or os.environ.get("TIKTOK_CLIENT_SECRET", "")
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
