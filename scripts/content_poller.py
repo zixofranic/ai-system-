@@ -24,6 +24,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 POLL_INTERVAL = 300  # 5 minutes
 ORCHESTRATOR = Path("C:/AI/system/scripts/orchestrator.py")
 YOUTUBE_UPLOADER = Path("C:/AI/system/scripts/youtube_uploader.py")
+TIKTOK_UPLOADER = Path("C:/AI/system/scripts/tiktok_uploader.py")
 COMFYUI_DIR = Path("C:/AI/system/ComfyUI")
 COMFYUI_PORT = 8188
 CONDA_BAT = Path("C:/Users/ziadf/miniconda3/condabin/conda.bat")
@@ -59,6 +60,47 @@ def check_queued_content():
     except Exception as e:
         print(f"  Connection error: {e}")
         return []
+
+
+def check_tiktok_content():
+    """Check for approved content with tiktok_publish_requested and no tiktok_video_id."""
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/content"
+        params = {
+            "select": "id,philosopher,topic,channel_id",
+            "status": "eq.approved",
+            "video_drive_url": "not.is.null",
+            "generation_params->tiktok_publish_requested": "eq.true",
+            "tiktok_video_id": "is.null",
+            "deleted_at": "is.null",
+            "order": "created_at.asc",
+            "limit": "10",
+        }
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        return resp.json() if resp.status_code == 200 else []
+    except Exception as e:
+        print(f"  Error checking TikTok: {e}")
+        return []
+
+
+def run_tiktok_uploader():
+    """Run tiktok_uploader.py to publish flagged content."""
+    print("  Running TikTok uploader...")
+    result = subprocess.run(
+        [PYTHON_CHATTERBOX, str(TIKTOK_UPLOADER)],
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        capture_output=True, text=True, timeout=3600,
+    )
+    if result.returncode == 0:
+        print("  TikTok uploader completed")
+        if result.stdout:
+            for line in result.stdout.strip().split("\n")[-5:]:
+                print(f"    {line}")
+    else:
+        print(f"  TikTok uploader failed (exit {result.returncode})")
+        if result.stderr:
+            print(f"  Error: {result.stderr[:300]}")
+    return result.returncode
 
 
 def promote_scheduled_content():
@@ -292,6 +334,17 @@ def main():
                 print(f"[{now}] YouTube publish batch complete.")
             else:
                 print(f"[{now}] No approved content awaiting YouTube upload.")
+
+            # --- Check for approved content to publish to TikTok ---
+            tiktok_items = check_tiktok_content()
+            if tiktok_items:
+                print(f"\n[{now}] Found {len(tiktok_items)} item(s) for TikTok:")
+                for item in tiktok_items:
+                    print(f"  - [{item['id'][:8]}] {item.get('philosopher','?')}")
+                run_tiktok_uploader()
+                print(f"[{now}] TikTok publish batch complete.")
+            else:
+                print(f"[{now}] No content awaiting TikTok upload.")
 
             print(f"[{now}] Sleeping {POLL_INTERVAL // 60} min...")
 
