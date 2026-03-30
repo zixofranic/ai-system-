@@ -153,6 +153,46 @@ def check_approved_content():
         return []
 
 
+def is_chatterbox_running():
+    """Check if Chatterbox TTS is responding."""
+    try:
+        resp = requests.get("http://localhost:8004/", timeout=3)
+        return resp.status_code in (200, 404, 405)
+    except:
+        return False
+
+
+chatterbox_process = None
+
+def start_chatterbox():
+    """Start Chatterbox TTS as a background process."""
+    global chatterbox_process
+    if is_chatterbox_running():
+        print("  Chatterbox already running")
+        return True
+
+    print("  Starting Chatterbox TTS...")
+    chatterbox_process = subprocess.Popen(
+        [
+            str(CONDA_BAT), "run", "-n", "chatterbox", "--no-banner",
+            "python", "server.py", "--port", "8004"
+        ],
+        cwd="C:/AI/system/Chatterbox-TTS-Server",
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
+
+    for i in range(30):
+        time.sleep(2)
+        if is_chatterbox_running():
+            print(f"  Chatterbox started (took {(i+1)*2}s)")
+            return True
+
+    print("  WARNING: Chatterbox didn't start in 60s")
+    return False
+
+
 def is_comfyui_running():
     """Check if ComfyUI is responding."""
     try:
@@ -299,10 +339,12 @@ def main():
                 for item in queued:
                     print(f"  - {item.get('philosopher', '?')}: {item.get('topic', '?')}")
 
-                # Start ComfyUI
+                # Start services
                 comfyui_was_running = is_comfyui_running()
                 if not comfyui_was_running:
                     start_comfyui()
+                if not is_chatterbox_running():
+                    start_chatterbox()
 
                 # Run orchestrator
                 run_orchestrator()
