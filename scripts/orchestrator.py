@@ -936,6 +936,21 @@ def process_short(content: dict):
         # Upload failure is non-fatal; video is still produced locally
         print(f"  [upload] WARNING: Drive upload failed: {e}")
 
+    # --- Step 7b: Generate thumbnail ---
+    thumb_drive_url = None
+    try:
+        from thumbnail_generator import generate_thumbnail, generate_thumbnail_from_video
+        thumb_path = video_path.replace(".mp4", "_thumb.jpg")
+        if art_path:
+            generate_thumbnail(art_path, title, thumb_path, 1080, 1920)  # portrait for shorts
+        else:
+            generate_thumbnail_from_video(video_path, title, thumb_path, 1080, 1920)
+        if channel.get("google_drive_folder_id") and drive_url:
+            thumb_drive_url = upload_to_drive(thumb_path, channel)
+        print(f"  [thumb] {thumb_path}")
+    except Exception as e:
+        print(f"  [thumb] WARNING: {e}")
+
     # --- Step 8: Update Supabase ---
     # status='ready' means generation is complete; human approves via dashboard
     # to advance to 'approved', which triggers youtube_uploader.py.
@@ -956,6 +971,8 @@ def process_short(content: dict):
     }
     if drive_url:
         updates["video_drive_url"] = drive_url
+    if thumb_drive_url:
+        updates["thumbnail_drive_url"] = thumb_drive_url
     update_supabase(content_id, updates)
 
     print(f"  DONE: {content_id} -> {video_path}")

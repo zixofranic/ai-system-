@@ -393,11 +393,34 @@ def main():
     # Step 6: Render
     step_render(output_name, str(video_path))
 
-    # Step 6b: Upload to Google Drive
+    # Step 6b: Generate thumbnail
+    thumb_path = str(video_path).replace("_video.mp4", "_thumb.jpg")
+    thumb_drive_url = None
+    try:
+        from thumbnail_generator import generate_thumbnail, generate_thumbnail_from_video
+        art_paths_list = json.load(open(art_paths_path)) if art_paths_path.exists() else []
+        first_art = next((p for p in art_paths_list if p), None)
+        if first_art:
+            generate_thumbnail(first_art, story.get("title", ""), thumb_path)
+        else:
+            generate_thumbnail_from_video(str(video_path), story.get("title", ""), thumb_path)
+        print(f"  Thumbnail: {thumb_path}")
+    except Exception as e:
+        print(f"  Thumbnail failed: {e}")
+
+    # Step 6c: Upload to Google Drive
     drive_url = step_upload_drive(str(video_path), channel)
 
+    # Upload thumbnail to Drive
+    if os.path.exists(thumb_path) and drive_url:
+        try:
+            thumb_drive_url = step_upload_drive(thumb_path, channel)
+            print(f"  Thumbnail Drive: {thumb_drive_url}")
+        except Exception as e:
+            print(f"  Thumbnail upload failed: {e}")
+
     # Step 7: Update Supabase content row with metadata (if connected)
-    step_update_supabase(story, str(video_path), video_drive_url=drive_url)
+    step_update_supabase(story, str(video_path), video_drive_url=drive_url, thumbnail_drive_url=thumb_drive_url)
 
     print(f"\n{'='*60}")
     print(f"  COMPLETE")
@@ -677,7 +700,7 @@ def step_upload_drive(video_path, channel):
 # ---------------------------------------------------------------------------
 # Step 7: Push metadata to Supabase
 # ---------------------------------------------------------------------------
-def step_update_supabase(story, video_path, video_drive_url=None):
+def step_update_supabase(story, video_path, video_drive_url=None, thumbnail_drive_url=None):
     """Update Supabase content row with title, description, tags, and local path."""
     supabase_url = os.getenv("SUPABASE_URL", "")
     supabase_key = os.getenv("SUPABASE_SERVICE_KEY", "")
@@ -735,6 +758,8 @@ def step_update_supabase(story, video_path, video_drive_url=None):
         }
         if video_drive_url:
             payload["video_drive_url"] = video_drive_url
+        if thumbnail_drive_url:
+            payload["thumbnail_drive_url"] = thumbnail_drive_url
         # Get channel ID
         ch_resp = requests.get(
             f"{supabase_url}/rest/v1/channels",
@@ -767,6 +792,8 @@ def step_update_supabase(story, video_path, video_drive_url=None):
         }
         if video_drive_url:
             payload["video_drive_url"] = video_drive_url
+        if thumbnail_drive_url:
+            payload["thumbnail_drive_url"] = thumbnail_drive_url
         resp = requests.patch(
             f"{supabase_url}/rest/v1/content?id=eq.{content_id}",
             headers=headers, json=payload,
