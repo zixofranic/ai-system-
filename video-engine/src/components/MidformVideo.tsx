@@ -21,6 +21,7 @@ import {
   getAudioPath,
 } from "../lib/utils";
 import { Background } from "./Background";
+import { Equalizer } from "./Equalizer";
 
 export const midformVideoSchema = z.object({
   timeline: TimelineSchema.nullable(),
@@ -169,11 +170,47 @@ export const MidformVideo: React.FC<z.infer<typeof midformVideoSchema>> = ({
           >
             <Audio
               src={staticFile(getAudioPath(id, element.audioUrl))}
-              volume={isMusic ? 0.15 : 1}
+              volume={isMusic ? 0.35 : 1}
             />
           </Sequence>
         );
       })}
+
+      {/* Equalizer — vertically centered for midform */}
+      {timeline.audio
+        .filter((el) => el.audioUrl !== "music")
+        .map((element, index) => {
+          const { startFrame, duration } = calculateFrameTiming(
+            element.startMs,
+            element.endMs,
+            { addIntroOffset: true },
+          );
+          return (
+            <Sequence
+              key={`eq-${index}`}
+              from={startFrame}
+              durationInFrames={duration}
+            >
+              <AbsoluteFill
+                style={{
+                  zIndex: 15,
+                  justifyContent: "center",
+                  alignItems: "center",
+                  pointerEvents: "none",
+                }}
+              >
+                <Equalizer
+                  audioSrc={staticFile(getAudioPath(id, element.audioUrl))}
+                  color={timeline.metadata?.equalizerColor || GOLD}
+                  numberOfBars={48}
+                  maxBarHeight={160}
+                  barWidth={10}
+                  gap={8}
+                />
+              </AbsoluteFill>
+            </Sequence>
+          );
+        })}
     </AbsoluteFill>
   );
 };
@@ -258,16 +295,24 @@ const MidformQuote: React.FC<{
   attribution?: string;
 }> = ({ text, attribution }) => {
   const frame = useCurrentFrame();
-  const { fps } = useVideoConfig();
+  const { fps, durationInFrames } = useVideoConfig();
 
   const enter = spring({
     frame,
     fps,
     config: { damping: 200 },
-    durationInFrames: 10,
+    durationInFrames: 12,
   });
 
-  const opacity = interpolate(enter, [0, 1], [0, 1]);
+  const fadeOutFrames = Math.min(20, Math.floor(durationInFrames / 4));
+  const fadeOut = interpolate(
+    frame,
+    [durationInFrames - fadeOutFrames, durationInFrames],
+    [1, 0],
+    { extrapolateLeft: "clamp", extrapolateRight: "clamp" },
+  );
+
+  const opacity = Math.min(interpolate(enter, [0, 1], [0, 1]), fadeOut);
   const translateY = interpolate(enter, [0, 1], [30, 0]);
 
   return (
@@ -299,6 +344,7 @@ const MidformQuote: React.FC<{
             lineHeight: "76px",
             color: "white",
             fontFamily: "Georgia, serif",
+            fontWeight: "bold",
             fontStyle: "italic",
             textAlign: "center",
             textShadow: "0 2px 8px rgba(0,0,0,0.5)",
@@ -326,16 +372,24 @@ const MidformQuote: React.FC<{
 
 const MidformNarration: React.FC<{ text: string }> = ({ text }) => {
   const frame = useCurrentFrame();
-  const { fps } = useVideoConfig();
+  const { fps, durationInFrames } = useVideoConfig();
 
   const enter = spring({
     frame,
     fps,
     config: { damping: 200 },
-    durationInFrames: 8,
+    durationInFrames: 10,
   });
 
-  const opacity = interpolate(enter, [0, 1], [0, 1]);
+  const fadeOutFrames = Math.min(20, Math.floor(durationInFrames / 4));
+  const fadeOut = interpolate(
+    frame,
+    [durationInFrames - fadeOutFrames, durationInFrames],
+    [1, 0],
+    { extrapolateLeft: "clamp", extrapolateRight: "clamp" },
+  );
+
+  const opacity = Math.min(interpolate(enter, [0, 1], [0, 1]), fadeOut);
 
   return (
     <AbsoluteFill
@@ -391,9 +445,9 @@ const MidformCaption: React.FC<{ text: string }> = ({ text }) => {
           fontSize: 44,
           color: "white",
           fontFamily: "Georgia, serif",
+          fontWeight: "bold",
           textAlign: "center",
           textTransform: "uppercase",
-          WebkitTextStroke: "1.5px rgba(0,0,0,0.7)",
           transform: `scale(${scaleVal}) translateY(${translateY}px)`,
           maxWidth: "85%",
           textShadow: "0 2px 8px rgba(0,0,0,0.9)",

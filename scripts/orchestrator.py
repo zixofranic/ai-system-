@@ -31,6 +31,7 @@ import uuid
 import random
 import argparse
 import traceback
+import subprocess
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -45,7 +46,7 @@ load_dotenv("C:/AI/.env")
 # Our pipeline modules
 sys.path.insert(0, "C:/AI/system/scripts")
 from ai_writer import generate_short_script, generate_youtube_metadata
-from assemble_video import assemble_video
+from render_remotion import render_remotion_video
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -57,9 +58,7 @@ GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 
 OLLAMA_URL = "http://localhost:11434"
 COMFYUI_URL = "http://localhost:8188"
-CHATTERBOX_URL = "http://localhost:8004"
-
-VOICE_REFERENCE = "C:/AI/system/voice/cloned/wisdom_burton.mp3"
+CHATTERBOX_URL = "http://localhost:8004"  # kept for future Chatterbox option
 MUSIC_ROOT = Path("C:/AI/system/music")
 WORK_DIR = Path("C:/AI/system/pipeline_work")
 
@@ -71,6 +70,7 @@ PHILOSOPHER_TO_LORA = {
     "Seneca": "stoic_classical_v1",
     "Epictetus": "stoic_classical_v1",
     "Gibran Khalil Gibran": "gibran_style_v1",
+    "Gibran": "gibran_style_v1",
     "Rumi": "persian_miniature_v1",
     "Lao Tzu": "eastern_ink_v1",
     "Sun Tzu": "eastern_ink_v1",
@@ -92,6 +92,7 @@ PHILOSOPHER_TO_MUSIC_STYLE = {
     "Seneca": "stoic_classical",
     "Epictetus": "stoic_classical",
     "Gibran Khalil Gibran": "gibran",
+    "Gibran": "gibran",
     "Rumi": "persian_miniature",
     "Lao Tzu": "eastern_ink",
     "Sun Tzu": "eastern_ink",
@@ -107,6 +108,31 @@ PHILOSOPHER_TO_MUSIC_STYLE = {
     "Tesla": "renaissance_genius",
     "Vivekananda": "vedic_sacred",
 }
+
+# Explicit mapping from philosopher display name to Ollama model name.
+# Use this whenever the lowercase-with-underscores form doesn't match.
+PHILOSOPHER_TO_OLLAMA_MODEL = {
+    "Marcus Aurelius": "marcus_aurelius",
+    "Seneca": "seneca",
+    "Epictetus": "epictetus",
+    "Gibran Khalil Gibran": "gibran",
+    "Gibran": "gibran",
+    "Rumi": "rumi",
+    "Lao Tzu": "lao_tzu",
+    "Sun Tzu": "sun_tzu",
+    "Confucius": "confucius",
+    "Musashi": "musashi",
+    "Emerson": "emerson",
+    "Thoreau": "thoreau",
+    "Nietzsche": "nietzsche",
+    "Dostoevsky": "dostoevsky",
+    "Wilde": "wilde",
+    "Franklin": "franklin",
+    "Da Vinci": "da_vinci",
+    "Tesla": "tesla",
+    "Vivekananda": "vivekananda",
+}
+
 
 PHILOSOPHER_TO_VOICE_SETTINGS = {
     "Marcus Aurelius": {"exaggeration": 0.3},
@@ -240,6 +266,49 @@ def fetch_queued_content():
     return resp.json()
 
 
+def _ensure_channel_data(content: dict) -> dict:
+    """
+    Guarantee that content['channels'] is populated. If missing (e.g., direct call
+    to process_short without the Supabase join), fetch it from channel_id.
+    Raises loudly if neither is available — never silently defaults to 'wisdom'.
+    """
+    if content.get("channels"):
+        return content
+    channel_id = content.get("channel_id")
+    if not channel_id:
+        raise ValueError(
+            f"Content {content.get('id', '?')} has no channel_id and no channels join. "
+            "Cannot determine target channel. Refusing to default to 'wisdom'."
+        )
+    url = (
+        f"{SUPABASE_URL}/rest/v1/channels"
+        f"?id=eq.{channel_id}"
+        f"&select=id,name,slug,google_drive_folder_id,settings"
+    )
+    resp = requests.get(url, headers=_supabase_headers(), timeout=15)
+    resp.raise_for_status()
+    rows = resp.json()
+    if not rows:
+        raise ValueError(
+            f"Channel {channel_id} not found in Supabase for content {content.get('id', '?')}. "
+            "Refusing to default to 'wisdom'."
+        )
+    content["channels"] = rows[0]
+    return content
+
+
+# Channel-level defaults for when philosopher mapping doesn't match.
+# Used by pick_music / LoRA selection so Gibran content never falls back to Stoic.
+CHANNEL_DEFAULT_MUSIC_STYLE = {
+    "wisdom": "stoic_classical",
+    "gibran": "gibran",
+}
+CHANNEL_DEFAULT_LORA = {
+    "wisdom": "stoic_classical_v1",
+    "gibran": "gibran_style_v1",
+}
+
+
 def update_supabase(content_id: str, updates: dict):
     """PATCH a content row in Supabase."""
     url = f"{SUPABASE_URL}/rest/v1/content?id=eq.{content_id}"
@@ -279,13 +348,52 @@ def log_step(content_id: str, step: str, step_order: int, status: str,
 
 
 # ---------------------------------------------------------------------------
+# Quote deduplication — fetch recent quotes to avoid repetition
+# ---------------------------------------------------------------------------
+def _fetch_recent_quotes(philosopher: str, limit: int = 20) -> list:
+    """Fetch recent quote_text for a philosopher from Supabase."""
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/content"
+            f"?philosopher=eq.{philosopher}"
+            f"&quote_text=not.is.null"
+            f"&deleted_at=is.null"
+            f"&select=quote_text"
+            f"&order=created_at.desc"
+            f"&limit={limit}"
+        )
+        resp = requests.get(url, headers=_supabase_headers(), timeout=10)
+        if resp.status_code == 200:
+            return [r["quote_text"] for r in resp.json() if r.get("quote_text")]
+    except Exception:
+        pass
+    return []
+
+
+def _build_dedup_context(previous_quotes: list) -> str:
+    """Build a prompt section listing previous quotes to avoid."""
+    if not previous_quotes:
+        return ""
+    trimmed = [q[:120] for q in previous_quotes[:15]]
+    lines = "\n".join(f"- {q}" for q in trimmed)
+    return (
+        f"\n\nIMPORTANT — Do NOT repeat or closely paraphrase any of these "
+        f"previous quotes:\n{lines}\n\nWrite something genuinely different.\n"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Quote generation (Ollama with Claude fallback)
 # ---------------------------------------------------------------------------
 def generate_quote(philosopher: str, topic: str) -> str:
     """
     Generate a single philosophical quote via Ollama (local).
     Falls back to Claude Haiku if Ollama is unavailable.
+    Passes recent quotes for deduplication.
     """
+    previous = _fetch_recent_quotes(philosopher)
+    dedup = _build_dedup_context(previous)
+
     prompt = (
         f"Write a single original philosophical quote in the authentic style "
         f"and voice of {philosopher}, on the topic of \"{topic}\".\n\n"
@@ -295,13 +403,17 @@ def generate_quote(philosopher: str, topic: str) -> str:
         f"- Deep insight, not surface-level advice\n"
         f"- Do NOT include attribution or quotation marks\n\n"
         f"Return ONLY the quote text, nothing else."
+        f"{dedup}"
     )
 
     try:
+        ollama_model = PHILOSOPHER_TO_OLLAMA_MODEL.get(
+            philosopher, philosopher.lower().replace(" ", "_")
+        )
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
             json={
-                "model": "qwen3:32b",
+                "model": ollama_model,
                 "prompt": prompt,
                 "stream": False,
                 "options": {"temperature": 0.8},
@@ -312,8 +424,8 @@ def generate_quote(philosopher: str, topic: str) -> str:
         quote = resp.json().get("response", "").strip().strip('"').strip("'")
         if quote:
             return quote
-    except (requests.ConnectionError, requests.Timeout) as e:
-        print(f"  [quote] Ollama unavailable ({e}), falling back to Haiku")
+    except Exception as e:
+        print(f"  [quote] Ollama failed ({e}), falling back to Haiku")
 
     # Fallback: use ai_writer's generate_short_script which calls Haiku
     result = generate_short_script(philosopher, topic)
@@ -424,51 +536,71 @@ def generate_art(prompt: str, lora_name: str, width: int, height: int,
 
 
 # ---------------------------------------------------------------------------
-# Voice generation via Chatterbox TTS
+# Voice generation via ElevenLabs
 # ---------------------------------------------------------------------------
+ELEVENLABS_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+ELEVENLABS_VOICE_WISDOM = os.environ.get("ELEVENLABS_VOICE_WISDOM", "0ABJJI7ZYmWZBiUBMHUW")
+ELEVENLABS_VOICE_GIBRAN = os.environ.get("ELEVENLABS_VOICE_GIBRAN", "R68HwD2GzEdWfqYZP9FQ")
+
+
 def generate_voice(text: str, output_path: str,
+                   channel_slug: str,
                    exaggeration: float = 0.5,
                    cfg_weight: float = 0.5) -> str:
     """
-    Call Chatterbox TTS API to generate voice narration.
+    Generate voice via ElevenLabs TTS API.
 
-    Returns the local file path of the saved WAV.
+    channel_slug is REQUIRED — it determines which voice to use.
+    Returns the local file path of the saved audio.
     """
+    from elevenlabs import ElevenLabs, VoiceSettings
+
+    if not channel_slug:
+        raise ValueError("generate_voice requires a channel_slug — refusing to default to wisdom voice")
+
     output_path = str(output_path)
-    payload = {
-        "text": text,
-        "exaggeration": exaggeration,
-        "cfg_weight": cfg_weight,
-    }
+    voice_id = ELEVENLABS_VOICE_GIBRAN if channel_slug == "gibran" else ELEVENLABS_VOICE_WISDOM
 
-    # Include reference audio if it exists
-    if Path(VOICE_REFERENCE).exists():
-        payload["reference_audio"] = VOICE_REFERENCE
-
-    resp = requests.post(
-        f"{CHATTERBOX_URL}/tts",
-        json=payload,
-        timeout=120,
+    client = ElevenLabs(api_key=ELEVENLABS_KEY)
+    audio = client.text_to_speech.convert(
+        voice_id=voice_id,
+        text=text,
+        model_id="eleven_multilingual_v2",
+        voice_settings=VoiceSettings(
+            stability=0.70,
+            similarity_boost=0.85,
+            style=0.25,
+            use_speaker_boost=True,
+        ),
     )
-    resp.raise_for_status()
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "wb") as f:
-        f.write(resp.content)
+        for chunk in audio:
+            f.write(chunk)
 
-    print(f"  [voice] Saved: {output_path}")
+    print(f"  [voice] Saved (ElevenLabs): {output_path}")
     return output_path
 
 
 # ---------------------------------------------------------------------------
 # Music selection
 # ---------------------------------------------------------------------------
-def pick_music(philosopher: str) -> str:
+def pick_music(philosopher: str, channel_slug: str = None) -> str:
     """
-    Pick a random music track from the philosopher's style folder.
-    Falls back to any available style if the specific folder is empty.
+    Pick a random music track for this content.
+
+    Resolution order:
+      1. PHILOSOPHER_TO_MUSIC_STYLE[philosopher]  (exact match)
+      2. CHANNEL_DEFAULT_MUSIC_STYLE[channel_slug]  (channel-aware fallback)
+      3. 'stoic_classical' (last resort)
     """
-    style = PHILOSOPHER_TO_MUSIC_STYLE.get(philosopher, "stoic_classical")
+    style = PHILOSOPHER_TO_MUSIC_STYLE.get(philosopher)
+    if not style and channel_slug:
+        style = CHANNEL_DEFAULT_MUSIC_STYLE.get(channel_slug)
+    if not style:
+        style = "stoic_classical"
+
     style_dir = MUSIC_ROOT / style
 
     if style_dir.exists():
@@ -660,6 +792,23 @@ def _get_or_create_week_folder(access_token: str, parent_folder_id: str) -> str:
     return new_id
 
 
+def _make_file_public(access_token: str, file_id: str) -> None:
+    """Share a Drive file as 'anyone with the link can view'."""
+    try:
+        resp = requests.post(
+            f"https://www.googleapis.com/drive/v3/files/{file_id}/permissions",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json={"role": "reader", "type": "anyone"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  [drive] WARNING: Could not make file public: {e}")
+
+
 def upload_to_drive(file_path: str, channel: dict) -> str:
     """
     Upload a video file to the channel's Google Drive folder inside a
@@ -681,9 +830,16 @@ def upload_to_drive(file_path: str, channel: dict) -> str:
 
     # Use multipart upload for files under 5MB, resumable for larger
     if file_size < 5 * 1024 * 1024:
-        return _upload_multipart(access_token, week_folder_id, file_path, filename)
+        drive_url = _upload_multipart(access_token, week_folder_id, file_path, filename)
     else:
-        return _upload_resumable(access_token, week_folder_id, file_path, filename)
+        drive_url = _upload_resumable(access_token, week_folder_id, file_path, filename)
+
+    # Make the file publicly viewable so dashboard thumbnails work
+    file_id = drive_url.split("/d/")[1].split("/")[0] if "/d/" in drive_url else None
+    if file_id:
+        _make_file_public(access_token, file_id)
+
+    return drive_url
 
 
 def _upload_multipart(access_token: str, folder_id: str,
@@ -822,6 +978,32 @@ def _content_work_dir(content_id: str) -> Path:
     return work
 
 
+def _slugify_title(title: str, max_len: int = 60) -> str:
+    """Convert a title to a filesystem-safe slug."""
+    import re
+    s = title.lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = s.strip("_")
+    return s[:max_len] or "untitled"
+
+
+def _final_video_path(channel_slug: str, format_name: str,
+                      title: str, content_id: str) -> Path:
+    """
+    Return a human-readable output path for the final video:
+      C:/AI/{channel_slug}/videos/{format}/{format}_{YYYY-MM-DD}_{title-slug}.mp4
+
+    Format is normalized: 'short' -> 'short', 'midform' -> 'midform',
+    'longform' -> 'longform', 'story' -> 'story'.
+    """
+    fmt = format_name if format_name in ("short", "midform", "longform", "story") else "short"
+    out_dir = Path(f"C:/AI/{channel_slug}/videos/{fmt}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    slug = _slugify_title(title)
+    return out_dir / f"{fmt}_{date_str}_{slug}.mp4"
+
+
 # ---------------------------------------------------------------------------
 # Short-form pipeline
 # ---------------------------------------------------------------------------
@@ -837,19 +1019,20 @@ def process_short(content: dict):
     content_id = content["id"]
     philosopher = content["philosopher"]
     topic = content.get("topic", "life and wisdom")
-    channel = content.get("channels", {})
-    channel_name = channel.get("name", "Wisdom")
-    channel_slug = channel.get("slug", "wisdom")
+    content = _ensure_channel_data(content)
+    channel = content["channels"]
+    channel_name = channel["name"]
+    channel_slug = channel["slug"]
 
     work = _content_work_dir(content_id)
-    print(f"\n  Processing short: {philosopher} / {topic}")
+    print(f"\n  Processing short: {philosopher} / {topic} [channel={channel_slug}]")
 
     # --- Step 1: Quote ---
     log_step(content_id, "quote", 1, "running")
     try:
-        # Use existing quote if provided, otherwise generate
-        quote = content.get("quote_text", "").strip()
-        if not quote:
+        # Use existing quote if it's real content, otherwise generate
+        quote = (content.get("quote_text") or "").strip()
+        if not quote or quote.lower() in ("pending generation", "pending"):
             quote = generate_quote(philosopher, topic)
         log_step(content_id, "quote", 1, "success")
         print(f"  [quote] {quote[:80]}...")
@@ -873,7 +1056,7 @@ def process_short(content: dict):
     log_step(content_id, "image", 2, "running")
     try:
         art_prompt = _build_art_prompt(philosopher, quote, topic)
-        lora = PHILOSOPHER_TO_LORA.get(philosopher, "stoic_classical_v1")
+        lora = PHILOSOPHER_TO_LORA.get(philosopher) or CHANNEL_DEFAULT_LORA.get(channel_slug, "stoic_classical_v1")
         art_path = str(work / "art.png")
         generate_art(art_prompt, lora, 832, 1216, art_path)
         log_step(content_id, "image", 2, "success")
@@ -884,27 +1067,23 @@ def process_short(content: dict):
     # --- Step 4: Voice ---
     log_step(content_id, "voice", 3, "running")
     try:
-        voice_settings = PHILOSOPHER_TO_VOICE_SETTINGS.get(
-            philosopher, {"exaggeration": 0.5}
-        )
         voice_path = str(work / "voice.wav")
-        generate_voice(quote, voice_path, **voice_settings)
+        generate_voice(quote, voice_path, channel_slug=channel_slug)
         log_step(content_id, "voice", 3, "success")
     except Exception as e:
         log_step(content_id, "voice", 3, "failed", str(e))
         raise
 
     # --- Step 5: Music ---
-    music_path = pick_music(philosopher)
+    music_path = pick_music(philosopher, channel_slug=channel_slug)
+    music_style = PHILOSOPHER_TO_MUSIC_STYLE.get(philosopher) or CHANNEL_DEFAULT_MUSIC_STYLE.get(channel_slug, "stoic_classical")
+    eq_color = EQUALIZER_COLORS.get(music_style, "#D4AF37")
 
     # --- Step 6: Assemble video ---
     log_step(content_id, "video", 4, "running")
     try:
-        music_style = PHILOSOPHER_TO_MUSIC_STYLE.get(philosopher, "stoic_classical")
-        eq_color = EQUALIZER_COLORS.get(music_style, "#D4AF37")
-
-        video_path = str(work / f"{channel_slug}_{content_id[:8]}.mp4")
-        assemble_video(
+        video_path = str(_final_video_path(channel_slug, "short", title, content_id))
+        render_remotion_video(
             quotes=[quote],
             philosopher=philosopher,
             art_paths=[art_path],
@@ -912,8 +1091,8 @@ def process_short(content: dict):
             music_path=music_path,
             output_path=video_path,
             format="short",
-            aspect_ratio="9:16",
             channel_name=channel_name,
+            title=title,
             equalizer_color=eq_color,
         )
         log_step(content_id, "video", 4, "success")
@@ -921,23 +1100,29 @@ def process_short(content: dict):
         log_step(content_id, "video", 4, "failed", str(e))
         raise
 
-    # --- Step 7: Upload to Google Drive ---
+    # --- Step 7: Upload to Supabase Storage (primary) + Google Drive (fallback) ---
     drive_url = None
+    video_storage_path = None
     log_step(content_id, "upload", 5, "running")
     try:
-        if channel.get("google_drive_folder_id"):
-            drive_url = upload_to_drive(video_path, channel)
-            print(f"  [upload] Drive URL: {drive_url}")
-        else:
-            print("  [upload] Skipped: no Google Drive folder configured")
+        from supabase_storage import upload_to_storage
+        video_storage_path = upload_to_storage(video_path, "wisdom-videos", channel_slug, "short")
+        print(f"  [upload] Storage path: {video_storage_path}")
         log_step(content_id, "upload", 5, "success")
     except Exception as e:
-        log_step(content_id, "upload", 5, "failed", str(e))
-        # Upload failure is non-fatal; video is still produced locally
-        print(f"  [upload] WARNING: Drive upload failed: {e}")
+        print(f"  [upload] Storage failed, trying Drive: {e}")
+        try:
+            if channel.get("google_drive_folder_id"):
+                drive_url = upload_to_drive(video_path, channel)
+                print(f"  [upload] Drive URL: {drive_url}")
+            log_step(content_id, "upload", 5, "success")
+        except Exception as e2:
+            log_step(content_id, "upload", 5, "failed", str(e2))
+            print(f"  [upload] WARNING: Both uploads failed: {e2}")
 
     # --- Step 7b: Generate thumbnail ---
     thumb_drive_url = None
+    thumb_storage_path = None
     try:
         from thumbnail_generator import generate_thumbnail, generate_thumbnail_from_video
         thumb_path = video_path.replace(".mp4", "_thumb.jpg")
@@ -945,8 +1130,13 @@ def process_short(content: dict):
             generate_thumbnail(art_path, title, thumb_path, 1080, 1920)  # portrait for shorts
         else:
             generate_thumbnail_from_video(video_path, title, thumb_path, 1080, 1920)
-        if channel.get("google_drive_folder_id") and drive_url:
-            thumb_drive_url = upload_to_drive(thumb_path, channel)
+        try:
+            from supabase_storage import upload_to_storage as upload_thumb
+            thumb_storage_path = upload_thumb(thumb_path, "wisdom-thumbnails", channel_slug, "short")
+        except Exception as ts_e:
+            print(f"  [thumb] Storage upload failed: {ts_e}")
+            if channel.get("google_drive_folder_id") and drive_url:
+                thumb_drive_url = upload_to_drive(thumb_path, channel)
         print(f"  [thumb] {thumb_path}")
     except Exception as e:
         print(f"  [thumb] WARNING: {e}")
@@ -963,12 +1153,16 @@ def process_short(content: dict):
         "generation_params": {
             "lora": lora,
             "art_prompt": art_prompt,
-            "voice_settings": voice_settings,
+            "voice_settings": {"provider": "elevenlabs"},
             "music_track": Path(music_path).name,
-            "equalizer_color": eq_color,
+            "renderer": "remotion",
             "tags": tags,
         },
     }
+    if video_storage_path:
+        updates["video_storage_path"] = video_storage_path
+    if thumb_storage_path:
+        updates["thumbnail_storage_path"] = thumb_storage_path
     if drive_url:
         updates["video_drive_url"] = drive_url
     if thumb_drive_url:
@@ -990,20 +1184,24 @@ def process_midform(content: dict):
     content_id = content["id"]
     philosopher = content["philosopher"]
     topic = content.get("topic", "life and wisdom")
-    channel = content.get("channels", {})
-    channel_name = channel.get("name", "Wisdom")
-    channel_slug = channel.get("slug", "wisdom")
+    content = _ensure_channel_data(content)
+    channel = content["channels"]
+    channel_name = channel["name"]
+    channel_slug = channel["slug"]
 
     work = _content_work_dir(content_id)
     num_quotes = 4
-    print(f"\n  Processing midform: {philosopher} / {topic} ({num_quotes} quotes)")
+    print(f"\n  Processing midform: {philosopher} / {topic} ({num_quotes} quotes) [channel={channel_slug}]")
 
-    # --- Step 1: Quotes ---
+    # --- Step 1: Quotes (with dedup) ---
     log_step(content_id, "quote", 1, "running")
     try:
         from ai_writer import generate_midform_script
-        script = generate_midform_script(philosopher, topic, num_quotes=num_quotes)
+        previous = _fetch_recent_quotes(philosopher)
+        script = generate_midform_script(philosopher, topic, num_quotes=num_quotes,
+                                         previous_quotes=previous)
         quotes = script.get("quotes", [])
+        narration_segments = script.get("narration_segments", [])
         if not quotes:
             raise ValueError("Midform script returned no quotes")
         log_step(content_id, "quote", 1, "success")
@@ -1016,7 +1214,7 @@ def process_midform(content: dict):
     # --- Step 2: Art (one per quote) ---
     log_step(content_id, "image", 2, "running")
     try:
-        lora = PHILOSOPHER_TO_LORA.get(philosopher, "stoic_classical_v1")
+        lora = PHILOSOPHER_TO_LORA.get(philosopher) or CHANNEL_DEFAULT_LORA.get(channel_slug, "stoic_classical_v1")
         art_paths = []
         art_prompts = script.get("art_prompts", [])
         for i, quote in enumerate(quotes):
@@ -1033,33 +1231,37 @@ def process_midform(content: dict):
         log_step(content_id, "image", 2, "failed", str(e))
         raise
 
-    # --- Step 3: Voice (one per quote) ---
+    # --- Step 3: Voice (narration + quote per section) ---
     log_step(content_id, "voice", 3, "running")
     try:
-        voice_settings = PHILOSOPHER_TO_VOICE_SETTINGS.get(
-            philosopher, {"exaggeration": 0.5}
-        )
         voice_paths = []
         for i, quote in enumerate(quotes):
+            # Combine narration bridge + quote into one spoken section
+            narration = ""
+            if i < len(narration_segments) and narration_segments[i]:
+                narration = narration_segments[i].strip() + " "
+            full_text = narration + quote
             voice_path = str(work / f"voice_{i}.wav")
-            generate_voice(quote, voice_path, **voice_settings)
+            generate_voice(full_text, voice_path, channel_slug=channel_slug)
             voice_paths.append(voice_path)
+            if narration:
+                print(f"  [voice {i}] narration ({len(narration)}ch) + quote ({len(quote)}ch)")
         log_step(content_id, "voice", 3, "success")
     except Exception as e:
         log_step(content_id, "voice", 3, "failed", str(e))
         raise
 
     # --- Step 4: Music ---
-    music_path = pick_music(philosopher)
+    music_path = pick_music(philosopher, channel_slug=channel_slug)
+    music_style = PHILOSOPHER_TO_MUSIC_STYLE.get(philosopher) or CHANNEL_DEFAULT_MUSIC_STYLE.get(channel_slug, "stoic_classical")
+    eq_color = EQUALIZER_COLORS.get(music_style, "#D4AF37")
 
     # --- Step 5: Assemble ---
     log_step(content_id, "video", 4, "running")
     try:
-        music_style = PHILOSOPHER_TO_MUSIC_STYLE.get(philosopher, "stoic_classical")
-        eq_color = EQUALIZER_COLORS.get(music_style, "#D4AF37")
-
-        video_path = str(work / f"{channel_slug}_{content_id[:8]}_mid.mp4")
-        assemble_video(
+        midform_title = script.get("title", f"{philosopher} on {topic}")
+        video_path = str(_final_video_path(channel_slug, "midform", midform_title, content_id))
+        render_remotion_video(
             quotes=quotes,
             philosopher=philosopher,
             art_paths=art_paths,
@@ -1067,8 +1269,9 @@ def process_midform(content: dict):
             music_path=music_path,
             output_path=video_path,
             format="midform",
-            aspect_ratio="16:9",
             channel_name=channel_name,
+            title=midform_title,
+            narration_segments=narration_segments,
             equalizer_color=eq_color,
         )
         log_step(content_id, "video", 4, "success")
@@ -1076,19 +1279,25 @@ def process_midform(content: dict):
         log_step(content_id, "video", 4, "failed", str(e))
         raise
 
-    # --- Step 6: Upload ---
+    # --- Step 6: Upload to Supabase Storage (primary) + Drive (fallback) ---
     drive_url = None
+    video_storage_path = None
     log_step(content_id, "upload", 5, "running")
     try:
-        if channel.get("google_drive_folder_id"):
-            drive_url = upload_to_drive(video_path, channel)
-            print(f"  [upload] Drive URL: {drive_url}")
-        else:
-            print("  [upload] Skipped: no Google Drive folder configured")
+        from supabase_storage import upload_to_storage
+        video_storage_path = upload_to_storage(video_path, "wisdom-videos", channel_slug, "midform")
+        print(f"  [upload] Storage path: {video_storage_path}")
         log_step(content_id, "upload", 5, "success")
     except Exception as e:
-        log_step(content_id, "upload", 5, "failed", str(e))
-        print(f"  [upload] WARNING: Drive upload failed: {e}")
+        print(f"  [upload] Storage failed, trying Drive: {e}")
+        try:
+            if channel.get("google_drive_folder_id"):
+                drive_url = upload_to_drive(video_path, channel)
+                print(f"  [upload] Drive URL: {drive_url}")
+            log_step(content_id, "upload", 5, "success")
+        except Exception as e2:
+            log_step(content_id, "upload", 5, "failed", str(e2))
+            print(f"  [upload] WARNING: Both uploads failed: {e2}")
 
     # --- Step 7: Update Supabase ---
     # Generate/refresh YouTube metadata from ai_writer for best SEO
@@ -1113,12 +1322,14 @@ def process_midform(content: dict):
         "generation_params": {
             "lora": lora,
             "quotes": quotes,
-            "voice_settings": voice_settings,
+            "voice_settings": {"provider": "elevenlabs"},
             "music_track": Path(music_path).name,
-            "equalizer_color": eq_color,
+            "renderer": "remotion",
             "tags": tags,
         },
     }
+    if video_storage_path:
+        updates["video_storage_path"] = video_storage_path
     if drive_url:
         updates["video_drive_url"] = drive_url
     update_supabase(content_id, updates)
@@ -1156,19 +1367,25 @@ def _batch_process(items: list):
         work = _content_work_dir(cid)
 
         try:
+            content = _ensure_channel_data(content)
             log_step(cid, "quote", 1, "running")
 
+            previous = _fetch_recent_quotes(philosopher)
+
             if content_type == "short":
-                quote = content.get("quote_text", "").strip()
-                if not quote:
+                quote = (content.get("quote_text") or "").strip()
+                if not quote or quote.lower() in ("pending generation", "pending"):
                     quote = generate_quote(philosopher, topic)
                 quotes = [quote]
+                narration_segments = []
                 art_prompt_base = _build_art_prompt(philosopher, quote, topic)
                 art_prompts = [art_prompt_base]
             else:
                 from ai_writer import generate_midform_script
-                script = generate_midform_script(philosopher, topic)
+                script = generate_midform_script(philosopher, topic,
+                                                 previous_quotes=previous)
                 quotes = script.get("quotes", [])
+                narration_segments = script.get("narration_segments", [])
                 art_prompts = script.get("art_prompts", [])
                 if not quotes:
                     raise ValueError("Script returned no quotes")
@@ -1176,6 +1393,7 @@ def _batch_process(items: list):
             log_step(cid, "quote", 1, "success")
             results[cid] = {
                 "quotes": quotes,
+                "narration_segments": narration_segments,
                 "art_prompts": art_prompts,
                 "content": content,
                 "work": work,
@@ -1194,7 +1412,8 @@ def _batch_process(items: list):
     for cid, data in list(results.items()):
         content = data["content"]
         philosopher = content["philosopher"]
-        lora = PHILOSOPHER_TO_LORA.get(philosopher, "stoic_classical_v1")
+        channel_slug = content["channels"]["slug"]
+        lora = PHILOSOPHER_TO_LORA.get(philosopher) or CHANNEL_DEFAULT_LORA.get(channel_slug, "stoic_classical_v1")
         content_type = content.get("format", "short")
         work = data["work"]
 
@@ -1231,27 +1450,31 @@ def _batch_process(items: list):
             print(f"  [{cid[:8]}] FAILED at art: {e}")
 
     # ---------------------------------------------------------------
-    # Phase 3: Voice generation (GPU - Chatterbox)
+    # Phase 3: Voice generation (ElevenLabs)
     # ---------------------------------------------------------------
-    print("\n=== PHASE 3: Voice Generation (Chatterbox) ===")
+    print("\n=== PHASE 3: Voice Generation (ElevenLabs) ===")
     for cid, data in list(results.items()):
         content = data["content"]
-        philosopher = content["philosopher"]
-        voice_settings = PHILOSOPHER_TO_VOICE_SETTINGS.get(
-            philosopher, {"exaggeration": 0.5}
-        )
+        channel = content["channels"]
+        channel_slug = channel["slug"]
         work = data["work"]
 
         try:
             log_step(cid, "voice", 3, "running")
             voice_paths = []
+            narration_segments = data.get("narration_segments", [])
             for i, quote in enumerate(data["quotes"]):
+                # Combine narration bridge + quote for midform
+                narration = ""
+                if i < len(narration_segments) and narration_segments[i]:
+                    narration = narration_segments[i].strip() + " "
+                full_text = narration + quote
                 voice_path = str(work / f"voice_{i}.wav")
-                generate_voice(quote, voice_path, **voice_settings)
+                generate_voice(full_text, voice_path, channel_slug=channel_slug)
                 voice_paths.append(voice_path)
 
             data["voice_paths"] = voice_paths
-            data["voice_settings"] = voice_settings
+            data["voice_settings"] = {"provider": "elevenlabs"}
             log_step(cid, "voice", 3, "success")
             print(f"  [{cid[:8]}] {len(voice_paths)} voice clip(s) generated")
 
@@ -1270,30 +1493,25 @@ def _batch_process(items: list):
         philosopher = content["philosopher"]
         topic = content.get("topic", "life and wisdom")
         content_type = content.get("format", "short")
-        channel = content.get("channels", {})
-        channel_name = channel.get("name", "Wisdom")
-        channel_slug = channel.get("slug", "wisdom")
+        channel = content["channels"]
+        channel_name = channel["name"]
+        channel_slug = channel["slug"]
         work = data["work"]
         quotes = data["quotes"]
 
         try:
             # Music
-            music_path = pick_music(philosopher)
+            music_path = pick_music(philosopher, channel_slug=channel_slug)
+            music_style = PHILOSOPHER_TO_MUSIC_STYLE.get(philosopher) or CHANNEL_DEFAULT_MUSIC_STYLE.get(channel_slug, "stoic_classical")
+            eq_color = EQUALIZER_COLORS.get(music_style, "#D4AF37")
 
             # Assembly
             log_step(cid, "video", 4, "running")
-            music_style = PHILOSOPHER_TO_MUSIC_STYLE.get(philosopher, "stoic_classical")
-            eq_color = EQUALIZER_COLORS.get(music_style, "#D4AF37")
 
-            if content_type == "short":
-                vid_format, aspect = "short", "9:16"
-                suffix = ""
-            else:
-                vid_format, aspect = "midform", "16:9"
-                suffix = "_mid"
-
-            video_path = str(work / f"{channel_slug}_{cid[:8]}{suffix}.mp4")
-            assemble_video(
+            vid_format = "short" if content_type == "short" else "midform"
+            batch_title = content.get("title", f"{philosopher} on {topic}")
+            video_path = str(_final_video_path(channel_slug, vid_format, batch_title, cid))
+            render_remotion_video(
                 quotes=quotes,
                 philosopher=philosopher,
                 art_paths=data["art_paths"],
@@ -1301,25 +1519,32 @@ def _batch_process(items: list):
                 music_path=music_path,
                 output_path=video_path,
                 format=vid_format,
-                aspect_ratio=aspect,
                 channel_name=channel_name,
+                title=batch_title,
+                narration_segments=data.get("narration_segments"),
                 equalizer_color=eq_color,
             )
             log_step(cid, "video", 4, "success")
 
-            # Upload
+            # Upload to Supabase Storage (primary) + Drive (fallback)
             drive_url = None
+            video_storage_path = None
             log_step(cid, "upload", 5, "running")
             try:
-                if channel.get("google_drive_folder_id"):
-                    drive_url = upload_to_drive(video_path, channel)
-                    print(f"  [{cid[:8]}] Drive: {drive_url}")
-                else:
-                    print(f"  [{cid[:8]}] Upload skipped (no Drive folder)")
+                from supabase_storage import upload_to_storage
+                video_storage_path = upload_to_storage(video_path, "wisdom-videos", channel_slug, vid_format)
+                print(f"  [{cid[:8]}] Storage: {video_storage_path}")
                 log_step(cid, "upload", 5, "success")
             except Exception as e:
-                log_step(cid, "upload", 5, "failed", str(e))
-                print(f"  [{cid[:8]}] Upload warning: {e}")
+                print(f"  [{cid[:8]}] Storage failed, trying Drive: {e}")
+                try:
+                    if channel.get("google_drive_folder_id"):
+                        drive_url = upload_to_drive(video_path, channel)
+                        print(f"  [{cid[:8]}] Drive: {drive_url}")
+                    log_step(cid, "upload", 5, "success")
+                except Exception as e2:
+                    log_step(cid, "upload", 5, "failed", str(e2))
+                    print(f"  [{cid[:8]}] Upload warning: {e2}")
 
             # YouTube metadata — generate via ai_writer for SEO-optimised
             # title, description, and tags before marking ready
@@ -1334,6 +1559,29 @@ def _batch_process(items: list):
                 description = quotes[0]
                 tags = [philosopher, topic, "philosophy"]
 
+            # Thumbnail
+            thumb_drive_url = None
+            thumb_storage_path = None
+            try:
+                from thumbnail_generator import generate_thumbnail, generate_thumbnail_from_video
+                thumb_path = video_path.replace(".mp4", "_thumb.jpg")
+                first_art = data["art_paths"][0] if data.get("art_paths") else None
+                if first_art and Path(first_art).exists():
+                    tw, th = (1080, 1920) if content_type == "short" else (1920, 1080)
+                    generate_thumbnail(first_art, title, thumb_path, tw, th)
+                else:
+                    generate_thumbnail_from_video(video_path, title, thumb_path, 1080, 1920)
+                try:
+                    from supabase_storage import upload_to_storage as upload_thumb
+                    thumb_storage_path = upload_thumb(thumb_path, "wisdom-thumbnails", channel_slug, vid_format)
+                except Exception as ts_e:
+                    print(f"  [{cid[:8]}] Thumb storage failed: {ts_e}")
+                    if channel.get("google_drive_folder_id") and drive_url:
+                        thumb_drive_url = upload_to_drive(thumb_path, channel)
+                print(f"  [{cid[:8]}] Thumbnail: {thumb_path}")
+            except Exception as thumb_e:
+                print(f"  [{cid[:8]}] Thumbnail warning: {thumb_e}")
+
             # Update Supabase — status='ready' signals generation is done;
             # human approves in dashboard → status becomes 'approved' →
             # content_poller triggers youtube_uploader.py automatically.
@@ -1347,12 +1595,18 @@ def _batch_process(items: list):
                     "lora": data.get("lora", ""),
                     "voice_settings": data.get("voice_settings", {}),
                     "music_track": Path(music_path).name,
-                    "equalizer_color": eq_color,
+                    "renderer": "remotion",
                     "tags": tags,
                 },
             }
+            if video_storage_path:
+                updates["video_storage_path"] = video_storage_path
+            if thumb_storage_path:
+                updates["thumbnail_storage_path"] = thumb_storage_path
             if drive_url:
                 updates["video_drive_url"] = drive_url
+            if thumb_drive_url:
+                updates["thumbnail_drive_url"] = thumb_drive_url
             update_supabase(cid, updates)
             print(f"  [{cid[:8]}] DONE -> {video_path}")
 
@@ -1360,6 +1614,45 @@ def _batch_process(items: list):
             log_step(cid, "video", 4, "failed", str(e))
             update_supabase(cid, {"status": "failed"})
             print(f"  [{cid[:8]}] FAILED at assembly: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Story pipeline delegation
+# ---------------------------------------------------------------------------
+def _run_story_pipeline(content: dict):
+    """Delegate story format to generate_story_video.py as a subprocess."""
+    cid = content["id"]
+    philosopher = content.get("philosopher", "Marcus Aurelius")
+    topic = content.get("topic", "life")
+    channel = content.get("channels", {}) or {}
+
+    print(f"\n--- Story Pipeline: {philosopher} on {topic} ---")
+    update_supabase(cid, {"status": "generating"})
+    log_step(cid, "story", 1, "running")
+
+    cmd = [
+        sys.executable, str(Path(__file__).parent / "generate_story_video.py"),
+        "--philosopher", philosopher,
+        "--theme", topic,
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=1800,
+            cwd=str(Path(__file__).parent),
+        )
+        if result.returncode != 0:
+            err = result.stderr[-500:] if result.stderr else "Unknown error"
+            raise RuntimeError(f"Story pipeline failed (exit {result.returncode}): {err}")
+        log_step(cid, "story", 1, "success")
+        print(f"  Story pipeline completed for {cid}")
+    except subprocess.TimeoutExpired:
+        log_step(cid, "story", 1, "failed", "Timeout after 30 minutes")
+        update_supabase(cid, {"status": "failed"})
+        raise
+    except Exception as e:
+        log_step(cid, "story", 1, "failed", str(e))
+        update_supabase(cid, {"status": "failed"})
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1418,7 +1711,9 @@ def main():
         for content in queued:
             try:
                 content_type = content.get("format", "short")
-                if content_type in ("short", "story"):
+                if content_type == "story":
+                    _run_story_pipeline(content)
+                elif content_type == "short":
                     process_short(content)
                 elif content_type in ("midform", "longform", "compilation"):
                     process_midform(content)
@@ -1431,8 +1726,18 @@ def main():
                 log_step(content["id"], "publish", 0, "failed", str(e))
                 update_supabase(content["id"], {"status": "failed"})
     else:
-        # Batched processing (VRAM-aware: all art first, then all voice)
-        _batch_process(queued)
+        # Stories run separately (own pipeline), rest go through batch
+        stories = [c for c in queued if c.get("format") == "story"]
+        non_stories = [c for c in queued if c.get("format") != "story"]
+        for content in stories:
+            try:
+                _run_story_pipeline(content)
+                print(f"  Done (story): {content['id']}")
+            except Exception as e:
+                print(f"  FAILED (story): {content['id']} - {e}")
+                traceback.print_exc()
+        if non_stories:
+            _batch_process(non_stories)
 
     elapsed = (datetime.now() - start).total_seconds()
     print(f"\n{'='*60}")

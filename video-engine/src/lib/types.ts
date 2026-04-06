@@ -59,6 +59,7 @@ const MetadataSchema = z.object({
   channel: z.string().optional(),
   closingAttribution: z.string().optional(),
   watermark: z.string().optional(),
+  equalizerColor: z.string().optional(),
 });
 
 const TimelineSchema = z.object({

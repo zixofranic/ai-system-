@@ -18,6 +18,7 @@ import {
 } from "../lib/constants";
 import { TimelineSchema } from "../lib/types";
 import { calculateFrameTiming, getAudioPath, getImagePath } from "../lib/utils";
+import { Equalizer } from "./Equalizer";
 
 export const shortVideoSchema = z.object({
   timeline: TimelineSchema.nullable(),
@@ -191,11 +192,48 @@ export const ShortVideo: React.FC<z.infer<typeof shortVideoSchema>> = ({
           >
             <Audio
               src={staticFile(getAudioPath(id, element.audioUrl))}
-              volume={isMusic ? 0.15 : 1}
+              volume={isMusic ? 0.35 : 1}
             />
           </Sequence>
         );
       })}
+
+      {/* Equalizer — pinned to bottom for shorts */}
+      {timeline.audio
+        .filter((el) => el.audioUrl !== "music")
+        .slice(0, 1)
+        .map((element, index) => {
+          const { startFrame, duration } = calculateFrameTiming(
+            element.startMs,
+            element.endMs,
+          );
+          return (
+            <Sequence
+              key={`eq-${index}`}
+              from={startFrame}
+              durationInFrames={duration}
+            >
+              <AbsoluteFill
+                style={{
+                  zIndex: 15,
+                  justifyContent: "flex-end",
+                  alignItems: "center",
+                  paddingBottom: 140,
+                  pointerEvents: "none",
+                }}
+              >
+                <Equalizer
+                  audioSrc={staticFile(getAudioPath(id, element.audioUrl))}
+                  color={timeline.metadata?.equalizerColor || GOLD}
+                  numberOfBars={36}
+                  maxBarHeight={140}
+                  barWidth={8}
+                  gap={6}
+                />
+              </AbsoluteFill>
+            </Sequence>
+          );
+        })}
     </AbsoluteFill>
   );
 };
@@ -244,8 +282,18 @@ const ShortBackground: React.FC<{
   const top = -(finalH - height) / 2;
   const left = -(finalW - width) / 2;
 
+  // Soft fade in/out
+  const { durationInFrames } = useVideoConfig();
+  const fadeFrames = Math.min(FPS, Math.floor(durationInFrames / 4));
+  const opacity = interpolate(
+    frame,
+    [0, fadeFrames, durationInFrames - fadeFrames, durationInFrames],
+    [0, 1, 1, 0],
+    { extrapolateLeft: "clamp", extrapolateRight: "clamp" },
+  );
+
   return (
-    <AbsoluteFill>
+    <AbsoluteFill style={{ opacity }}>
       <Img
         src={staticFile(getImagePath(project, item.imageUrl))}
         style={{
@@ -263,16 +311,24 @@ const ShortBackground: React.FC<{
 
 const QuoteOverlay: React.FC<{ text: string }> = ({ text }) => {
   const frame = useCurrentFrame();
-  const { fps } = useVideoConfig();
+  const { fps, durationInFrames } = useVideoConfig();
 
   const enter = spring({
     frame,
     fps,
     config: { damping: 200 },
-    durationInFrames: 8,
+    durationInFrames: 12,
   });
 
-  const opacity = interpolate(enter, [0, 1], [0, 1]);
+  const fadeOutFrames = Math.min(20, Math.floor(durationInFrames / 4));
+  const fadeOut = interpolate(
+    frame,
+    [durationInFrames - fadeOutFrames, durationInFrames],
+    [1, 0],
+    { extrapolateLeft: "clamp", extrapolateRight: "clamp" },
+  );
+
+  const opacity = Math.min(interpolate(enter, [0, 1], [0, 1]), fadeOut);
   const translateY = interpolate(enter, [0, 1], [40, 0]);
 
   return (
@@ -281,27 +337,26 @@ const QuoteOverlay: React.FC<{ text: string }> = ({ text }) => {
         zIndex: 15,
         justifyContent: "center",
         alignItems: "center",
-        top: "40%",
-        height: "50%",
-        padding: "0 60px",
+        padding: "0 50px",
       }}
     >
       <div
         style={{
           backgroundColor: "rgba(0, 0, 0, 0.5)",
           borderRadius: 16,
-          padding: "40px 48px",
-          maxWidth: "90%",
+          padding: "48px 52px",
+          maxWidth: "95%",
           opacity,
           transform: `translateY(${translateY}px)`,
         }}
       >
         <div
           style={{
-            fontSize: 52,
-            lineHeight: "72px",
+            fontSize: 64,
+            lineHeight: "88px",
             color: "white",
             fontFamily: "Georgia, serif",
+            fontWeight: "bold",
             fontStyle: "italic",
             textAlign: "center",
             textShadow: "0 2px 8px rgba(0,0,0,0.6)",
@@ -319,17 +374,25 @@ const AttributionOverlay: React.FC<{
   philosopher: string;
 }> = ({ text, philosopher }) => {
   const frame = useCurrentFrame();
-  const { fps } = useVideoConfig();
+  const { fps, durationInFrames } = useVideoConfig();
 
   const enter = spring({
     frame,
     fps,
     config: { damping: 200 },
-    durationInFrames: 10,
+    durationInFrames: 12,
     delay: 5,
   });
 
-  const opacity = interpolate(enter, [0, 1], [0, 1]);
+  const fadeOutFrames = Math.min(20, Math.floor(durationInFrames / 4));
+  const fadeOut = interpolate(
+    frame,
+    [durationInFrames - fadeOutFrames, durationInFrames],
+    [1, 0],
+    { extrapolateLeft: "clamp", extrapolateRight: "clamp" },
+  );
+
+  const opacity = Math.min(interpolate(enter, [0, 1], [0, 1]), fadeOut);
 
   return (
     <AbsoluteFill
@@ -337,12 +400,12 @@ const AttributionOverlay: React.FC<{
         zIndex: 15,
         justifyContent: "flex-end",
         alignItems: "center",
-        paddingBottom: 200,
+        paddingBottom: 300,
       }}
     >
       <div
         style={{
-          fontSize: 36,
+          fontSize: 40,
           color: GOLD,
           fontFamily: "Georgia, serif",
           fontStyle: "italic",
@@ -384,9 +447,9 @@ const ShortCaption: React.FC<{ text: string }> = ({ text }) => {
           fontSize: 40,
           color: "white",
           fontFamily: "Georgia, serif",
+          fontWeight: "bold",
           textAlign: "center",
           textTransform: "uppercase",
-          WebkitTextStroke: "1.5px rgba(0,0,0,0.8)",
           transform: `scale(${scaleVal})`,
           maxWidth: "85%",
           textShadow: "0 2px 8px rgba(0,0,0,0.9)",

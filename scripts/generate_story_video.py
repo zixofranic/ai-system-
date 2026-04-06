@@ -37,8 +37,8 @@ VIDEO_ENGINE = Path("C:/AI/system/video-engine")
 MUSIC_ROOT = Path("C:/AI/system/music")
 
 OUTPUT_DIRS = {
-    "wisdom": Path("C:/AI/wisdom/output/stories"),
-    "gibran": Path("C:/AI/gibran/output/stories"),
+    "wisdom": Path("C:/AI/wisdom/videos/story"),
+    "gibran": Path("C:/AI/gibran/videos/story"),
 }
 
 PHILOSOPHER_CHANNEL = {
@@ -95,9 +95,10 @@ def step_generate_voice(text, output_path, ts_path):
     print("\n[2/6] Generating voice via Chatterbox TTS...")
     text = _sanitize_text(text)
     payload = {"text": text, "exaggeration": 0.5, "cfg_weight": 0.5}
-    voice_ref = Path("C:/AI/system/voice/cloned/wisdom_burton.mp3")
+    voice_ref = Path("C:/AI/system/voice/recordings/wisdom_burton_11labs_clip.mp3")
     if voice_ref.exists():
-        payload["reference_audio"] = str(voice_ref)
+        payload["voice_mode"] = "clone"
+        payload["reference_audio_filename"] = voice_ref.name
 
     resp = requests.post(f"{CHATTERBOX_URL}/tts", json=payload, timeout=300)
     resp.raise_for_status()
@@ -408,19 +409,40 @@ def main():
     except Exception as e:
         print(f"  Thumbnail failed: {e}")
 
-    # Step 6c: Upload to Google Drive
-    drive_url = step_upload_drive(str(video_path), channel)
+    # Step 6c: Upload to Supabase Storage (primary) + Drive (fallback)
+    drive_url = None
+    video_storage_path = None
+    thumb_storage_path = None
+    channel_slug = channel.get("slug", "wisdom") if channel else "wisdom"
+    try:
+        from supabase_storage import upload_to_storage
+        video_storage_path = upload_to_storage(str(video_path), "wisdom-videos", channel_slug, "story")
+        print(f"  Storage: {video_storage_path}")
+    except Exception as e:
+        print(f"  Storage upload failed, trying Drive: {e}")
+        drive_url = step_upload_drive(str(video_path), channel)
 
-    # Upload thumbnail to Drive
-    if os.path.exists(thumb_path) and drive_url:
+    # Upload thumbnail
+    if os.path.exists(thumb_path):
         try:
-            thumb_drive_url = step_upload_drive(thumb_path, channel)
-            print(f"  Thumbnail Drive: {thumb_drive_url}")
+            from supabase_storage import upload_to_storage as upload_thumb
+            thumb_storage_path = upload_thumb(thumb_path, "wisdom-thumbnails", channel_slug, "story")
+            print(f"  Thumbnail Storage: {thumb_storage_path}")
         except Exception as e:
-            print(f"  Thumbnail upload failed: {e}")
+            print(f"  Thumbnail storage failed: {e}")
+            if drive_url or video_storage_path:
+                try:
+                    thumb_drive_url = step_upload_drive(thumb_path, channel)
+                    print(f"  Thumbnail Drive: {thumb_drive_url}")
+                except Exception as e2:
+                    print(f"  Thumbnail upload failed: {e2}")
 
     # Step 7: Update Supabase content row with metadata (if connected)
-    step_update_supabase(story, str(video_path), video_drive_url=drive_url, thumbnail_drive_url=thumb_drive_url)
+    step_update_supabase(
+        story, str(video_path),
+        video_drive_url=drive_url, thumbnail_drive_url=thumb_drive_url,
+        video_storage_path=video_storage_path, thumbnail_storage_path=thumb_storage_path,
+    )
 
     print(f"\n{'='*60}")
     print(f"  COMPLETE")
@@ -700,7 +722,7 @@ def step_upload_drive(video_path, channel):
 # ---------------------------------------------------------------------------
 # Step 7: Push metadata to Supabase
 # ---------------------------------------------------------------------------
-def step_update_supabase(story, video_path, video_drive_url=None, thumbnail_drive_url=None):
+def step_update_supabase(story, video_path, video_drive_url=None, thumbnail_drive_url=None, video_storage_path=None, thumbnail_storage_path=None):
     """Update Supabase content row with title, description, tags, and local path."""
     supabase_url = os.getenv("SUPABASE_URL", "")
     supabase_key = os.getenv("SUPABASE_SERVICE_KEY", "")
@@ -756,6 +778,10 @@ def step_update_supabase(story, video_path, video_drive_url=None, thumbnail_driv
             },
             "is_system_generated": True,
         }
+        if video_storage_path:
+            payload["video_storage_path"] = video_storage_path
+        if thumbnail_storage_path:
+            payload["thumbnail_storage_path"] = thumbnail_storage_path
         if video_drive_url:
             payload["video_drive_url"] = video_drive_url
         if thumbnail_drive_url:
@@ -790,6 +816,10 @@ def step_update_supabase(story, video_path, video_drive_url=None, thumbnail_driv
                 "closing_attribution": story.get("closing_attribution", ""),
             },
         }
+        if video_storage_path:
+            payload["video_storage_path"] = video_storage_path
+        if thumbnail_storage_path:
+            payload["thumbnail_storage_path"] = thumbnail_storage_path
         if video_drive_url:
             payload["video_drive_url"] = video_drive_url
         if thumbnail_drive_url:

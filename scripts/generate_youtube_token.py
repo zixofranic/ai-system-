@@ -67,16 +67,14 @@ REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}"
 
 # Scopes needed for YouTube upload + Drive storage
 SCOPES = [
-    "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube",
-    "https://www.googleapis.com/auth/drive.file",
 ]
 
 # Channel hints
 CHANNEL_HINTS = {
     "wisdom": {
         "name": "Deep Echoes of Wisdom",
-        "id": "UCg2xRMNI-w3u2_Rhm6FHrdA",
+        "id": "UCg2xRMNl-w3u2_Rhm6FHrdA",
         "account": "ziadfeg@gmail.com",
     },
     "gibran": {
@@ -160,12 +158,12 @@ def build_auth_url(login_hint: str = None) -> str:
         "response_type": "code",
         "scope": " ".join(SCOPES),
         "access_type": "offline",
-        "prompt": "consent",  # Force consent to always get refresh_token
+        "prompt": "select_account consent",  # Force account picker + consent
         "include_granted_scopes": "true",
     }
 
-    if login_hint:
-        params["login_hint"] = login_hint
+    # NOTE: Do NOT set login_hint — it can cause Google to skip showing
+    # Brand Account options in the account picker.
 
     return f"{AUTH_URL}?{urlencode(params)}"
 
