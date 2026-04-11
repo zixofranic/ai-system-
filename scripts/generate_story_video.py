@@ -336,10 +336,12 @@ def step_render(output_name, out_path):
     print(f"\n[6/6] Rendering via Remotion -> {out_path}")
     remotion_cmd = str(VIDEO_ENGINE / "node_modules" / ".bin" / "remotion.cmd")
     subprocess.run(
-        # CRF 22 keeps 6-min stories under 50 MB so they upload via direct
-        # PUT instead of requiring TUS. Quality diff vs CRF 18 is imperceptible
-        # on cinematic AI art.
-        f'"{remotion_cmd}" render {output_name} "{out_path}" --codec=h264 --crf=22',
+        # CRF 24 keeps 6-min stories comfortably under the Supabase project
+        # 50 MB global file size limit (Pro plan default). CRF 22 was landing
+        # 6-min stories at ~50.8 MB, just over the cap — upload 413'd. Quality
+        # diff vs CRF 22 is imperceptible on cinematic AI art. Raise the
+        # project limit in Supabase Settings > Storage if you want CRF 18-20.
+        f'"{remotion_cmd}" render {output_name} "{out_path}" --codec=h264 --crf=24',
         cwd=str(VIDEO_ENGINE), check=True, timeout=600, shell=True,
     )
     print(f"  DONE: {out_path}")
@@ -522,6 +524,20 @@ def main():
                     print(f"  Thumbnail Drive: {thumb_drive_url}")
                 except Exception as e2:
                     print(f"  Thumbnail upload failed: {e2}")
+
+    # Fail loud if we have NO playable video URL after uploads. Previously
+    # the pipeline would happily continue with video_storage_path=None and
+    # video_drive_url=None, patch the row to status=ready, and leave it
+    # invisible on the review page (which filters by the presence of at
+    # least one video URL). Now we raise so the orchestrator's mark_failed
+    # runs and the dashboard surfaces the real reason.
+    if not video_storage_path and not drive_url:
+        raise RuntimeError(
+            "Video upload failed on every backend (Supabase Storage + Drive) "
+            "— refusing to mark row ready with no playable video URL. "
+            "Check Supabase project file size limit (Settings > Storage) "
+            "or add a Google Drive folder to the channel."
+        )
 
     # Step 7: Update Supabase content row with metadata. If the PATCH fails
     # after the uploads succeeded, best-effort DELETE the orphan storage
