@@ -18,9 +18,10 @@ VIDEO_ENGINE = Path("C:/AI/system/video-engine")
 CONTENT_DIR = VIDEO_ENGINE / "public" / "content"
 
 FORMAT_DIMENSIONS = {
-    "short":    {"width": 1080, "height": 1920},
-    "midform":  {"width": 1920, "height": 1080},
-    "longform": {"width": 1920, "height": 1080},
+    "short":          {"width": 1080, "height": 1920},
+    "story_vertical": {"width": 1080, "height": 1920},
+    "midform":        {"width": 1920, "height": 1080},
+    "longform":       {"width": 1920, "height": 1080},
 }
 
 # Padding constants (milliseconds)
@@ -46,6 +47,47 @@ def _convert_to_mp3(src: str, dst: str):
         ["ffmpeg", "-y", "-i", src, "-codec:a", "libmp3lame", "-b:a", "192k", dst],
         capture_output=True, check=True,
     )
+
+
+def _copy_and_loop_music(music_path: str, dst: str, voice_paths: list):
+    """
+    Copy/convert the music file to dst, looping it if needed to cover
+    the total video duration (estimated from voice clips + padding).
+
+    Uses ffmpeg's -stream_loop to seamlessly concatenate the track
+    enough times to cover the full duration, then trims to exact length.
+    """
+    # Estimate total video duration from voice clips
+    total_voice_ms = 0
+    for vp in voice_paths:
+        total_voice_ms += _get_duration_ms(vp)
+    # Add intro/outro/section padding — generous estimate so music covers all
+    estimated_duration_ms = total_voice_ms + INTRO_PAD_MS + OUTRO_PAD_MS + 5000
+
+    music_duration_ms = _get_duration_ms(music_path)
+
+    if music_duration_ms >= estimated_duration_ms:
+        # Music track is long enough — just copy/convert
+        if music_path.lower().endswith(".mp3"):
+            import shutil
+            shutil.copy2(music_path, dst)
+        else:
+            _convert_to_mp3(music_path, dst)
+    else:
+        # Music track is shorter than the video — loop it
+        loops_needed = int(estimated_duration_ms / music_duration_ms) + 1
+        target_sec = estimated_duration_ms / 1000
+        print(f"  [music] Looping {loops_needed}x to cover {target_sec:.0f}s "
+              f"(track is {music_duration_ms/1000:.0f}s)")
+        subprocess.run(
+            ["ffmpeg", "-y",
+             "-stream_loop", str(loops_needed),
+             "-i", music_path,
+             "-t", str(target_sec),
+             "-codec:a", "libmp3lame", "-b:a", "192k",
+             dst],
+            capture_output=True, check=True,
+        )
 
 
 def _build_short_timeline(
@@ -272,12 +314,12 @@ def render_remotion_video(
         else:
             _convert_to_mp3(voice_path, str(dst))
 
-    # Music
+    # Music — loop to cover the full video if the track is shorter than
+    # the total duration. Most library tracks are 2-4 minutes but 6-min
+    # stories need 5:30+ of background music. Without looping, the second
+    # half of the story plays in silence.
     music_dst = audio_dir / "music.mp3"
-    if music_path.lower().endswith(".mp3"):
-        shutil.copy2(music_path, music_dst)
-    else:
-        _convert_to_mp3(music_path, str(music_dst))
+    _copy_and_loop_music(music_path, str(music_dst), voice_paths)
 
     # --- Get voice durations ---
     voice_durations_ms = []

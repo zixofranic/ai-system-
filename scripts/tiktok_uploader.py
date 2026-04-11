@@ -249,7 +249,13 @@ def upload_to_tiktok(video_path, title, token, open_id):
     return publish_id  # Return publish_id even if status check times out
 
 
-def build_tiktok_caption(content):
+CHANNEL_HASHTAGS = {
+    "wisdom": ["#Philosophy", "#Wisdom", "#Shorts", "#DeepEchoesOfWisdom"],
+    "gibran": ["#Gibran", "#KahlilGibran", "#TheProphet", "#Shorts"],
+}
+
+
+def build_tiktok_caption(content, channel_slug="wisdom"):
     """Build TikTok caption from title, description, and tags."""
     title = content.get("title", "")
     description = content.get("description", "")
@@ -265,14 +271,15 @@ def build_tiktok_caption(content):
         first_line = description.split("\n")[0][:200]
         caption = f"{title}\n\n{first_line}"
 
-    # Add hashtags
+    # Add hashtags from AI-generated tags
     hashtags = []
     if tags:
         for tag in tags[:8]:
             ht = "#" + tag.replace(" ", "").replace("-", "")
             hashtags.append(ht)
-    # Always add these
-    for ht in ["#Philosophy", "#Wisdom", "#Shorts", "#DeepEchoesOfWisdom"]:
+
+    # Add channel-specific hashtags
+    for ht in CHANNEL_HASHTAGS.get(channel_slug, CHANNEL_HASHTAGS["wisdom"]):
         if ht not in hashtags:
             hashtags.append(ht)
 
@@ -311,11 +318,20 @@ def process_content(content, dry_run=False):
         token = get_tiktok_token(channel)
         open_id = settings.get("tiktok_open_id", "")
 
-        # Download video
-        video_path = download_from_drive(content["video_drive_url"], channel)
+        # Download video (prefer Supabase Storage, fallback to Drive)
+        storage_path = content.get("video_storage_path")
+        if storage_path:
+            from supabase_storage import download_from_storage
+            import tempfile as _tmpfile
+            tmp = _tmpfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+            tmp.close()
+            video_path = download_from_storage("wisdom-videos", storage_path, tmp.name)
+        else:
+            video_path = download_from_drive(content["video_drive_url"], channel)
 
         # Upload with full caption
-        caption = build_tiktok_caption(content)
+        channel_slug = channel.get("slug", "wisdom")
+        caption = build_tiktok_caption(content, channel_slug=channel_slug)
         tiktok_id = upload_to_tiktok(video_path, caption, token, open_id)
 
         # Update Supabase
@@ -361,9 +377,9 @@ def main():
             f"{SUPABASE_URL}/rest/v1/content",
             headers=HEADERS,
             params={
-                "select": "id,title,description,philosopher,channel_id,video_drive_url,generation_params",
+                "select": "id,title,description,philosopher,channel_id,video_drive_url,video_storage_path,generation_params",
                 "status": "eq.approved",
-                "video_drive_url": "not.is.null",
+                "or": "(video_drive_url.not.is.null,video_storage_path.not.is.null)",
                 "tiktok_video_id": "is.null",
                 "deleted_at": "is.null",
                 "order": "created_at.asc",

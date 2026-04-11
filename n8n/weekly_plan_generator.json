@@ -1,4 +1,5 @@
 {
+  "id": "weekly-plan-generator-001",
   "name": "Weekly Plan Generator",
   "nodes": [
     {
@@ -167,7 +168,7 @@
     "errorWorkflow": ""
   },
   "staticData": null,
-  "tags": ["wisdom", "weekly-plan", "content-pipeline"],
+  "tags": [],
   "triggerCount": 0,
   "updatedAt": "2026-03-26T00:00:00.000Z",
   "versionId": "1"

@@ -102,7 +102,7 @@ def _fetch_approved_content() -> list:
     url = (
         f"{SUPABASE_URL}/rest/v1/content"
         f"?status=eq.approved"
-        f"&video_drive_url=not.is.null"
+        f"&or=(video_drive_url.not.is.null,video_storage_path.not.is.null)"
         f"&deleted_at=is.null"
         f"&order=created_at.asc"
         f"&select=*,channels:channel_id(id,name,slug,settings)"
@@ -467,15 +467,18 @@ def upload_to_youtube(content_id: str, dry_run: bool = False) -> str:
     channel = content.get("channels", {}) or {}
     channel_name = channel.get("name", "?")
     drive_url = content.get("video_drive_url", "")
+    storage_path = content.get("video_storage_path", "")
 
     print(f"  Philosopher : {philosopher}")
     print(f"  Topic       : {topic}")
     print(f"  Channel     : {channel_name}")
+    if storage_path:
+        print(f"  Storage Path: {storage_path}")
     print(f"  Drive URL   : {drive_url or '(none)'}")
 
     # --- 2. Validate ---
-    if not drive_url:
-        err = "video_drive_url is not set — video has not been uploaded to Drive yet"
+    if not drive_url and not storage_path:
+        err = "No video source — neither video_storage_path nor video_drive_url is set"
         _update_content(content_id, {"status": "failed",
                                      "rejection_reason": err})
         raise ValueError(err)
@@ -516,15 +519,19 @@ def upload_to_youtube(content_id: str, dry_run: bool = False) -> str:
     else:
         drive_access_token = yt_access_token  # fallback
 
-    # --- 4. Download video from Drive ---
+    # --- 4. Download video (prefer Supabase Storage, fallback to Drive) ---
     tmp_dir = Path(tempfile.gettempdir()) / "wisdom_yt_upload"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp_video = str(tmp_dir / f"{content_id[:8]}.mp4")
 
     try:
-        _download_from_drive(drive_url, drive_access_token, tmp_video)
+        if storage_path:
+            from supabase_storage import download_from_storage
+            download_from_storage("wisdom-videos", storage_path, tmp_video)
+        else:
+            _download_from_drive(drive_url, drive_access_token, tmp_video)
     except Exception as e:
-        err = f"Drive download failed: {e}"
+        err = f"Video download failed: {e}"
         _update_content(content_id, {"status": "failed",
                                      "rejection_reason": err})
         raise RuntimeError(err)

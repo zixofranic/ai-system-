@@ -78,7 +78,9 @@ TOPIC_PHILOSOPHER_MAP = {
     "change": ["Marcus Aurelius", "Lao Tzu", "Seneca"],
 }
 
-FORMAT_ROTATION = ["short", "story", "short", "midform", "short", "story", "longform"]
+# Midform killed 2026-04-09, longform parked. Mon-Fri stories + daily shorts.
+# Sat/Sun are rest days in the rotation.
+FORMAT_ROTATION = ["short", "story", "short", "story", "short", "story", "short"]
 
 
 # ---------------------------------------------------------------------------

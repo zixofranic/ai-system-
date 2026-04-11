@@ -132,6 +132,19 @@ def step_generate_voice(text, output_path, ts_path):
         words = [{"word": w, "start": i * tpw, "end": (i + 1) * tpw} for i, w in enumerate(text_words)]
         print(f"  Even-split: {len(words)} words, {duration:.1f}s")
 
+    # Forced-align Whisper's timings to the ground-truth script text.
+    # This fixes Whisper's mis-transcriptions of uncommon proper nouns
+    # (e.g. "Saya" → "Sire") by replacing each token with the correct
+    # spelling from the source script while keeping Whisper's timestamps.
+    try:
+        from whisper_align import align_whisper_to_script
+        before = sum(1 for w in words if w["word"].lower() not in text.lower())
+        words = align_whisper_to_script(words, text)
+        after = sum(1 for w in words if w["word"] not in text)
+        print(f"  Aligned to script: {before} → {after} out-of-script tokens")
+    except Exception as e:
+        print(f"  WARNING: script alignment failed ({e}), using raw Whisper output")
+
     with open(ts_path, "w") as f:
         json.dump(words, f, indent=2)
     return words
@@ -208,9 +221,25 @@ def _submit_and_wait(workflow, timeout=180):
 
 def step_generate_images(prompts, prefix):
     print(f"\n[4/6] Generating {len(prompts)} images via ComfyUI...")
-    neg = "blurry, low quality, text, watermark, anime, cartoon, 3d render, deformed face, extra limbs, disfigured, bad anatomy"
+    # Stronger negative to kill the "plastic AI look"
+    neg = (
+        "blurry, low quality, text, watermark, anime, cartoon, 3d render, "
+        "deformed face, extra limbs, disfigured, bad anatomy, "
+        "plastic skin, waxy, doll face, dead eyes, airbrushed, "
+        "oversaturated, cgi render, deviantart, trending on artstation, "
+        "fused fingers, mutated hands, lowres, jpeg artifacts, over-smoothed"
+    )
     reference = None
     art_paths = []
+
+    # Quality settings (2026-04-09):
+    #   steps 30 → 40, cfg 7.5/7.0 → 5.5, sampler euler → dpmpp_2m_sde_gpu,
+    #   scheduler normal → karras. Same tune as orchestrator's shorts path.
+    SAMPLER = "dpmpp_2m_sde_gpu"
+    SCHEDULER = "karras"
+    STEPS = 40
+    CFG_HERO = 5.5  # scene 1 — less constraint, more room for base model quality
+    CFG_IPADAPTER = 6.0  # scenes 2+ — slightly firmer to balance IP-Adapter guidance
 
     for i, prompt in enumerate(prompts):
         print(f"  Scene {i+1}/{len(prompts)}: {prompt[:50]}...", flush=True)
@@ -222,7 +251,7 @@ def step_generate_images(prompts, prefix):
                 "3": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["1", 1]}},
                 "4": {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": ["1", 1]}},
                 "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 1216, "height": 832, "batch_size": 1}},
-                "6": {"class_type": "KSampler", "inputs": {"seed": random.randint(1, 999999), "steps": 30, "cfg": 7.5, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["5", 0]}},
+                "6": {"class_type": "KSampler", "inputs": {"seed": random.randint(1, 999999), "steps": STEPS, "cfg": CFG_HERO, "sampler_name": SAMPLER, "scheduler": SCHEDULER, "denoise": 1.0, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["5", 0]}},
                 "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
                 "8": {"class_type": "SaveImage", "inputs": {"filename_prefix": sp, "images": ["7", 0]}},
             }
@@ -235,7 +264,7 @@ def step_generate_images(prompts, prefix):
                 "10": {"class_type": "LoadImage", "inputs": {"image": _copy_to_input(reference)}},
                 "12": {"class_type": "IPAdapterUnifiedLoader", "inputs": {"model": ["1", 0], "preset": "STANDARD (medium strength)"}},
                 "13": {"class_type": "IPAdapterAdvanced", "inputs": {"model": ["12", 0], "ipadapter": ["12", 1], "image": ["10", 0], "weight": 0.5, "weight_type": "style transfer", "start_at": 0.0, "end_at": 0.3, "combine_embeds": "concat", "embeds_scaling": "K+V w/ C penalty"}},
-                "6": {"class_type": "KSampler", "inputs": {"seed": random.randint(1, 999999), "steps": 30, "cfg": 7.0, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": ["13", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["5", 0]}},
+                "6": {"class_type": "KSampler", "inputs": {"seed": random.randint(1, 999999), "steps": STEPS, "cfg": CFG_IPADAPTER, "sampler_name": SAMPLER, "scheduler": SCHEDULER, "denoise": 1.0, "model": ["13", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["5", 0]}},
                 "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
                 "8": {"class_type": "SaveImage", "inputs": {"filename_prefix": sp, "images": ["7", 0]}},
             }
@@ -288,7 +317,10 @@ def step_render(output_name, out_path):
     print(f"\n[6/6] Rendering via Remotion -> {out_path}")
     remotion_cmd = str(VIDEO_ENGINE / "node_modules" / ".bin" / "remotion.cmd")
     subprocess.run(
-        f'"{remotion_cmd}" render {output_name} "{out_path}" --codec=h264 --crf=18',
+        # CRF 22 keeps 6-min stories under 50 MB so they upload via direct
+        # PUT instead of requiring TUS. Quality diff vs CRF 18 is imperceptible
+        # on cinematic AI art.
+        f'"{remotion_cmd}" render {output_name} "{out_path}" --codec=h264 --crf=22',
         cwd=str(VIDEO_ENGINE), check=True, timeout=600, shell=True,
     )
     print(f"  DONE: {out_path}")
@@ -309,7 +341,9 @@ def main():
     parser.add_argument("--reuse-voice", action="store_true", help="Skip voice if exists")
     parser.add_argument("--reuse-images", action="store_true", help="Skip image gen if art_paths exists")
     parser.add_argument("--reuse-all", action="store_true", help="Skip to Remotion render")
-    parser.add_argument("--num-scenes", type=int, default=10)
+    # Bumped 10 → 15 on 2026-04-09 to pair with longer 6-min story scripts.
+    # Aim for ~24s per scene on a 6-min story.
+    parser.add_argument("--num-scenes", type=int, default=15)
     args = parser.parse_args()
 
     philosopher = args.philosopher
@@ -383,12 +417,38 @@ def main():
             art_paths = json.load(f)
         print(f"\n[4/6] Reusing {len(art_paths)} images")
 
-    # Step 5: Pick music
+    # Step 5: Pick music — loop if shorter than the voice
     music_dir = MUSIC_ROOT / music_style
     tracks = list(music_dir.glob("*.mp3"))
     music_path = str(random.choice(tracks)) if tracks else None
 
-    # Step 5: Convert to Remotion
+    # Pre-loop the music track if it's shorter than the voice file.
+    # Most library tracks are 2-4 minutes but 6-min stories need 5:30+.
+    if music_path and voice_path:
+        voice_dur = float(subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nk=1:nw=1", str(voice_path)],
+            capture_output=True, text=True,
+        ).stdout.strip() or "0")
+        music_dur = float(subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nk=1:nw=1", music_path],
+            capture_output=True, text=True,
+        ).stdout.strip() or "0")
+        needed = voice_dur + 10  # voice + padding
+        if music_dur > 0 and music_dur < needed:
+            loops = int(needed / music_dur) + 1
+            looped_path = str(output_dir / f"{prefix}_music_looped.mp3")
+            subprocess.run(
+                ["ffmpeg", "-y", "-stream_loop", str(loops), "-i", music_path,
+                 "-t", str(needed), "-codec:a", "libmp3lame", "-b:a", "192k",
+                 looped_path],
+                capture_output=True,
+            )
+            print(f"  Music looped {loops}x -> {needed:.0f}s (track was {music_dur:.0f}s)")
+            music_path = looped_path
+
+    # Step 5b: Convert to Remotion
     step_convert_remotion(script_path, ts_path, art_paths_path, voice_path, music_path, output_name)
 
     # Step 6: Render
@@ -413,7 +473,7 @@ def main():
     drive_url = None
     video_storage_path = None
     thumb_storage_path = None
-    channel_slug = channel.get("slug", "wisdom") if channel else "wisdom"
+    channel_slug = channel or "wisdom"
     try:
         from supabase_storage import upload_to_storage
         video_storage_path = upload_to_storage(str(video_path), "wisdom-videos", channel_slug, "story")

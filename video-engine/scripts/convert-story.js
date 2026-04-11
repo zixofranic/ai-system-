@@ -18,6 +18,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { execSync } = require("child_process");
 
 // --- Parse args ---
 const args = {};
@@ -48,7 +49,24 @@ const FORMAT_CONFIG = {
 const config = FORMAT_CONFIG[format] || FORMAT_CONFIG.story;
 
 // --- Calculate total voice duration ---
-const voiceEndMs = timestamps[timestamps.length - 1].end * 1000;
+// Use actual audio file duration via ffprobe (Whisper often misses the
+// final 200-500ms of the last word's trailing phonemes).
+function getAudioDurationMs(audioPath) {
+  try {
+    const out = execSync(
+      `ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "${audioPath}"`,
+      { encoding: "utf-8" },
+    ).trim();
+    return Math.round(parseFloat(out) * 1000);
+  } catch (e) {
+    console.warn(`ffprobe failed, using Whisper timestamp: ${e.message}`);
+    return Math.round(timestamps[timestamps.length - 1].end * 1000);
+  }
+}
+
+const voiceFileEndMs = getAudioDurationMs(voicePath);
+// +120ms safety pad so the very last phoneme doesn't clip on playback
+const voiceEndMs = voiceFileEndMs + 120;
 const totalDurationMs = voiceEndMs + VOICE_START_MS + 3000;
 const numScenes = artPaths.filter((p) => p !== null).length;
 const targetSceneDurationMs = voiceEndMs / numScenes;
@@ -179,31 +197,62 @@ if (elements.length > 0) {
 }
 
 // --- Caption text elements ---
-const MAX_CAPTION_WORDS = 8;
+// Sentence-build captions: each sentence is ONE textElement that holds for
+// the whole sentence duration. Within it, individual word timings let
+// ProgressiveSubtitle fade words in one by one (eyes have a stable anchor
+// instead of a single flickering word).
+//
+// Sentences are split at punctuation (.!?;:). Long sentences (>14 words) are
+// hard-broken at the next comma or word boundary so font-fitting stays sane.
+const SENTENCE_HOLD_MS = 350; // hold the full sentence on-screen after the last word
+const MAX_SENTENCE_WORDS = 14;
 const textElements = [];
-let chunk = [];
 
+const flushSentence = (sentenceWords) => {
+  if (sentenceWords.length === 0) return;
+  const sentenceStartMs = Math.round(
+    sentenceWords[0].start * 1000 + VOICE_START_MS,
+  );
+  const sentenceEndMs =
+    Math.round(
+      sentenceWords[sentenceWords.length - 1].end * 1000 + VOICE_START_MS,
+    ) + SENTENCE_HOLD_MS;
+
+  textElements.push({
+    startMs: sentenceStartMs,
+    endMs: sentenceEndMs,
+    text: sentenceWords
+      .map((w) => w.word)
+      .join(" ")
+      .toLowerCase(),
+    position: "center",
+    words: sentenceWords.map((w) => ({
+      word: w.word.toLowerCase(),
+      startMs: Math.round(w.start * 1000 + VOICE_START_MS),
+      endMs: Math.round(w.end * 1000 + VOICE_START_MS),
+    })),
+  });
+};
+
+let sentence = [];
 for (const w of timestamps) {
-  chunk.push(w);
-  const atPunct = [...SENTENCE_ENDINGS].some((p) => w.word.endsWith(p));
-  if ((atPunct && chunk.length >= 2) || chunk.length >= MAX_CAPTION_WORDS) {
-    const text = chunk.map((c) => c.word).join(" ").toLowerCase();
-    const startMs = chunk[0].start * 1000 + VOICE_START_MS;
-    let endMs = chunk[chunk.length - 1].end * 1000 + VOICE_START_MS;
-    if (endMs - startMs < 800) endMs = startMs + 800;
+  sentence.push(w);
+  const isSentenceEnd = [...SENTENCE_ENDINGS].some((p) => w.word.endsWith(p));
+  const tooLong = sentence.length >= MAX_SENTENCE_WORDS;
+  const breakAtComma = sentence.length >= 10 && w.word.endsWith(",");
 
-    textElements.push({ startMs: Math.round(startMs), endMs: Math.round(endMs), text, position: "bottom" });
-    chunk = [];
+  if (isSentenceEnd || tooLong || breakAtComma) {
+    flushSentence(sentence);
+    sentence = [];
   }
 }
-if (chunk.length > 0) {
-  const text = chunk.map((c) => c.word).join(" ").toLowerCase();
-  textElements.push({
-    startMs: Math.round(chunk[0].start * 1000 + VOICE_START_MS),
-    endMs: Math.round(chunk[chunk.length - 1].end * 1000 + VOICE_START_MS),
-    text,
-    position: "bottom",
-  });
+flushSentence(sentence);
+
+// Prevent overlap: clip each sentence's endMs so it doesn't bleed into the next
+for (let i = 0; i < textElements.length - 1; i++) {
+  if (textElements[i].endMs > textElements[i + 1].startMs) {
+    textElements[i].endMs = textElements[i + 1].startMs;
+  }
 }
 
 // --- Audio ---
@@ -219,6 +268,14 @@ const audioElements = [
     audioUrl: "voice",
   },
 ];
+
+if (musicPath && fs.existsSync(musicPath)) {
+  audioElements.push({
+    startMs: 0,
+    endMs: Math.round(totalDurationMs),
+    audioUrl: "music",
+  });
+}
 
 // --- Timeline + metadata ---
 const timeline = {

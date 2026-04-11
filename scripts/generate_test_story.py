@@ -89,7 +89,8 @@ def _generate_voice_chatterbox(text, output_path, exaggeration=0.5, cfg_weight=0
 
     voice_ref = Path("C:/AI/system/voice/recordings/ziad_reference_voice.wav")
     if voice_ref.exists():
-        payload["reference_audio"] = str(voice_ref)
+        payload["voice_mode"] = "clone"
+        payload["reference_audio_filename"] = voice_ref.name
 
     resp = requests.post(f"http://localhost:8004/tts", json=payload, timeout=300)
     resp.raise_for_status()

@@ -2,10 +2,16 @@ import { loadFont } from "@remotion/google-fonts/BreeSerif";
 import { Audio } from "@remotion/media";
 import { AbsoluteFill, Sequence, staticFile, useVideoConfig } from "remotion";
 import { z } from "zod";
-import { FPS, INTRO_DURATION } from "../lib/constants";
+import {
+  FPS,
+  INTRO_DURATION,
+  MUSIC_FADE_FRAMES,
+  MUSIC_VOLUME,
+} from "../lib/constants";
 import { TimelineSchema } from "../lib/types";
 import { calculateFrameTiming, getAudioPath } from "../lib/utils";
 import { Background } from "./Background";
+import ProgressiveSubtitle from "./ProgressiveSubtitle";
 import Subtitle from "./Subtitle";
 
 export const aiVideoSchema = z.object({
@@ -82,11 +88,19 @@ export const AIVideo: React.FC<z.infer<typeof aiVideoSchema>> = ({
 
         return (
           <Sequence
-            key={`element-${index}`}
+            key={`text-${index}`}
             from={startFrame}
             durationInFrames={duration}
           >
-            <Subtitle key={index} text={element.text} />
+            {element.words && element.words.length > 0 ? (
+              <ProgressiveSubtitle
+                text={element.text}
+                words={element.words}
+                sentenceStartMs={element.startMs}
+              />
+            ) : (
+              <Subtitle text={element.text} />
+            )}
           </Sequence>
         );
       })}
@@ -98,14 +112,31 @@ export const AIVideo: React.FC<z.infer<typeof aiVideoSchema>> = ({
           { addIntroOffset: true },
         );
 
+        const isMusic = element.audioUrl === "music";
+        const fadeFrames = Math.min(MUSIC_FADE_FRAMES, Math.floor(duration / 4));
+
         return (
           <Sequence
-            key={`element-${index}`}
+            key={`audio-${index}`}
             from={startFrame}
             durationInFrames={duration}
             premountFor={3 * FPS}
           >
-            <Audio src={staticFile(getAudioPath(id, element.audioUrl))} />
+            <Audio
+              src={staticFile(getAudioPath(id, element.audioUrl))}
+              volume={
+                isMusic
+                  ? (f: number) => {
+                      const fadeIn = Math.min(1, f / fadeFrames);
+                      const fadeOut = Math.min(
+                        1,
+                        Math.max(0, (duration - f) / fadeFrames),
+                      );
+                      return Math.min(fadeIn, fadeOut) * MUSIC_VOLUME;
+                    }
+                  : 1
+              }
+            />
           </Sequence>
         );
       })}

@@ -41,7 +41,10 @@ export const Equalizer: React.FC<EqualizerProps> = ({
   }
 
   // numberOfSamples must be a power of two (64, 128, 256, ...)
-  const samplesNeeded = Math.max(64, numberOfBars * 2);
+  // We only need HALF the bars' worth of FFT bins because we mirror them
+  // to put bass in the middle and higher frequencies on both sides.
+  const halfBars = Math.ceil(numberOfBars / 2);
+  const samplesNeeded = Math.max(64, halfBars * 2);
   const numberOfSamples = Math.pow(2, Math.ceil(Math.log2(samplesNeeded)));
 
   const visualization = visualizeAudio({
@@ -52,7 +55,15 @@ export const Equalizer: React.FC<EqualizerProps> = ({
     optimizeFor: "speed",
   });
 
-  const bars = visualization.slice(0, numberOfBars);
+  // Mirror the low-frequency half so bass sits in the center of the bar row
+  // and higher frequencies fan out symmetrically to both sides. This avoids
+  // the "all activity on the left" look of a raw FFT visualization where the
+  // right half is always flat (human voice energy is mostly below 1 kHz).
+  const lowHalf = visualization.slice(0, halfBars);
+  const bars =
+    numberOfBars % 2 === 0
+      ? [...lowHalf.slice().reverse(), ...lowHalf]
+      : [...lowHalf.slice(1).reverse(), ...lowHalf];
 
   return (
     <div

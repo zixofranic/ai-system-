@@ -63,13 +63,15 @@ def check_queued_content():
 
 
 def check_tiktok_content():
-    """Check for approved content with tiktok_publish_requested and no tiktok_video_id."""
+    """Check for approved SHORT content with tiktok_publish_requested and no tiktok_video_id.
+    Only shorts (9:16 vertical) are compatible with TikTok."""
     try:
         url = f"{SUPABASE_URL}/rest/v1/content"
         params = {
-            "select": "id,philosopher,topic,channel_id",
+            "select": "id,philosopher,topic,channel_id,format",
             "status": "eq.approved",
-            "video_drive_url": "not.is.null",
+            "format": "eq.short",
+            "or": "(video_drive_url.not.is.null,video_storage_path.not.is.null)",
             "generation_params->tiktok_publish_requested": "eq.true",
             "tiktok_video_id": "is.null",
             "deleted_at": "is.null",
@@ -135,7 +137,7 @@ def check_approved_content():
         params = {
             "select": "id,philosopher,topic,channel_id",
             "status": "eq.approved",
-            "video_drive_url": "not.is.null",
+            "or": "(video_drive_url.not.is.null,video_storage_path.not.is.null)",
             "generation_params->youtube_publish_requested": "eq.true",
             "youtube_video_id": "is.null",
             "deleted_at": "is.null",

@@ -25,6 +25,9 @@ import argparse
 import numpy as np
 from pathlib import Path
 
+from moviepy.config import change_settings
+change_settings({"IMAGEMAGICK_BINARY": r"C:\Program Files\ImageMagick-7.1.2-Q16-HDRI\magick.exe"})
+
 from moviepy.editor import (
     AudioFileClip, ImageClip, TextClip, CompositeVideoClip,
     CompositeAudioClip, ColorClip, concatenate_videoclips
@@ -102,12 +105,12 @@ def _apply_dreamy_vignette(frame, intensity=0.3):
 
 
 def _create_glow_text(text, fontsize, color='white', glow_color=None,
-                       font='Georgia-Bold', method='caption', size=None):
+                       font='Calibri-Bold', method='caption', size=None):
     """Create text with a soft ethereal glow behind it."""
     # Main text
     main = TextClip(
         text, fontsize=fontsize, color=color, font=font,
-        method=method, size=size, stroke_color='black', stroke_width=1,
+        method=method, size=size,
         align='center'
     )
     # Glow layer (larger, blurred-looking via slight transparency)
@@ -298,17 +301,29 @@ def _build_section(quote: str, philosopher: str, art_path: str,
             quote,
             fontsize=font_size_quote,
             color="white",
-            font="Georgia-Bold",
+            font="Calibri-Bold",
             method="caption",
             size=(text_w, None),
-            stroke_color="black",
-            stroke_width=2,
             align="center",
         )
         .set_position(("center", quote_y_rel), relative=True)
         .set_duration(section_dur)
         .set_start(0)
         .crossfadein(1.0)
+        .crossfadeout(0.8)
+    )
+
+    # Dark overlay behind text for readability
+    quote_h = quote_clip.size[1] if hasattr(quote_clip, 'size') and quote_clip.size[1] else 300
+    overlay_h = quote_h + 200  # generous padding
+    overlay_y = int(H * quote_y_rel) - 100
+    text_overlay = (
+        ColorClip(size=(W, overlay_h), color=(0, 0, 0))
+        .set_opacity(0.65)
+        .set_position((0, overlay_y))
+        .set_duration(section_dur)
+        .set_start(0)
+        .crossfadein(0.8)
         .crossfadeout(0.8)
     )
 
@@ -320,7 +335,7 @@ def _build_section(quote: str, philosopher: str, art_path: str,
             f"-- {philosopher}",
             fontsize=font_size_attr,
             color="#D4AF37",
-            font="Georgia-Italic" if sys.platform != "win32" else "Georgia",
+            font="Calibri-Bold",
             method="label",
         )
         .set_position(("center", attr_y_rel), relative=True)
@@ -351,7 +366,7 @@ def _build_section(quote: str, philosopher: str, art_path: str,
 
     # Compose section video (no audio yet)
     section_video = CompositeVideoClip(
-        [art_layer, quote_clip, attr_clip, wm_clip, eq_clip],
+        [art_layer, text_overlay, quote_clip, attr_clip, wm_clip, eq_clip],
         size=(W, H),
     ).set_duration(section_dur)
 
@@ -444,20 +459,20 @@ def assemble_video(
         voice_audios.append(voice_aud)
 
         if i < n_quotes - 1:
-            # Next section starts with overlap for crossfade
-            cumulative_time += sec_dur - transition_dur
+            # No overlap — sections play sequentially so voice clips don't collide
+            cumulative_time += sec_dur
         else:
             cumulative_time += sec_dur
 
     total_duration = cumulative_time
 
-    # Compose all sections with crossfade
+    # Compose all sections (sequential, no video crossfade to avoid audio overlap)
     if n_quotes == 1:
         final_video = sections[0]
     else:
-        # Apply crossfade: each section fades in over transition_dur
-        for i in range(1, len(sections)):
-            sections[i] = sections[i].crossfadein(transition_dur)
+        # Each section fades in/out smoothly but without timeline overlap
+        for i in range(len(sections)):
+            sections[i] = sections[i].crossfadein(0.8).crossfadeout(0.5)
         final_video = CompositeVideoClip(sections, size=(W, H)).set_duration(total_duration)
 
     # --- Audio mixing ---
@@ -469,6 +484,10 @@ def assemble_video(
         from moviepy.editor import concatenate_audioclips
         music = concatenate_audioclips([music] * repeats)
     music = music.subclip(0, total_duration).volumex(0.17)
+
+    # Fade voice clips in/out for smooth transitions
+    for i in range(len(voice_audios)):
+        voice_audios[i] = voice_audios[i].audio_fadein(0.3).audio_fadeout(0.3)
 
     # Combine voice tracks + music
     all_audio = voice_audios + [music]

@@ -45,7 +45,7 @@ load_dotenv("C:/AI/.env")
 
 # Our pipeline modules
 sys.path.insert(0, "C:/AI/system/scripts")
-from ai_writer import generate_short_script, generate_youtube_metadata
+from ai_writer import generate_short_script, generate_youtube_metadata, sanitize_quote
 from render_remotion import render_remotion_video
 
 # ---------------------------------------------------------------------------
@@ -169,15 +169,21 @@ EQUALIZER_COLORS = {
 
 # Default ComfyUI SDXL + LoRA workflow template
 # Placeholder values are filled at runtime via _build_comfyui_workflow()
+#
+# Quality tuning (2026-04-09):
+#   - sampler dpmpp_2m_sde_gpu + scheduler karras → richer detail on skin/fabric
+#   - cfg 7.0 → 6.0  less "burned" colors, more naturalistic
+#   - steps 30 → 40  sharper fine detail (+33% GPU time is fine on 5060 Ti)
+#   - stronger negative to kill the plastic/waxy "AI look"
 _COMFYUI_WORKFLOW_TEMPLATE = {
     "3": {
         "class_type": "KSampler",
         "inputs": {
             "seed": 0,
-            "steps": 30,
-            "cfg": 7.0,
-            "sampler_name": "euler_ancestral",
-            "scheduler": "normal",
+            "steps": 40,
+            "cfg": 6.0,
+            "sampler_name": "dpmpp_2m_sde_gpu",
+            "scheduler": "karras",
             "denoise": 1.0,
             "model": ["10", 0],
             "positive": ["6", 0],
@@ -203,7 +209,13 @@ _COMFYUI_WORKFLOW_TEMPLATE = {
     "7": {
         "class_type": "CLIPTextEncode",
         "inputs": {
-            "text": "text, watermark, logo, blurry, low quality, deformed, ugly",
+            "text": (
+                "text, watermark, logo, blurry, low quality, deformed, ugly, "
+                "plastic skin, waxy, doll face, dead eyes, airbrushed, "
+                "oversaturated, cgi render, 3d render, deviantart, trending on artstation, "
+                "disfigured, extra limbs, bad anatomy, fused fingers, mutated hands, "
+                "lowres, jpeg artifacts, grainy noise, over-smoothed"
+            ),
             "clip": ["10", 1],
         },
     },
@@ -319,6 +331,16 @@ def update_supabase(content_id: str, updates: dict):
     return resp.json()
 
 
+def mark_failed(content_id: str, reason) -> None:
+    # Write status=failed AND rejection_reason so the dashboard can surface
+    # the real error instead of a bare "Retry" button.
+    msg = str(reason).strip()[:500] or "unknown error"
+    try:
+        update_supabase(content_id, {"status": "failed", "rejection_reason": msg})
+    except Exception as e:
+        print(f"  [{content_id[:8]}] Failed to mark failed: {e}")
+
+
 def log_step(content_id: str, step: str, step_order: int, status: str,
              error: str = None, gpu_stats: dict = None):
     """Insert or update a generation_log row for a pipeline step."""
@@ -406,10 +428,10 @@ def generate_quote(philosopher: str, topic: str) -> str:
         f"{dedup}"
     )
 
+    ollama_model = PHILOSOPHER_TO_OLLAMA_MODEL.get(
+        philosopher, philosopher.lower().replace(" ", "_")
+    )
     try:
-        ollama_model = PHILOSOPHER_TO_OLLAMA_MODEL.get(
-            philosopher, philosopher.lower().replace(" ", "_")
-        )
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
             json={
@@ -421,15 +443,14 @@ def generate_quote(philosopher: str, topic: str) -> str:
             timeout=120,
         )
         resp.raise_for_status()
-        quote = resp.json().get("response", "").strip().strip('"').strip("'")
+        quote = sanitize_quote(resp.json().get("response", ""))
         if quote:
             return quote
     except Exception as e:
         print(f"  [quote] Ollama failed ({e}), falling back to Haiku")
 
-    # Fallback: use ai_writer's generate_short_script which calls Haiku
-    result = generate_short_script(philosopher, topic)
-    return result.get("quote", "")
+    result = generate_short_script(philosopher, topic, ollama_model=ollama_model)
+    return sanitize_quote(result.get("quote", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -546,11 +567,15 @@ ELEVENLABS_VOICE_GIBRAN = os.environ.get("ELEVENLABS_VOICE_GIBRAN", "R68HwD2GzEd
 def generate_voice(text: str, output_path: str,
                    channel_slug: str,
                    exaggeration: float = 0.5,
-                   cfg_weight: float = 0.5) -> str:
+                   cfg_weight: float = 0.5,
+                   slow_factor: float = 1.0) -> str:
     """
     Generate voice via ElevenLabs TTS API.
 
     channel_slug is REQUIRED — it determines which voice to use.
+    slow_factor: 1.0 = normal speed; <1.0 slows playback via ffmpeg atempo
+      while preserving pitch. E.g. 0.88 = 12% slower (used for shorts where
+      the default 11labs cadence feels rushed).
     Returns the local file path of the saved audio.
     """
     from elevenlabs import ElevenLabs, VoiceSettings
@@ -578,6 +603,25 @@ def generate_voice(text: str, output_path: str,
     with open(output_path, "wb") as f:
         for chunk in audio:
             f.write(chunk)
+
+    # Apply tempo slowdown (pitch-preserving) if requested
+    if slow_factor != 1.0:
+        import subprocess
+        tmp_path = output_path + ".fast.wav"
+        os.replace(output_path, tmp_path)
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", tmp_path, "-af",
+                 f"atempo={slow_factor}", output_path],
+                check=True, capture_output=True,
+            )
+            os.remove(tmp_path)
+            print(f"  [voice] Saved (ElevenLabs, atempo={slow_factor}): {output_path}")
+        except subprocess.CalledProcessError as e:
+            # Roll back — keep original if atempo fails
+            os.replace(tmp_path, output_path)
+            print(f"  [voice] WARNING: atempo slowdown failed ({e.stderr[:120] if e.stderr else e}), kept original")
+        return output_path
 
     print(f"  [voice] Saved (ElevenLabs): {output_path}")
     return output_path
@@ -914,56 +958,155 @@ def _upload_resumable(access_token: str, folder_id: str,
 # ---------------------------------------------------------------------------
 # Art prompt builder
 # ---------------------------------------------------------------------------
+# Per-philosopher visual STYLE cards (2026-04-09, refined).
+#
+# IMPORTANT: These describe HOW the image is painted (medium, lighting,
+# palette, brushwork, art-historical influence) — NOT WHAT is in it.
+# The SUBJECT of each image comes from Claude's per-scene description.
+# An earlier version of these cards baked specific scenes into the style
+# (e.g. "Walden Pond in autumn, solitary figure in contemplation") which
+# caused SDXL to paint the SAME scene every time regardless of narration.
+# Rule: no subject nouns, no specific locations, no "figure doing X".
+PHILOSOPHER_VISUAL_STYLE = {
+    # --- Stoics: Caravaggio oil painting with chiaroscuro ---
+    "Marcus Aurelius": (
+        "oil painting, chiaroscuro lighting, renaissance master palette, "
+        "earth tones and warm ochre, deep umber shadows, single warm light source, "
+        "painterly brushwork on linen canvas, museum-quality fine art, "
+        "Caravaggio influence, tenebrism"
+    ),
+    "Seneca": (
+        "oil painting, Caravaggio tenebrism style, dramatic single-source lighting, "
+        "rich earth tones of umber and sienna, deep shadows and warm highlights, "
+        "painterly brushwork on linen canvas, 17th century master fine art"
+    ),
+    "Epictetus": (
+        "oil painting, severe tenebrism, cold light cutting through darkness, "
+        "muted earth palette, rough linen textures, restrained Caravaggio style, "
+        "painterly realism, museum-quality fine art"
+    ),
+    # --- Rumi & Gibran: illuminated manuscript / watercolor ---
+    "Rumi": (
+        "Persian miniature painting style, gold leaf accents, illuminated manuscript "
+        "aesthetic, intricate decorative borders, jewel-tone palette of lapis and "
+        "turquoise and saffron, ornate detail work, medieval Islamic art tradition"
+    ),
+    "Gibran": (
+        "symbolist watercolor painting, warm ochre and earth-tone palette, "
+        "soft dreamlike edges, mystical atmosphere, art nouveau influence, "
+        "luminous washes, spiritual symbolism, Kahlil Gibran's own painting style"
+    ),
+    "Gibran Khalil Gibran": (
+        "symbolist watercolor painting, warm ochre and earth-tone palette, "
+        "soft dreamlike edges, mystical atmosphere, art nouveau influence, "
+        "luminous washes, spiritual symbolism, Kahlil Gibran's own painting style"
+    ),
+    # --- Eastern philosophy: ink wash ---
+    "Lao Tzu": (
+        "Chinese sumi-e ink wash painting, minimalist composition with negative space, "
+        "black ink on rice paper aesthetic, single confident brushstrokes, "
+        "zen brushwork, subtle grey wash tones, contemplative restraint"
+    ),
+    "Confucius": (
+        "classical Chinese scholar painting, ink and light color wash on silk, "
+        "restrained palette, calligraphic brushwork, Song dynasty fine art, "
+        "refined atmosphere, painted scroll aesthetic"
+    ),
+    "Sun Tzu": (
+        "ancient Chinese painting on silk, ink and gold leaf, dynamic composition, "
+        "Tang dynasty aesthetic, heroic mood, dramatic brushwork, "
+        "imperial scroll art, painted with confident ink lines"
+    ),
+    "Musashi": (
+        "Japanese ukiyo-e woodblock print style, Hokusai influence, bold outlines, "
+        "flat jewel-tone palette, sumi-e ink accents, Edo period aesthetic, "
+        "compositional clarity, traditional Japanese print"
+    ),
+    # --- Western Romantics: Hudson River School ---
+    "Emerson": (
+        "Hudson River School oil painting style, luminous romantic realism, "
+        "warm golden-hour light, atmospheric perspective, painterly brushwork, "
+        "Thomas Cole influence, 19th century American landscape tradition"
+    ),
+    "Thoreau": (
+        "Hudson River School oil painting style, painterly romantic realism, "
+        "warm amber autumn light, atmospheric perspective, visible brushwork, "
+        "luminous palette, Asher Brown Durand influence, 19th century landscape tradition"
+    ),
+    # --- Nietzsche & Dostoevsky: dark expressionism ---
+    "Nietzsche": (
+        "German expressionist oil painting, Caspar David Friedrich influence, "
+        "dark romantic sublime palette, heavy impasto brushwork, moody atmospheric lighting, "
+        "dramatic chiaroscuro, 19th century painterly tradition"
+    ),
+    "Dostoevsky": (
+        "Russian realist oil painting, Ilya Repin influence, candlelit interior lighting, "
+        "painterly psychological realism, heavy shadow and warm lamplight, "
+        "19th century academic oil technique, muted earth palette"
+    ),
+    # --- Victorian / Renaissance / Scientific ---
+    "Wilde": (
+        "Victorian aesthetic movement oil painting, John Singer Sargent influence, "
+        "jewel-tone palette, opulent textures, decadent lighting, fin-de-siecle atmosphere, "
+        "rich velvet and gilded details in the palette, 19th century portraiture style"
+    ),
+    "Da Vinci": (
+        "high renaissance oil painting, Leonardo da Vinci sfumato technique, "
+        "atmospheric perspective, warm earth tones, chiaroscuro modeling, "
+        "soft gradient light, anatomical precision, painted on poplar panel"
+    ),
+    "Tesla": (
+        "early 20th century oil painting, Ashcan school realism, tungsten and "
+        "electric arc color temperature contrast, moody industrial palette, "
+        "painterly brushwork, period scientific atmosphere"
+    ),
+    "Franklin": (
+        "colonial American oil painting, John Singleton Copley influence, "
+        "candlelit warmth, period portraiture lighting, painted on linen, "
+        "18th century academic oil technique, warm wood and parchment palette"
+    ),
+    "Vivekananda": (
+        "Indian miniature painting tradition, saffron and deep red palette, "
+        "gold leaf accents, Rajput court art aesthetic, luminous devotional mood, "
+        "ornate detail work, spiritual radiance in the light"
+    ),
+}
+
+
+def _get_philosopher_style(philosopher: str) -> str:
+    """Return the visual style card for a philosopher, with a sensible default."""
+    # Try exact match first, then common variations
+    if philosopher in PHILOSOPHER_VISUAL_STYLE:
+        return PHILOSOPHER_VISUAL_STYLE[philosopher]
+    # Case-insensitive lookup
+    for k, v in PHILOSOPHER_VISUAL_STYLE.items():
+        if k.lower() == philosopher.lower():
+            return v
+    # Default: cinematic oil painting
+    return (
+        "cinematic oil painting, masterful chiaroscuro lighting, "
+        "renaissance master palette, earth tones and warm candlelight, "
+        "painted on linen canvas, museum-quality fine art"
+    )
+
+
 def _build_art_prompt(philosopher: str, quote: str, topic: str) -> str:
-    """Build a ComfyUI-friendly image generation prompt for a quote."""
-    style_hints = {
-        "stoic_classical_v1": (
-            "ancient Roman marble hall, dramatic chiaroscuro lighting, "
-            "classical columns, Mediterranean golden hour"
-        ),
-        "gibran_style_v1": (
-            "ethereal Lebanese mountain landscape, cedar trees, "
-            "warm golden light, mystical atmosphere, soft watercolor"
-        ),
-        "persian_miniature_v1": (
-            "ornate Persian garden, intricate tile patterns, "
-            "moonlit courtyard, roses and cypress trees"
-        ),
-        "eastern_ink_v1": (
-            "traditional Chinese ink wash landscape, misty mountains, "
-            "bamboo, flowing water, zen minimalism"
-        ),
-        "romantic_landscape_v1": (
-            "lush New England forest, golden autumn light, "
-            "Walden Pond atmosphere, romantic landscape painting"
-        ),
-        "dark_expressionist_v1": (
-            "dramatic expressionist scene, deep shadows, "
-            "stormy sky, Gothic architecture, candlelight"
-        ),
-        "aesthetic_gilded_v1": (
-            "opulent Art Nouveau interior, gilded details, "
-            "stained glass, Victorian elegance, warm lamplight"
-        ),
-        "renaissance_genius_v1": (
-            "Renaissance workshop, anatomical sketches, "
-            "warm candlelight, Leonardo-style sfumato"
-        ),
-        "vedic_sacred_v1": (
-            "sacred Indian temple at sunrise, intricate carvings, "
-            "lotus pond, golden spiritual light, Himalayan backdrop"
-        ),
-    }
+    """Build a ComfyUI-friendly image generation prompt for a quote.
 
-    lora = PHILOSOPHER_TO_LORA.get(philosopher, "stoic_classical_v1")
-    scene = style_hints.get(lora, "dramatic cinematic landscape, golden hour")
+    Structure: SUBJECT first (front-loaded in SDXL for emphasis),
+    then composition tokens, then style card, then quality tokens.
+    """
+    style = _get_philosopher_style(philosopher)
 
+    # For shorts we don't have per-chunk narration — use the quote + topic
+    # as the scene subject. Keep it concrete, not abstract.
     prompt = (
-        f"masterpiece, best quality, highly detailed, cinematic, "
-        f"{scene}, "
-        f"philosophical atmosphere, contemplative mood, "
-        f"inspired by the theme of {topic}, "
-        f"no text, no words, no letters, no watermark"
+        f"a single contemplative human figure depicting {topic}, "
+        f"period-accurate dress, expressive pose, "
+        f"strong compositional silhouette, rule of thirds, shallow depth of field, "
+        f"volumetric light, soft rim light, atmospheric perspective, "
+        f"{style}, "
+        f"ultra detailed, award-winning fine art, masterpiece quality"
     )
     return prompt
 
@@ -1030,8 +1173,10 @@ def process_short(content: dict):
     # --- Step 1: Quote ---
     log_step(content_id, "quote", 1, "running")
     try:
-        # Use existing quote if it's real content, otherwise generate
-        quote = (content.get("quote_text") or "").strip()
+        # Sanitize any pre-existing quote_text in case a prior run stored
+        # tag-polluted text (e.g. "[AI-generated in the spirit of X]") and
+        # retry is reusing it.
+        quote = sanitize_quote(content.get("quote_text") or "")
         if not quote or quote.lower() in ("pending generation", "pending"):
             quote = generate_quote(philosopher, topic)
         log_step(content_id, "quote", 1, "success")
@@ -1065,10 +1210,12 @@ def process_short(content: dict):
         raise
 
     # --- Step 4: Voice ---
+    # slow_factor=0.88 slows shorts narration 12% — default 11labs cadence
+    # feels too rushed for the James Burton voice on 12-15s shorts.
     log_step(content_id, "voice", 3, "running")
     try:
         voice_path = str(work / "voice.wav")
-        generate_voice(quote, voice_path, channel_slug=channel_slug)
+        generate_voice(quote, voice_path, channel_slug=channel_slug, slow_factor=0.88)
         log_step(content_id, "voice", 3, "success")
     except Exception as e:
         log_step(content_id, "voice", 3, "failed", str(e))
@@ -1373,7 +1520,7 @@ def _batch_process(items: list):
             previous = _fetch_recent_quotes(philosopher)
 
             if content_type == "short":
-                quote = (content.get("quote_text") or "").strip()
+                quote = sanitize_quote(content.get("quote_text") or "")
                 if not quote or quote.lower() in ("pending generation", "pending"):
                     quote = generate_quote(philosopher, topic)
                 quotes = [quote]
@@ -1402,7 +1549,7 @@ def _batch_process(items: list):
 
         except Exception as e:
             log_step(cid, "quote", 1, "failed", str(e))
-            update_supabase(cid, {"status": "failed"})
+            mark_failed(cid, f"quote step: {e}")
             print(f"  [{cid[:8]}] FAILED at quote: {e}")
 
     # ---------------------------------------------------------------
@@ -1445,7 +1592,7 @@ def _batch_process(items: list):
 
         except Exception as e:
             log_step(cid, "image", 2, "failed", str(e))
-            update_supabase(cid, {"status": "failed"})
+            mark_failed(cid, f"image step: {e}")
             del results[cid]
             print(f"  [{cid[:8]}] FAILED at art: {e}")
 
@@ -1458,6 +1605,10 @@ def _batch_process(items: list):
         channel = content["channels"]
         channel_slug = channel["slug"]
         work = data["work"]
+        fmt = content.get("format", "short")
+        # Shorts need a 12% slowdown so the narration doesn't feel rushed.
+        # Midform/longform handle their own pacing.
+        slow_factor = 0.88 if fmt == "short" else 1.0
 
         try:
             log_step(cid, "voice", 3, "running")
@@ -1470,7 +1621,9 @@ def _batch_process(items: list):
                     narration = narration_segments[i].strip() + " "
                 full_text = narration + quote
                 voice_path = str(work / f"voice_{i}.wav")
-                generate_voice(full_text, voice_path, channel_slug=channel_slug)
+                generate_voice(full_text, voice_path,
+                               channel_slug=channel_slug,
+                               slow_factor=slow_factor)
                 voice_paths.append(voice_path)
 
             data["voice_paths"] = voice_paths
@@ -1480,7 +1633,7 @@ def _batch_process(items: list):
 
         except Exception as e:
             log_step(cid, "voice", 3, "failed", str(e))
-            update_supabase(cid, {"status": "failed"})
+            mark_failed(cid, f"voice step: {e}")
             del results[cid]
             print(f"  [{cid[:8]}] FAILED at voice: {e}")
 
@@ -1612,7 +1765,7 @@ def _batch_process(items: list):
 
         except Exception as e:
             log_step(cid, "video", 4, "failed", str(e))
-            update_supabase(cid, {"status": "failed"})
+            mark_failed(cid, f"video step: {e}")
             print(f"  [{cid[:8]}] FAILED at assembly: {e}")
 
 
@@ -1647,11 +1800,11 @@ def _run_story_pipeline(content: dict):
         print(f"  Story pipeline completed for {cid}")
     except subprocess.TimeoutExpired:
         log_step(cid, "story", 1, "failed", "Timeout after 30 minutes")
-        update_supabase(cid, {"status": "failed"})
+        mark_failed(cid, "story pipeline: timeout after 30 minutes")
         raise
     except Exception as e:
         log_step(cid, "story", 1, "failed", str(e))
-        update_supabase(cid, {"status": "failed"})
+        mark_failed(cid, f"story pipeline: {e}")
         raise
 
 
@@ -1711,11 +1864,23 @@ def main():
         for content in queued:
             try:
                 content_type = content.get("format", "short")
+                # Midform was killed 2026-04-09. Any queued midform item is
+                # rejected loudly instead of silently rendering a dead-zone
+                # video.
+                if content_type == "midform":
+                    msg = "midform format killed — reject and flag"
+                    print(f"  REJECTED: {content['id']} ({msg})")
+                    log_step(content["id"], "publish", 0, "failed", msg)
+                    update_supabase(content["id"], {
+                        "status": "rejected",
+                        "rejection_reason": "midform format discontinued; use short or story",
+                    })
+                    continue
                 if content_type == "story":
                     _run_story_pipeline(content)
                 elif content_type == "short":
                     process_short(content)
-                elif content_type in ("midform", "longform", "compilation"):
+                elif content_type in ("longform", "compilation"):
                     process_midform(content)
                 else:
                     process_short(content)
@@ -1724,11 +1889,28 @@ def main():
                 print(f"  FAILED: {content['id']} - {e}")
                 traceback.print_exc()
                 log_step(content["id"], "publish", 0, "failed", str(e))
-                update_supabase(content["id"], {"status": "failed"})
+                mark_failed(content["id"], e)
     else:
+        # Reject midform up front (killed 2026-04-09)
+        midforms = [c for c in queued if c.get("format") == "midform"]
+        for content in midforms:
+            msg = "midform format discontinued; use short or story"
+            print(f"  REJECTED midform: {content['id']}")
+            log_step(content["id"], "publish", 0, "failed", msg)
+            try:
+                update_supabase(content["id"], {
+                    "status": "rejected",
+                    "rejection_reason": msg,
+                })
+            except Exception:
+                pass
+
         # Stories run separately (own pipeline), rest go through batch
         stories = [c for c in queued if c.get("format") == "story"]
-        non_stories = [c for c in queued if c.get("format") != "story"]
+        non_stories = [
+            c for c in queued
+            if c.get("format") not in ("story", "midform")
+        ]
         for content in stories:
             try:
                 _run_story_pipeline(content)
@@ -1736,6 +1918,7 @@ def main():
             except Exception as e:
                 print(f"  FAILED (story): {content['id']} - {e}")
                 traceback.print_exc()
+                mark_failed(content["id"], f"story: {e}")
         if non_stories:
             _batch_process(non_stories)
 

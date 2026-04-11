@@ -15,6 +15,8 @@ import {
   DARK_GRADIENT_TOP,
   FPS,
   GOLD,
+  MUSIC_FADE_FRAMES,
+  MUSIC_VOLUME,
 } from "../lib/constants";
 import { TimelineSchema } from "../lib/types";
 import { calculateFrameTiming, getAudioPath, getImagePath } from "../lib/utils";
@@ -182,6 +184,7 @@ export const ShortVideo: React.FC<z.infer<typeof shortVideoSchema>> = ({
         );
 
         const isMusic = element.audioUrl === "music";
+        const fadeFrames = Math.min(MUSIC_FADE_FRAMES, Math.floor(duration / 4));
 
         return (
           <Sequence
@@ -192,7 +195,18 @@ export const ShortVideo: React.FC<z.infer<typeof shortVideoSchema>> = ({
           >
             <Audio
               src={staticFile(getAudioPath(id, element.audioUrl))}
-              volume={isMusic ? 0.35 : 1}
+              volume={
+                isMusic
+                  ? (f: number) => {
+                      const fadeIn = Math.min(1, f / fadeFrames);
+                      const fadeOut = Math.min(
+                        1,
+                        Math.max(0, (duration - f) / fadeFrames),
+                      );
+                      return Math.min(fadeIn, fadeOut) * MUSIC_VOLUME;
+                    }
+                  : 1
+              }
             />
           </Sequence>
         );
@@ -248,16 +262,11 @@ const ShortBackground: React.FC<{
 }> = ({ item, project }) => {
   const frame = useCurrentFrame();
   const localMs = (frame / FPS) * 1000;
-  const { width, height } = useVideoConfig();
 
-  // Use image natural ratio — we assume source images may be landscape
-  // so we scale to cover the portrait frame
-  const imgWidth = 1920; // assume source image dimensions
-  const imgHeight = 1080;
-  const fitScale = Math.max(width / imgWidth, height / imgHeight);
-  const scaledW = imgWidth * fitScale;
-  const scaledH = imgHeight * fitScale;
-
+  // Source-aspect-agnostic: the Img fills the canvas with objectFit:cover,
+  // and Ken Burns is applied via a CSS transform scale. This is correct for
+  // any source aspect ratio (portrait 832x1216, landscape 1920x1080, etc.)
+  // instead of the previous version which hardcoded landscape dimensions.
   let animScale = 1 + EXTRA_SCALE;
 
   const currentScaleAnim = item.animations?.find(
@@ -277,11 +286,6 @@ const ShortBackground: React.FC<{
       currentScaleAnim.from;
   }
 
-  const finalW = scaledW * animScale;
-  const finalH = scaledH * animScale;
-  const top = -(finalH - height) / 2;
-  const left = -(finalW - width) / 2;
-
   // Soft fade in/out
   const { durationInFrames } = useVideoConfig();
   const fadeFrames = Math.min(FPS, Math.floor(durationInFrames / 4));
@@ -293,16 +297,15 @@ const ShortBackground: React.FC<{
   );
 
   return (
-    <AbsoluteFill style={{ opacity }}>
+    <AbsoluteFill style={{ opacity, overflow: "hidden" }}>
       <Img
         src={staticFile(getImagePath(project, item.imageUrl))}
         style={{
-          width: finalW,
-          height: finalH,
-          position: "absolute",
-          top,
-          left,
+          width: "100%",
+          height: "100%",
           objectFit: "cover",
+          transform: `scale(${animScale})`,
+          transformOrigin: "center center",
         }}
       />
     </AbsoluteFill>

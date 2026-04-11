@@ -25,6 +25,12 @@ const BackgroundElementSchema = TimelineElementSchema.extend({
   animations: z.array(ElementAnimationSchema).optional(),
 });
 
+const WordTimingSchema = z.object({
+  word: z.string(),
+  startMs: z.number(),
+  endMs: z.number(),
+});
+
 const TextElementSchema = TimelineElementSchema.extend({
   text: z.string(),
   position: z.union([
@@ -44,6 +50,8 @@ const TextElementSchema = TimelineElementSchema.extend({
     ])
     .optional(),
   attribution: z.string().optional(),
+  // Per-word timings for progressive sentence-build captions
+  words: z.array(WordTimingSchema).optional(),
 });
 
 const AudioElementSchema = TimelineElementSchema.extend({
@@ -79,6 +87,7 @@ export type TimelineElement = z.infer<typeof TimelineElementSchema>;
 export type ElementAnimation = z.infer<typeof ElementAnimationSchema>;
 export type BackgroundElement = z.infer<typeof BackgroundElementSchema>;
 export type TextElement = z.infer<typeof TextElementSchema>;
+export type WordTiming = z.infer<typeof WordTimingSchema>;
 export type AudioElement = z.infer<typeof AudioElementSchema>;
 export type Metadata = z.infer<typeof MetadataSchema>;
 export type Timeline = z.infer<typeof TimelineSchema>;

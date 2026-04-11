@@ -14,6 +14,8 @@ import {
   FPS,
   GOLD,
   INTRO_DURATION,
+  MUSIC_FADE_FRAMES,
+  MUSIC_VOLUME,
 } from "../lib/constants";
 import { TimelineSchema } from "../lib/types";
 import {
@@ -160,6 +162,8 @@ export const MidformVideo: React.FC<z.infer<typeof midformVideoSchema>> = ({
         );
 
         const isMusic = element.audioUrl === "music";
+        // Fade frames capped at 1/4 of total duration for very short clips
+        const fadeFrames = Math.min(MUSIC_FADE_FRAMES, Math.floor(duration / 4));
 
         return (
           <Sequence
@@ -170,13 +174,25 @@ export const MidformVideo: React.FC<z.infer<typeof midformVideoSchema>> = ({
           >
             <Audio
               src={staticFile(getAudioPath(id, element.audioUrl))}
-              volume={isMusic ? 0.35 : 1}
+              volume={
+                isMusic
+                  ? (f: number) => {
+                      const fadeIn = Math.min(1, f / fadeFrames);
+                      const fadeOut = Math.min(
+                        1,
+                        Math.max(0, (duration - f) / fadeFrames),
+                      );
+                      return Math.min(fadeIn, fadeOut) * MUSIC_VOLUME;
+                    }
+                  : 1
+              }
             />
           </Sequence>
         );
       })}
 
-      {/* Equalizer — vertically centered for midform */}
+      {/* Equalizer — pinned to bottom for midform (was vertically centered,
+          which overlapped the quote text box). */}
       {timeline.audio
         .filter((el) => el.audioUrl !== "music")
         .map((element, index) => {
@@ -194,8 +210,9 @@ export const MidformVideo: React.FC<z.infer<typeof midformVideoSchema>> = ({
               <AbsoluteFill
                 style={{
                   zIndex: 15,
-                  justifyContent: "center",
+                  justifyContent: "flex-end",
                   alignItems: "center",
+                  paddingBottom: 60,
                   pointerEvents: "none",
                 }}
               >
@@ -203,9 +220,9 @@ export const MidformVideo: React.FC<z.infer<typeof midformVideoSchema>> = ({
                   audioSrc={staticFile(getAudioPath(id, element.audioUrl))}
                   color={timeline.metadata?.equalizerColor || GOLD}
                   numberOfBars={48}
-                  maxBarHeight={160}
-                  barWidth={10}
-                  gap={8}
+                  maxBarHeight={120}
+                  barWidth={8}
+                  gap={6}
                 />
               </AbsoluteFill>
             </Sequence>

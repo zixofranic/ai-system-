@@ -1,6 +1,7 @@
 import {
   AbsoluteFill,
   Img,
+  interpolate,
   staticFile,
   useCurrentFrame,
   useVideoConfig,
@@ -49,8 +50,18 @@ export const Background: React.FC<{
 
   const currentBlur = maxBlur * blur;
 
+  // Soft fade in/out over 1 second
+  const { durationInFrames } = useVideoConfig();
+  const fadeFrames = Math.min(FPS, Math.floor(durationInFrames / 4));
+  const opacity = interpolate(
+    frame,
+    [0, fadeFrames, durationInFrames - fadeFrames, durationInFrames],
+    [0, 1, 1, 0],
+    { extrapolateLeft: "clamp", extrapolateRight: "clamp" },
+  );
+
   return (
-    <AbsoluteFill>
+    <AbsoluteFill style={{ opacity }}>
       <Img
         src={staticFile(getImagePath(project, item.imageUrl))}
         style={{

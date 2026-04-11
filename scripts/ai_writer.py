@@ -60,9 +60,11 @@ def _call_anthropic(model: str, system: str, user: str,
     return message.content[0].text
 
 
-def _call_ollama(prompt: str, model: str = "qwen3:32b",
+def _call_ollama(prompt: str, model: str,
                  temperature: float = 0.8) -> str:
-    """Call local Ollama and return the generated text."""
+    # `model` is required — no safe default exists across environments, and a
+    # stale default (e.g. a model that was never installed on this host) fails
+    # silently with a 404 that looked like an outage for a week.
     payload = {
         "model": model,
         "prompt": prompt,
@@ -73,14 +75,28 @@ def _call_ollama(prompt: str, model: str = "qwen3:32b",
         resp = requests.post(OLLAMA_URL, json=payload, timeout=120)
         resp.raise_for_status()
         return resp.json().get("response", "")
-    except requests.exceptions.ConnectionError:
-        print("[ai_writer] WARNING: Ollama not running. Falling back to Haiku.")
+    except requests.exceptions.RequestException as e:
+        print(f"[ai_writer] WARNING: Ollama call failed ({e}). Falling back to Haiku.")
         return _call_anthropic(
             HAIKU_MODEL,
             "You are a philosopher and poet. Write in the authentic style requested.",
             prompt,
             max_tokens=512,
         )
+
+
+def sanitize_quote(text: str) -> str:
+    # Strip artifacts that small Ollama models sometimes inject into quotes:
+    # "[AI-generated in the spirit of X]", "(AI-generated...)", and trailing
+    # attribution lines like "-- Marcus Aurelius" / "~ Seneca". Must run on
+    # every quote path — primary Ollama, fallback, and any future caller.
+    if not text:
+        return ""
+    text = text.strip().strip('"').strip("'")
+    text = re.sub(r'\s*\[.*?generated.*?\]', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s*\(.*?generated.*?\)', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s*[-~—]+\s*[A-Z][\w\s]*$', '', text.strip())
+    return text.strip()
 
 
 def _parse_json_response(text: str) -> dict:
@@ -230,7 +246,7 @@ def push_weekly_plan_to_supabase(plan: list, channel_map: dict = None) -> str:
             "title": item.get("topic", ""),
             "philosopher": philosopher,
             "topic": item.get("topic", ""),
-            "quote_text": "Pending generation",
+            "quote_text": None,
             "format": fmt,
             "status": "planned",
             "scheduled_at": scheduled_date + "T09:00:00Z",
@@ -256,12 +272,14 @@ def generate_weekly_plan(trending_topics: list, channels: list) -> list:
     """
     Use Claude to create a full weekly content plan with the correct quotas.
 
-    Weekly quota per channel:
+    Weekly quota per channel (updated 2026-04-09 — midform killed, longform parked):
       - 7 shorts (1 per day)
-      - 3 stories (Mon/Wed/Fri)
-      - 2 midform (Tue/Thu)
-      - 1 longform (Saturday or Sunday)
-      = 13 items per channel
+      - 5 stories (Mon/Tue/Wed/Thu/Fri)
+      = 12 items per channel
+
+    NOTE: Portrait Shorts (story_vertical) are NOT planned separately — they
+    are auto-derived from each horizontal story via generate_story_vertical.py.
+    One vertical companion per story = 5 verticals/week per channel implicit.
 
     Wisdom channel philosophers: Marcus Aurelius, Seneca, Epictetus, Rumi,
       Lao Tzu, Nietzsche, Emerson, Thoreau, Dostoevsky, Wilde, etc.
@@ -288,30 +306,29 @@ CHANNEL 2: "Gibran Khalil Gibran" (slug: gibran)
 
 WEEKLY QUOTA PER CHANNEL:
   - 7 shorts (one per day, Mon-Sun)
-  - 3 stories (Mon, Wed, Fri)
-  - 2 midform (Tue, Thu)
-  - 1 longform (Sat or Sun)
-  Total: 13 items per channel, 26 items total
+  - 5 stories (Mon through Fri)
+  Total: 12 items per channel, 24 items total
 
-Return a JSON array of 26 objects:
+Return a JSON array of 24 objects:
 [
   {{
     "day": "Monday",
     "channel": "wisdom" or "gibran",
     "philosopher": "philosopher name",
     "topic": "specific compelling topic title",
-    "format": "short | story | midform | longform",
+    "format": "short | story",
     "hook": "compelling opening angle (1 sentence)"
   }}
 ]
 
 RULES:
 - Every day MUST have 1 short for wisdom AND 1 short for gibran
-- Stories on Mon/Wed/Fri for each channel
-- Midform on Tue/Thu for each channel
-- Longform on Sat or Sun for each channel
+- Stories on Mon through Fri for each channel (5 stories/week)
 - Vary philosophers across the week (no same philosopher 2 days in a row for wisdom)
 - Topics should be inspired by trending data but framed through the philosopher's lens
+- Do NOT output format="midform" — that format has been killed
+- Do NOT output format="longform" — that format is parked for later
+- Do NOT output format="story_vertical" — Portrait Shorts are auto-derived from stories, not planned
 - Each topic title should be compelling and specific, not generic
 - Gibran topics should draw from themes in The Prophet, The Broken Wings, Sand and Foam"""
 
@@ -332,8 +349,9 @@ RULES:
     return plan
 
 
-def generate_short_script(philosopher: str, topic: str,
-                          tone: str = None, notes: str = None) -> dict:
+def generate_short_script(philosopher: str, topic: str, ollama_model: str,
+                          tone: str = None, notes: str = None,
+                          previous_quotes: list = None) -> dict:
     """
     Generate a short-form script: quote from Ollama, metadata from Haiku.
 
@@ -350,6 +368,10 @@ def generate_short_script(philosopher: str, topic: str,
     # Step 1: Generate the quote with Ollama (local, more creative)
     tone_line = f"Tone: {tone}" if tone else "Tone: contemplative and profound"
     notes_line = f"Additional notes: {notes}" if notes else ""
+    dedup_line = ""
+    if previous_quotes:
+        trimmed = [q[:120] for q in previous_quotes[:15]]
+        dedup_line = "\n\nDo NOT repeat or closely paraphrase any of these previous quotes:\n" + "\n".join(f"- {q}" for q in trimmed) + "\n\nWrite something genuinely different."
 
     ollama_prompt = f"""Write a single original philosophical quote in the authentic style and voice of {philosopher}, on the topic of "{topic}".
 
@@ -362,9 +384,9 @@ Requirements:
 - Deep insight, not surface-level advice
 - Do NOT include attribution or quotation marks
 
-Return ONLY the quote text, nothing else."""
+Return ONLY the quote text, nothing else.{dedup_line}"""
 
-    quote = _call_ollama(ollama_prompt).strip().strip('"').strip("'")
+    quote = sanitize_quote(_call_ollama(ollama_prompt, model=ollama_model))
 
     # Step 2: Generate metadata with Haiku
     system = (
@@ -397,7 +419,8 @@ Return JSON:
 
 def generate_midform_script(philosopher: str, topic: str,
                             num_quotes: int = 4, tone: str = None,
-                            notes: str = None) -> dict:
+                            notes: str = None,
+                            previous_quotes: list = None) -> dict:
     """
     Use Claude Sonnet to write a connected multi-quote script for midform video.
 
@@ -415,6 +438,10 @@ def generate_midform_script(philosopher: str, topic: str,
     """
     tone_line = f"Tone: {tone}" if tone else "Tone: contemplative and layered"
     notes_line = f"Additional context: {notes}" if notes else ""
+    dedup_line = ""
+    if previous_quotes:
+        trimmed = [q[:120] for q in previous_quotes[:15]]
+        dedup_line = "\n\nDo NOT repeat or closely paraphrase any of these previously published quotes:\n" + "\n".join(f"- {q}" for q in trimmed) + "\n\nEnsure all quotes are genuinely original."
 
     system = (
         "You are a philosophical writer creating connected video scripts. "
@@ -425,7 +452,7 @@ def generate_midform_script(philosopher: str, topic: str,
     user = f"""Write a midform video script with {num_quotes} connected quotes in the style of {philosopher} on "{topic}".
 
 {tone_line}
-{notes_line}
+{notes_line}{dedup_line}
 
 Return JSON:
 {{
@@ -472,8 +499,9 @@ def generate_story_script(philosopher: str, theme: str,
                           setting: str = None, era: str = None,
                           mood: str = None, notes: str = None) -> dict:
     """
-    Generate an original fiction story (3-5 min) that embeds philosophical
+    Generate an original fiction story (5:30-6:30 min) that embeds philosophical
     teachings naturally through narrative, characters, and emotion.
+    Longer duration = better YouTube long-form algo treatment.
 
     NOT a lecture. NOT biographical. Original fiction that makes the viewer
     FEEL the philosophy through story.
@@ -540,7 +568,7 @@ Your stories have:
 
 Output valid JSON only."""
 
-    user = f"""Write an original short fiction story (500-700 words, 3 minutes when narrated) that carries the philosophical spirit of {philosopher} on the theme of "{theme}".
+    user = f"""Write an original fiction story (900-1100 words, 6 minutes when narrated) that carries the philosophical spirit of {philosopher} on the theme of "{theme}".
 
 {setting_line}
 {era_line}
@@ -571,7 +599,7 @@ Return JSON:
   "comic_style": "{comic_desc}",
   "character": "Precise physical description of the protagonist (under 25 words)",
   "visual_style": "Brief art direction (under 20 words) -- palette, rendering, lighting",
-  "story_script": "The complete narration script. 500-700 words.",
+  "story_script": "The complete narration script. 900-1100 words. This is ~6 minutes of narration at the pace of a thoughtful reader — give the story room to breathe, let scenes develop, include more sensory texture than you think you need. DO NOT rush the arc.",
   "closing_attribution": "Inspired by the philosophy of [philosopher name]",
   "music_mood": "overall mood for background music",
   "suno_prompt": "Suno AI music prompt (under 80 words)"
@@ -596,6 +624,91 @@ THE STORY ARC:
     return result
 
 
+def generate_story_vertical_script(full_story: dict) -> dict:
+    """
+    Condense a full 6-minute horizontal story into a ~60-second vertical
+    teaser script. Keeps the same characters, arc, and philosophical payoff
+    but cuts it down to 130-160 words (~1 minute of narration).
+
+    The result feeds the `story_vertical` format (9:16 for YouTube Shorts feed,
+    a companion piece to the full horizontal story).
+
+    Args:
+        full_story: The dict returned by generate_story_script (has title,
+                    story_script, character, philosopher, theme, etc.)
+
+    Returns:
+        Dict with: title, description, tags, story_script (condensed),
+                   closing_attribution, philosopher, theme, format='story_vertical',
+                   parent_story_id (for linking back to the full version)
+    """
+    philosopher = full_story.get("philosopher", "")
+    theme = full_story.get("theme", "")
+    character = full_story.get("character", "")
+    full_script = full_story.get("story_script", "")
+    full_title = full_story.get("title", "")
+
+    system = (
+        "You are a world-class short-form content writer for TikTok and YouTube Shorts. "
+        "You take longer stories and condense them into punchy 60-second versions that "
+        "still FEEL like a complete story. Output valid JSON only."
+    )
+
+    user = f"""Condense this fiction story into a 60-second vertical teaser script.
+
+ORIGINAL STORY (for context):
+\"\"\"
+{full_script}
+\"\"\"
+
+PHILOSOPHER: {philosopher}
+THEME: {theme}
+CHARACTER: {character}
+
+YOUR JOB:
+Write a NEW condensed version (STRICT 120-145 words, ~55-60 seconds of narration) that:
+- Keeps the same character and core situation
+- Still has a beginning (what happened), a turn (the insight), and an ending (what they did)
+- HOOKS hard in the first sentence — the first 2 seconds decide if someone keeps watching
+- Ends on a punch line, image, or revelation that makes the viewer FEEL something
+- Uses simple ASCII punctuation only (no em dashes, curly quotes)
+- Does NOT mention the philosopher's name in the story itself
+- Is written for the EAR, not the page — short declarative sentences (8 words or fewer per sentence works best)
+
+HARD LIMIT: Your story_script MUST be between 120 and 145 words. Not 150, not 160.
+Count the words before you respond. Going over 145 makes the captions unreadable on
+a vertical phone screen because they get squeezed.
+
+TITLE:
+- Must be hook-first, 55-65 chars
+- Include a curiosity gap
+- Can include the philosopher at the end after " | "
+- Example: "He Lost Everything In One Night. Then This Happened | Seneca"
+
+Return JSON:
+{{
+  "title": "hook-first short title, 55-65 chars",
+  "description": "YouTube Shorts description (2-3 lines, mention philosopher + hashtags, links to full story hint)",
+  "tags": ["stoicism", "shorts", "..."],
+  "story_script": "The condensed narration script, 130-160 words.",
+  "closing_attribution": "Inspired by the philosophy of {philosopher}",
+  "hook_first_line": "The first sentence of the script (repeat it here as a search-friendly hook)"
+}}
+
+REMINDER: 60 seconds of narration is VERY short. Every sentence must earn its place. The shorter, the punchier, the better."""
+
+    response = _call_anthropic(SONNET_MODEL, system, user, max_tokens=1500,
+                               temperature=0.8)
+    result = _parse_json_response(response)
+    result["philosopher"] = philosopher
+    result["theme"] = theme
+    result["format"] = "story_vertical"
+    result["character"] = character
+    result["visual_style"] = full_story.get("visual_style", "")
+    result["comic_style"] = full_story.get("comic_style", "")
+    return result
+
+
 def generate_art_prompts_from_chunks(story_data: dict, text_chunks: list) -> list:
     """
     Generate image prompts for each time-chunk of narration text.
@@ -612,56 +725,106 @@ def generate_art_prompts_from_chunks(story_data: dict, text_chunks: list) -> lis
     """
     character = story_data.get("character", "")
     visual_style = story_data.get("visual_style", "")
-    comic_artist = story_data.get("comic_artist", "")
-    comic_style = story_data.get("comic_style", "")
+    philosopher = story_data.get("philosopher", "")
+
+    # Fetch the per-philosopher visual style card (single source of truth is
+    # in orchestrator.PHILOSOPHER_VISUAL_STYLE — we inline-import to avoid a
+    # circular dependency on SUPABASE_KEY env at import time)
+    try:
+        from orchestrator import _get_philosopher_style  # type: ignore
+        philosopher_style_card = _get_philosopher_style(philosopher)
+    except Exception:
+        philosopher_style_card = (
+            "oil painting, chiaroscuro lighting, renaissance master palette, "
+            "painted on linen canvas"
+        )
 
     chunks_text = ""
     for i, chunk in enumerate(text_chunks):
         chunks_text += f"\n--- CHUNK {i+1} ---\n{chunk}\n"
 
     system = (
-        "You are a visual director creating image prompts for an AI art generator (SDXL). "
-        "Each prompt must describe a UNIQUE scene that matches the narration text. "
+        "You are a cinematographer storyboarding scenes for an AI art generator. "
+        "For each narration chunk, you write a LITERAL, CONCRETE description of "
+        "exactly what a camera would see in that moment — specific action, "
+        "specific objects, specific setting. You are writing what the viewer "
+        "should SEE on screen while those words are being spoken. "
         "Output valid JSON only."
     )
 
-    user = f"""Generate one image prompt for each narration chunk below. Each image will be shown
-while that chunk is being narrated aloud, so the image MUST depict what is being described.
+    user = f"""Read each narration chunk below. For each one, write a LITERAL scene
+description for what the viewer should see on screen while that chunk is narrated.
 
-CHARACTER (same person in every image): {character}
-VISUAL STYLE: {visual_style}
-COMIC ARTIST INFLUENCE: {comic_artist} -- {comic_style}
+CHARACTER (appears in every image with identical physical appearance):
+{character}
+
+THE MAIN CHARACTER MUST BE IN EVERY SCENE — at different angles, doing different
+things, in different places — but always visually identifiable as the same person.
+
+PER-STORY MOOD (this informs lighting/weather/color but is secondary to the action):
+{visual_style}
 
 NARRATION CHUNKS:{chunks_text}
 
-RULES:
-- Each prompt starts with the SCENE ACTION/SETTING (what is happening, where, objects visible)
-- Then brief character reference (10 words max)
-- Then brief style note including "{comic_artist} style" (10 words max)
-- Total prompt under 50 words
-- Every image must show a DIFFERENT composition, angle, or setting
-- Match the emotion and content of the narration text exactly
-- If the text describes hands folding paper, show hands folding paper
-- If the text describes walking across a parking lot, show that
-- Do NOT repeat backgrounds or compositions
+FOR EACH CHUNK, WRITE A SCENE DESCRIPTION THAT CONTAINS:
+1. The CHARACTER (mention the character physically, 10 words max)
+2. A specific ACTION the character is doing (what their body/hands are doing RIGHT NOW)
+3. The exact SETTING (room type, time of day, weather, specific objects visible)
+4. A camera framing hint (close up of hands, wide shot, over-the-shoulder, etc.)
+5. The single most important emotional beat of the chunk, shown through body language, NOT described in words
+
+CRITICAL RULES:
+- The scene MUST match what the narration text literally describes. If chunk 3 says
+  "she picked up the phone", scene 3 must show her picking up a phone. If chunk 7
+  says "he walked across the frozen lake", scene 7 must show him on a frozen lake.
+- Every scene must be DIFFERENT from the previous one. Different action, different
+  angle, different setting. No reusing compositions.
+- Describe ACTIONS and OBJECTS, not emotions. "hands folding a letter" not "feeling sad".
+- 40-60 words per scene.
+- Reference the character physically in every scene so SDXL keeps them consistent.
+- DO NOT include any art-style tokens (no "oil painting", "cinematic", "masterpiece",
+  "4k", "beautiful", "detailed"). The style is applied upstream. Just write what's happening.
+
+EXAMPLE (bad): "A contemplative figure in autumn light, mood of solitude"
+EXAMPLE (good): "Close-up of Nora's hands, weathered and mid-40s, gripping the wooden handle
+of a rusted canoe paddle as she pushes off from a rocky shore, pale dawn mist rising
+off the dark water, her breath visible in the cold air, her face half-turned away from camera"
 
 Return JSON:
 {{
   "prompts": [
-    "prompt for chunk 1",
-    "prompt for chunk 2",
+    "literal scene description for chunk 1",
+    "literal scene description for chunk 2",
     "..."
   ]
 }}"""
 
-    response = _call_anthropic(SONNET_MODEL, system, user, max_tokens=2000,
-                               temperature=0.7)
+    response = _call_anthropic(SONNET_MODEL, system, user, max_tokens=3000,
+                               temperature=0.6)
     result = _parse_json_response(response)
-    prompts = result.get("prompts", [])
+    raw_prompts = result.get("prompts", [])
 
-    # Pad if needed
-    while len(prompts) < len(text_chunks):
-        prompts.append(f"{text_chunks[len(prompts)][:30]}, {character}, {comic_artist} style {visual_style}")
+    # Pad if needed (fallback uses the chunk text verbatim)
+    while len(raw_prompts) < len(text_chunks):
+        raw_prompts.append(
+            f"{character}, {text_chunks[len(raw_prompts)][:100]}"
+        )
+
+    # Assemble final prompts: SCENE first (front-loaded in SDXL = emphasis),
+    # composition hints, then the per-philosopher STYLE card at the END,
+    # then quality tokens. This way Claude's scene drives the subject and
+    # the style card only dictates HOW it is painted.
+    prompts = []
+    for scene_text in raw_prompts[: len(text_chunks)]:
+        scene_text = scene_text.strip().rstrip(",.")
+        combined = (
+            f"{scene_text}, "
+            f"strong compositional silhouette, rule of thirds, shallow depth of field, "
+            f"volumetric light, soft rim light, atmospheric perspective, "
+            f"{philosopher_style_card}, "
+            f"ultra detailed, award-winning fine art, masterpiece quality"
+        )
+        prompts.append(combined)
 
     return prompts
 

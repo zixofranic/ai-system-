@@ -1,19 +1,42 @@
 import { Composition, getStaticFiles } from "remotion";
 import { AIVideo, aiVideoSchema } from "./components/AIVideo";
-import { LongformVideo, longformVideoSchema } from "./components/LongformVideo";
-import { MidformVideo, midformVideoSchema } from "./components/MidformVideo";
-import { ShortVideo, shortVideoSchema } from "./components/ShortVideo";
+import { LongformVideo } from "./components/LongformVideo";
+import { MidformVideo } from "./components/MidformVideo";
+import { ShortVideo } from "./components/ShortVideo";
+import { StoryVerticalVideo } from "./components/StoryVerticalVideo";
 import { FPS, INTRO_DURATION } from "./lib/constants";
+import type { Timeline } from "./lib/types";
 import { getTimelinePath, loadMetadata, loadTimelineFromFile } from "./lib/utils";
+import { z } from "zod";
+import { TimelineSchema } from "./lib/types";
 
-const FORMAT_COMPONENTS = {
-  story: { component: AIVideo, schema: aiVideoSchema },
-  short: { component: ShortVideo, schema: shortVideoSchema },
-  midform: { component: MidformVideo, schema: midformVideoSchema },
-  longform: { component: LongformVideo, schema: longformVideoSchema },
-} as const;
+const routerSchema = z.object({
+  timeline: TimelineSchema.nullable(),
+});
 
-type FormatKey = keyof typeof FORMAT_COMPONENTS;
+/**
+ * Routes to the correct video component based on timeline.metadata.format.
+ * This avoids relying on calculateMetadata to override the component,
+ * which doesn't work reliably in all Remotion versions.
+ */
+const FormatRouter: React.FC<z.infer<typeof routerSchema>> = ({ timeline }) => {
+  if (!timeline) throw new Error("Expected timeline to be fetched");
+
+  const format = timeline.metadata?.format || "story";
+
+  switch (format) {
+    case "short":
+      return <ShortVideo timeline={timeline} />;
+    case "story_vertical":
+      return <StoryVerticalVideo timeline={timeline} />;
+    case "midform":
+      return <MidformVideo timeline={timeline} />;
+    case "longform":
+      return <LongformVideo timeline={timeline} />;
+    default:
+      return <AIVideo timeline={timeline} />;
+  }
+};
 
 export const RemotionRoot: React.FC = () => {
   const staticFiles = getStaticFiles();
@@ -27,11 +50,11 @@ export const RemotionRoot: React.FC = () => {
         <Composition
           id={name}
           key={name}
-          component={AIVideo}
+          component={FormatRouter}
           fps={FPS}
           width={1920}
           height={1080}
-          schema={aiVideoSchema}
+          schema={routerSchema}
           defaultProps={{
             timeline: null,
           }}
@@ -40,17 +63,19 @@ export const RemotionRoot: React.FC = () => {
               getTimelinePath(name),
             );
             const meta = await loadMetadata(name);
-            const format = (meta?.format || "story") as FormatKey;
-            const entry = FORMAT_COMPONENTS[format] || FORMAT_COMPONENTS.story;
+            const format = meta?.format || "story";
 
-            // Shorts have no intro title card (handled inside component)
-            const introFrames = format === "short" ? 0 : INTRO_DURATION;
+            // Shorts and story_vertical skip the intro title card — they
+            // live on the Shorts feed where every frame must earn attention.
+            const introFrames =
+              format === "short" || format === "story_vertical"
+                ? 0
+                : INTRO_DURATION;
 
             return {
               durationInFrames: lengthFrames + introFrames,
               width: meta?.width || 1920,
               height: meta?.height || 1080,
-              component: entry.component,
               props: {
                 ...props,
                 timeline,

@@ -14,6 +14,8 @@ import {
   FPS,
   GOLD,
   INTRO_DURATION,
+  MUSIC_FADE_FRAMES,
+  MUSIC_VOLUME,
 } from "../lib/constants";
 import { TimelineSchema } from "../lib/types";
 import {
@@ -183,6 +185,7 @@ export const LongformVideo: React.FC<
         );
 
         const isMusic = element.audioUrl === "music";
+        const fadeFrames = Math.min(MUSIC_FADE_FRAMES, Math.floor(duration / 4));
 
         return (
           <Sequence
@@ -193,13 +196,25 @@ export const LongformVideo: React.FC<
           >
             <Audio
               src={staticFile(getAudioPath(id, element.audioUrl))}
-              volume={isMusic ? 0.30 : 1}
+              volume={
+                isMusic
+                  ? (f: number) => {
+                      const fadeIn = Math.min(1, f / fadeFrames);
+                      const fadeOut = Math.min(
+                        1,
+                        Math.max(0, (duration - f) / fadeFrames),
+                      );
+                      return Math.min(fadeIn, fadeOut) * MUSIC_VOLUME;
+                    }
+                  : 1
+              }
             />
           </Sequence>
         );
       })}
 
-      {/* Equalizer — vertically centered for longform */}
+      {/* Equalizer — pinned to bottom for longform (was vertically centered,
+          which overlapped text overlays). */}
       {timeline.audio
         .filter((el) => el.audioUrl !== "music")
         .map((element, index) => {
@@ -217,8 +232,9 @@ export const LongformVideo: React.FC<
               <AbsoluteFill
                 style={{
                   zIndex: 15,
-                  justifyContent: "center",
+                  justifyContent: "flex-end",
                   alignItems: "center",
+                  paddingBottom: 60,
                   pointerEvents: "none",
                 }}
               >
@@ -226,9 +242,9 @@ export const LongformVideo: React.FC<
                   audioSrc={staticFile(getAudioPath(id, element.audioUrl))}
                   color={timeline.metadata?.equalizerColor || GOLD}
                   numberOfBars={56}
-                  maxBarHeight={180}
-                  barWidth={10}
-                  gap={8}
+                  maxBarHeight={130}
+                  barWidth={8}
+                  gap={6}
                 />
               </AbsoluteFill>
             </Sequence>
