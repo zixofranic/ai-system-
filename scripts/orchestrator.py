@@ -1777,30 +1777,67 @@ def _run_story_pipeline(content: dict):
     cid = content["id"]
     philosopher = content.get("philosopher", "Marcus Aurelius")
     topic = content.get("topic", "life")
-    channel = content.get("channels", {}) or {}
+    content = _ensure_channel_data(content)
+    channel_slug = content["channels"]["slug"]
 
-    print(f"\n--- Story Pipeline: {philosopher} on {topic} ---")
+    print(f"\n--- Story Pipeline: {philosopher} on {topic} [channel={channel_slug}] ---")
     update_supabase(cid, {"status": "generating"})
     log_step(cid, "story", 1, "running")
 
+    # Pass --content-id and --channel-slug so the child updates the correct
+    # row and writes to the correct channel directory — no search, no
+    # silent default (that's how Gibran content leaked into wisdom).
+    # Pass --queued-title so the generated script delivers on the planned
+    # title instead of inventing a new one.
     cmd = [
         sys.executable, str(Path(__file__).parent / "generate_story_video.py"),
         "--philosopher", philosopher,
         "--theme", topic,
+        "--content-id", cid,
+        "--channel-slug", channel_slug,
     ]
+    queued_title = content.get("title")
+    if queued_title:
+        cmd.extend(["--queued-title", queued_title])
+
+    # Stream stdout/stderr to a per-content log file instead of buffering
+    # via capture_output=True. Story pipelines take up to 25 minutes; if
+    # they hang, capture_output gives us nothing to debug until the timeout
+    # fires. With Popen + tee-to-file we can tail the log live and we also
+    # get partial output to include in the error message on failure.
+    logs_dir = Path(__file__).parent / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    log_file = logs_dir / f"story_{cid[:8]}_{ts}.log"
+    print(f"  Subprocess log: {log_file}")
+
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=1800,
-            cwd=str(Path(__file__).parent),
-        )
-        if result.returncode != 0:
-            err = result.stderr[-500:] if result.stderr else "Unknown error"
-            raise RuntimeError(f"Story pipeline failed (exit {result.returncode}): {err}")
+        with open(log_file, "w", encoding="utf-8") as lf:
+            proc = subprocess.Popen(
+                cmd, stdout=lf, stderr=subprocess.STDOUT, text=True,
+                cwd=str(Path(__file__).parent),
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            )
+            try:
+                returncode = proc.wait(timeout=1800)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+                raise
+
+        if returncode != 0:
+            tail = ""
+            try:
+                with open(log_file, "r", encoding="utf-8", errors="replace") as lf:
+                    tail = "".join(lf.readlines()[-20:])[-1000:]
+            except Exception:
+                pass
+            raise RuntimeError(f"Story pipeline failed (exit {returncode}): {tail}")
         log_step(cid, "story", 1, "success")
         print(f"  Story pipeline completed for {cid}")
     except subprocess.TimeoutExpired:
-        log_step(cid, "story", 1, "failed", "Timeout after 30 minutes")
-        mark_failed(cid, "story pipeline: timeout after 30 minutes")
+        log_step(cid, "story", 1, "failed", f"Timeout after 30 minutes (log: {log_file})")
+        mark_failed(cid, f"story pipeline: timeout after 30 minutes (log: {log_file})")
         raise
     except Exception as e:
         log_step(cid, "story", 1, "failed", str(e))

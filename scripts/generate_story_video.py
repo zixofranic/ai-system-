@@ -44,14 +44,16 @@ OUTPUT_DIRS = {
 PHILOSOPHER_CHANNEL = {
     "Marcus Aurelius": "wisdom", "Seneca": "wisdom", "Epictetus": "wisdom",
     "Rumi": "wisdom", "Lao Tzu": "wisdom", "Nietzsche": "wisdom",
-    "Emerson": "wisdom", "Gibran": "gibran",
+    "Emerson": "wisdom",
+    "Gibran": "gibran", "Gibran Khalil Gibran": "gibran",
 }
 
 PHILOSOPHER_MUSIC = {
     "Marcus Aurelius": "stoic_classical", "Seneca": "stoic_classical",
     "Epictetus": "stoic_classical", "Rumi": "persian_miniature",
     "Lao Tzu": "eastern_ink", "Nietzsche": "dark_expressionist",
-    "Emerson": "romantic_landscape", "Gibran": "gibran",
+    "Emerson": "romantic_landscape",
+    "Gibran": "gibran", "Gibran Khalil Gibran": "gibran",
 }
 
 SENTENCE_ENDINGS = {'.', '!', '?', ';', ':'}
@@ -70,12 +72,15 @@ def _sanitize_text(text):
 # ---------------------------------------------------------------------------
 # Step 1: Generate story script
 # ---------------------------------------------------------------------------
-def step_generate_script(philosopher, theme, setting, mood, notes):
+def step_generate_script(philosopher, theme, setting, mood, notes, queued_title=None):
     print("\n[1/6] Generating story script via Claude Sonnet...")
+    if queued_title:
+        print(f"  Honoring queued title: {queued_title!r}")
     from ai_writer import generate_story_script
     story = generate_story_script(
         philosopher=philosopher, theme=theme,
         setting=setting, mood=mood, notes=notes,
+        queued_title=queued_title,
     )
     print(f"  Title: {story.get('title', '?')}")
     print(f"  Words: {len(story.get('story_script', '').split())}")
@@ -85,31 +90,45 @@ def step_generate_script(philosopher, theme, setting, mood, notes):
 # ---------------------------------------------------------------------------
 # Step 2: Generate voice + timestamps
 # ---------------------------------------------------------------------------
-def step_generate_voice(text, output_path, ts_path):
-    """Generate voice via Chatterbox, timestamps via Whisper."""
+ELEVENLABS_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+ELEVENLABS_VOICE_WISDOM = os.environ.get("ELEVENLABS_VOICE_WISDOM", "0ABJJI7ZYmWZBiUBMHUW")
+ELEVENLABS_VOICE_GIBRAN = os.environ.get("ELEVENLABS_VOICE_GIBRAN", "R68HwD2GzEdWfqYZP9FQ")
+
+
+def step_generate_voice(text, output_path, ts_path, channel_slug):
+    # channel_slug is required — it determines which ElevenLabs voice to use.
+    # Wisdom → Burton; Gibran → Gibran voice. No default. This exact pattern
+    # matches orchestrator.generate_voice for shorts. Chatterbox was the old
+    # path; it clone-cast every story in James Burton's voice regardless of
+    # channel (including Gibran), which was a channel-routing bug.
+    if not channel_slug:
+        raise ValueError("step_generate_voice requires channel_slug — refusing to default")
     if Path(output_path).exists() and Path(ts_path).exists():
         print(f"\n[2/6] Voice exists, loading: {Path(output_path).name}")
         with open(ts_path) as f:
             return json.load(f)
 
-    print("\n[2/6] Generating voice via Chatterbox TTS...")
+    voice_id = ELEVENLABS_VOICE_GIBRAN if channel_slug == "gibran" else ELEVENLABS_VOICE_WISDOM
+    print(f"\n[2/6] Generating voice via ElevenLabs (channel={channel_slug}, voice={voice_id[:8]}...)")
     text = _sanitize_text(text)
-    payload = {"text": text, "exaggeration": 0.5, "cfg_weight": 0.5}
-    voice_ref = Path("C:/AI/system/voice/recordings/wisdom_burton_11labs_clip.mp3")
-    if voice_ref.exists():
-        payload["voice_mode"] = "clone"
-        payload["reference_audio_filename"] = voice_ref.name
 
-    resp = requests.post(f"{CHATTERBOX_URL}/tts", json=payload, timeout=300)
-    resp.raise_for_status()
-
-    wav_path = output_path.replace(".mp3", ".wav")
-    with open(wav_path, "wb") as f:
-        f.write(resp.content)
-
-    # Convert to MP3
-    subprocess.run(["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame",
-                    "-b:a", "128k", output_path], capture_output=True)
+    from elevenlabs import ElevenLabs, VoiceSettings
+    client = ElevenLabs(api_key=ELEVENLABS_KEY)
+    audio = client.text_to_speech.convert(
+        voice_id=voice_id,
+        text=text,
+        model_id="eleven_multilingual_v2",
+        voice_settings=VoiceSettings(
+            stability=0.70,
+            similarity_boost=0.85,
+            style=0.25,
+            use_speaker_boost=True,
+        ),
+    )
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "wb") as f:
+        for chunk in audio:
+            f.write(chunk)
     print(f"  Voice saved: {output_path}")
 
     # Extract timestamps via Whisper
@@ -344,10 +363,32 @@ def main():
     # Bumped 10 → 15 on 2026-04-09 to pair with longer 6-min story scripts.
     # Aim for ~24s per scene on a 6-min story.
     parser.add_argument("--num-scenes", type=int, default=15)
+    # When invoked by the orchestrator: --content-id binds this run to a
+    # specific Supabase row so step_update_supabase updates it directly
+    # instead of searching by philosopher (which created duplicate rows).
+    # --channel-slug is the authoritative channel; no more silent "wisdom"
+    # default when PHILOSOPHER_CHANNEL is missing an entry.
+    parser.add_argument("--content-id", default=None)
+    parser.add_argument("--channel-slug", default=None)
+    # The dashboard plans each story with a title. Pass it here so Claude
+    # delivers on that exact title instead of inventing a new one — prevents
+    # the row lying about provenance after generation.
+    parser.add_argument("--queued-title", default=None)
     args = parser.parse_args()
 
     philosopher = args.philosopher
-    channel = PHILOSOPHER_CHANNEL.get(philosopher, "wisdom")
+    if args.channel_slug:
+        channel = args.channel_slug
+    elif philosopher in PHILOSOPHER_CHANNEL:
+        channel = PHILOSOPHER_CHANNEL[philosopher]
+    else:
+        raise ValueError(
+            f"Channel unknown for philosopher {philosopher!r}. "
+            "Add it to PHILOSOPHER_CHANNEL or pass --channel-slug explicitly. "
+            "Refusing to silently default to 'wisdom' (channel routing is a correctness invariant)."
+        )
+    if channel not in OUTPUT_DIRS:
+        raise ValueError(f"Unknown channel {channel!r}; must be one of {list(OUTPUT_DIRS)}")
     output_dir = OUTPUT_DIRS[channel]
     output_dir.mkdir(parents=True, exist_ok=True)
     music_style = PHILOSOPHER_MUSIC.get(philosopher, "stoic_classical")
@@ -386,13 +427,14 @@ def main():
         output_name = composition_name
         philosopher = story.get("philosopher", philosopher)
     else:
-        story = step_generate_script(philosopher, args.theme, args.setting, args.mood, args.notes)
+        story = step_generate_script(philosopher, args.theme, args.setting, args.mood, args.notes,
+                                     queued_title=args.queued_title)
         with open(script_path, "w", encoding="utf-8") as f:
             json.dump(story, f, indent=2, ensure_ascii=False)
 
     # Step 2: Voice
     if not args.reuse_all:
-        timestamps = step_generate_voice(story["story_script"], str(voice_path), str(ts_path))
+        timestamps = step_generate_voice(story["story_script"], str(voice_path), str(ts_path), channel_slug=channel)
     else:
         with open(ts_path) as f:
             timestamps = json.load(f)
@@ -473,10 +515,9 @@ def main():
     drive_url = None
     video_storage_path = None
     thumb_storage_path = None
-    channel_slug = channel or "wisdom"
     try:
         from supabase_storage import upload_to_storage
-        video_storage_path = upload_to_storage(str(video_path), "wisdom-videos", channel_slug, "story")
+        video_storage_path = upload_to_storage(str(video_path), "wisdom-videos", channel, "story")
         print(f"  Storage: {video_storage_path}")
     except Exception as e:
         print(f"  Storage upload failed, trying Drive: {e}")
@@ -486,7 +527,7 @@ def main():
     if os.path.exists(thumb_path):
         try:
             from supabase_storage import upload_to_storage as upload_thumb
-            thumb_storage_path = upload_thumb(thumb_path, "wisdom-thumbnails", channel_slug, "story")
+            thumb_storage_path = upload_thumb(thumb_path, "wisdom-thumbnails", channel, "story")
             print(f"  Thumbnail Storage: {thumb_storage_path}")
         except Exception as e:
             print(f"  Thumbnail storage failed: {e}")
@@ -497,12 +538,20 @@ def main():
                 except Exception as e2:
                     print(f"  Thumbnail upload failed: {e2}")
 
-    # Step 7: Update Supabase content row with metadata (if connected)
-    step_update_supabase(
-        story, str(video_path),
-        video_drive_url=drive_url, thumbnail_drive_url=thumb_drive_url,
-        video_storage_path=video_storage_path, thumbnail_storage_path=thumb_storage_path,
-    )
+    # Step 7: Update Supabase content row with metadata. If the PATCH fails
+    # after the uploads succeeded, best-effort DELETE the orphan storage
+    # objects before re-raising — otherwise every failed row leaves 50 MB
+    # of garbage in the Fellows bucket with nothing pointing at it.
+    try:
+        step_update_supabase(
+            story, str(video_path),
+            video_drive_url=drive_url, thumbnail_drive_url=thumb_drive_url,
+            video_storage_path=video_storage_path, thumbnail_storage_path=thumb_storage_path,
+            content_id=args.content_id, channel_slug=channel,
+        )
+    except Exception:
+        _cleanup_orphan_storage(video_storage_path, thumb_storage_path)
+        raise
 
     print(f"\n{'='*60}")
     print(f"  COMPLETE")
@@ -779,11 +828,42 @@ def step_upload_drive(video_path, channel):
         return None
 
 
+def _cleanup_orphan_storage(video_storage_path, thumb_storage_path):
+    # Best-effort DELETE of storage objects that were uploaded but whose
+    # PATCH failed. Swallows all errors — we're already in a failure path
+    # and don't want to mask the original exception.
+    fellows_url = os.environ.get("FELLOWS_SUPABASE_URL", "")
+    fellows_key = os.environ.get("FELLOWS_SUPABASE_SERVICE_KEY", "")
+    if not fellows_url or not fellows_key:
+        return
+    h = {"apikey": fellows_key, "Authorization": f"Bearer {fellows_key}"}
+    for bucket, obj in [("wisdom-videos", video_storage_path),
+                        ("wisdom-thumbnails", thumb_storage_path)]:
+        if not obj:
+            continue
+        try:
+            r = requests.delete(f"{fellows_url}/storage/v1/object/{bucket}/{obj}",
+                                headers=h, timeout=15)
+            if r.status_code in (200, 204):
+                print(f"  [cleanup] Deleted orphan {bucket}/{obj}")
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Step 7: Push metadata to Supabase
 # ---------------------------------------------------------------------------
-def step_update_supabase(story, video_path, video_drive_url=None, thumbnail_drive_url=None, video_storage_path=None, thumbnail_storage_path=None):
-    """Update Supabase content row with title, description, tags, and local path."""
+def step_update_supabase(story, video_path, video_drive_url=None, thumbnail_drive_url=None,
+                         video_storage_path=None, thumbnail_storage_path=None,
+                         content_id=None, channel_slug=None):
+    # Two modes:
+    # 1. content_id provided (orchestrator path): update that exact row. No
+    #    searching, no status filter, no duplicate-row fallback. This is the
+    #    fix for the Gibran contamination bug where the old search-by-
+    #    philosopher logic couldn't find rows in status=generating and
+    #    silently created duplicates in the wrong channel.
+    # 2. content_id missing (standalone CLI path): legacy behavior — search
+    #    by philosopher+format and create a row if nothing matches.
     supabase_url = os.getenv("SUPABASE_URL", "")
     supabase_key = os.getenv("SUPABASE_SERVICE_KEY", "")
     if not supabase_url or not supabase_key:
@@ -803,7 +883,52 @@ def step_update_supabase(story, video_path, video_drive_url=None, thumbnail_driv
     description = story.get("description", "")
     tags = story.get("tags", [])
 
-    # Find matching content row by philosopher + format
+    if content_id:
+        existing = requests.get(
+            f"{supabase_url}/rest/v1/content",
+            headers=headers,
+            params={"select": "id,generation_params", "id": f"eq.{content_id}"},
+            timeout=15,
+        ).json()
+        if not existing:
+            raise RuntimeError(
+                f"content_id {content_id} not found in Supabase — refusing to "
+                "fall back to create-new-row (that's how duplicate Gibran rows "
+                "happened)."
+            )
+        existing_params = existing[0].get("generation_params") or {}
+        payload = {
+            "title": title,
+            "description": description,
+            "status": "ready",
+            "local_machine_path": video_path,
+            "generation_params": {
+                **existing_params,
+                "tags": tags,
+                "closing_attribution": story.get("closing_attribution", ""),
+                "writer_style": story.get("writer_style", ""),
+                "comic_artist": story.get("comic_artist", ""),
+            },
+        }
+        if video_storage_path:
+            payload["video_storage_path"] = video_storage_path
+        if thumbnail_storage_path:
+            payload["thumbnail_storage_path"] = thumbnail_storage_path
+        if video_drive_url:
+            payload["video_drive_url"] = video_drive_url
+        if thumbnail_drive_url:
+            payload["thumbnail_drive_url"] = thumbnail_drive_url
+        resp = requests.patch(
+            f"{supabase_url}/rest/v1/content?id=eq.{content_id}",
+            headers=headers, json=payload, timeout=30,
+        )
+        if resp.status_code in (200, 204):
+            print(f"  Updated content [{content_id[:8]}]: {title}")
+        else:
+            raise RuntimeError(f"Supabase update failed: {resp.status_code} {resp.text[:200]}")
+        return
+
+    # Legacy standalone path: search by philosopher, create if missing.
     resp = requests.get(
         f"{supabase_url}/rest/v1/content",
         headers=headers,
@@ -816,10 +941,13 @@ def step_update_supabase(story, video_path, video_drive_url=None, thumbnail_driv
             "limit": "1",
         },
     )
-
     rows = resp.json() if resp.status_code == 200 else []
     if not rows:
-        # Create new content row
+        if not channel_slug:
+            raise ValueError(
+                "channel_slug is required when creating a new content row. "
+                "Refusing to silently default (channel routing is a correctness invariant)."
+            )
         payload = {
             "title": title,
             "description": description,
@@ -846,15 +974,15 @@ def step_update_supabase(story, video_path, video_drive_url=None, thumbnail_driv
             payload["video_drive_url"] = video_drive_url
         if thumbnail_drive_url:
             payload["thumbnail_drive_url"] = thumbnail_drive_url
-        # Get channel ID
         ch_resp = requests.get(
             f"{supabase_url}/rest/v1/channels",
             headers=headers,
-            params={"slug": f"eq.{'gibran' if philosopher == 'Gibran' else 'wisdom'}"},
+            params={"slug": f"eq.{channel_slug}"},
         )
         channels = ch_resp.json() if ch_resp.status_code == 200 else []
-        if channels:
-            payload["channel_id"] = channels[0]["id"]
+        if not channels:
+            raise RuntimeError(f"Channel {channel_slug!r} not found in Supabase")
+        payload["channel_id"] = channels[0]["id"]
 
         resp = requests.post(f"{supabase_url}/rest/v1/content", headers=headers, json=payload)
         if resp.status_code in (200, 201):
@@ -862,8 +990,7 @@ def step_update_supabase(story, video_path, video_drive_url=None, thumbnail_driv
         else:
             print(f"  Failed to create: {resp.text[:200]}")
     else:
-        # Update existing row
-        content_id = rows[0]["id"]
+        existing_id = rows[0]["id"]
         payload = {
             "title": title,
             "description": description,
@@ -885,7 +1012,7 @@ def step_update_supabase(story, video_path, video_drive_url=None, thumbnail_driv
         if thumbnail_drive_url:
             payload["thumbnail_drive_url"] = thumbnail_drive_url
         resp = requests.patch(
-            f"{supabase_url}/rest/v1/content?id=eq.{content_id}",
+            f"{supabase_url}/rest/v1/content?id=eq.{existing_id}",
             headers=headers, json=payload,
         )
         if resp.status_code in (200, 204):

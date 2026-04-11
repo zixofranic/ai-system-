@@ -497,7 +497,8 @@ Each quote should be 1-3 sentences. The quotes should form a narrative arc:
 
 def generate_story_script(philosopher: str, theme: str,
                           setting: str = None, era: str = None,
-                          mood: str = None, notes: str = None) -> dict:
+                          mood: str = None, notes: str = None,
+                          queued_title: str = None) -> dict:
     """
     Generate an original fiction story (5:30-6:30 min) that embeds philosophical
     teachings naturally through narrative, characters, and emotion.
@@ -534,6 +535,7 @@ def generate_story_script(philosopher: str, theme: str,
         "sharp": ("Hemingway", "Iceberg theory. What is unsaid carries the weight. Declarative sentences. Dialogue that sounds real but cuts. No adjectives you do not need. Every word earns its place."),
         "tender": ("Marilynne Robinson", "Luminous attention to ordinary things. Grief and grace intertwined. Long pastoral sentences. The sacred in the mundane. Silence between people who love each other."),
         "noir": ("Raymond Chandler", "First person. Cynical narrator. Sharp metaphors. City at night. Everyone has a secret. Moral ambiguity. Dark humor."),
+        "gibran": ("Gibran Khalil Gibran", "Lyrical, aphoristic prose poetry in the tradition of The Prophet. Short, quotable sentences that feel carved from stone. Parables, not plot. Characters speak in wisdom fragments. Slow, contemplative pacing with silences that feel holy. Natural imagery — sea, mountain, tree, night, bread, salt, hands. Avoid slang, irony, noir, or clipped modern prose. The prose itself should sound like something that could be quoted and remembered."),
     }
 
     # Match comic artist style to mood for visual direction
@@ -546,11 +548,24 @@ def generate_story_script(philosopher: str, theme: str,
         "sharp": ("Sean Murphy", "Clean dynamic linework, gritty urban atmosphere, cinematic framing, high contrast ink, modern graphic novel"),
         "tender": ("Moebius", "Delicate precise linework, soft pastel palette, luminous open spaces, gentle detail, contemplative compositions"),
         "noir": ("Sean Murphy", "Stark black and white, rain-slicked streets, dramatic shadows, angular compositions, pulp noir atmosphere"),
+        "gibran": ("Symbolist watercolor", "Gibran's own painting style — symbolist watercolor, warm ochre and earth-tone palette, soft dreamlike edges, luminous washes, art nouveau influence, mystical atmosphere, spiritual symbolism, no hard lines, no modern graphic-novel inking"),
     }
 
-    mood_key = (mood or "sharp").lower().split(",")[0].strip()
-    writer_name, writer_desc = WRITER_STYLES.get(mood_key, WRITER_STYLES["sharp"])
-    comic_artist, comic_desc = COMIC_STYLES.get(mood_key, COMIC_STYLES["sharp"])
+    # Philosopher-level override for writer/comic style. When a philosopher
+    # has a canonical voice of their own (Gibran, eventually Rumi, etc.), we
+    # force that style regardless of mood. Mood still drives style for
+    # philosophers without an entry here.
+    PHILOSOPHER_STYLE_OVERRIDE = {
+        "Gibran": "gibran",
+        "Gibran Khalil Gibran": "gibran",
+    }
+
+    if philosopher in PHILOSOPHER_STYLE_OVERRIDE:
+        style_key = PHILOSOPHER_STYLE_OVERRIDE[philosopher]
+    else:
+        style_key = (mood or "sharp").lower().split(",")[0].strip()
+    writer_name, writer_desc = WRITER_STYLES.get(style_key, WRITER_STYLES["sharp"])
+    comic_artist, comic_desc = COMIC_STYLES.get(style_key, COMIC_STYLES["sharp"])
 
     system = f"""You are a world-class fiction writer. For this story, write in the literary style of {writer_name}.
 
@@ -568,8 +583,17 @@ Your stories have:
 
 Output valid JSON only."""
 
-    user = f"""Write an original fiction story (900-1100 words, 6 minutes when narrated) that carries the philosophical spirit of {philosopher} on the theme of "{theme}".
+    title_directive = (
+        f'\nPROMISED TITLE: "{queued_title}"\n'
+        f"This story was planned in the dashboard under this exact title. Your story MUST deliver\n"
+        f"on the emotional beat and subject this title promises. Use this title verbatim as the\n"
+        f"`title` field in your JSON response — do NOT invent a new title. The story arc must\n"
+        f"pay off what this title sets up.\n"
+        if queued_title else ""
+    )
 
+    user = f"""Write an original fiction story (900-1100 words, 6 minutes when narrated) that carries the philosophical spirit of {philosopher} on the theme of "{theme}".
+{title_directive}
 {setting_line}
 {era_line}
 {mood_line}
@@ -585,13 +609,14 @@ CRITICAL RULES:
 - The philosopher's name only appears in the closing attribution
 - Use simple ASCII punctuation only -- no em dashes, curly quotes, or special Unicode
 - The ending must feel COMPLETE. End on a concrete action or image that resolves the emotional arc.
+- UNIVERSAL SETTING: Unless a specific setting is given, use universally relatable character names and locations. The audience is global. Do NOT default to the philosopher's country of origin just because the philosopher is from there. For GIBRAN content specifically: do NOT use Lebanese names (Tarek, Samir, Nour, Layla, etc.) or Lebanese places (Beirut, Tripoli, Jounieh, cedars of Lebanon, etc.) unless the theme explicitly demands it. Gibran's philosophy is international — the story should feel like it could be set in a harbor town, a mountain village, a rented room, a coastal highway, a city apartment. Pick character names that do NOT telegraph a single country (e.g., David, Sarah, Marco, Anja, Thomas, Leah, Elena, Daniel).
 
 CHARACTER (CRITICAL FOR AI ART):
 Define ONE main character with a FIXED appearance (under 25 words).
 
 Return JSON:
 {{
-  "title": "YouTube title (compelling, under 70 chars, does NOT mention the philosopher)",
+  "title": "{'Use the PROMISED TITLE above verbatim' if queued_title else 'YouTube title (compelling, under 70 chars, does NOT mention the philosopher)'}",
   "description": "YouTube description (3-4 lines, mention philosopher + theme, hashtags)",
   "tags": ["tag1", "tag2", "..."],
   "writer_style": "{writer_name}",

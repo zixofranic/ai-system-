@@ -130,6 +130,39 @@ def promote_scheduled_content():
         print(f"  Error promoting scheduled: {e}")
 
 
+STALE_GENERATING_MINUTES = 45
+
+
+def reap_stale_generating():
+    # Any row that's been status=generating for more than 45 minutes is
+    # almost certainly stuck (the orchestrator or child subprocess crashed
+    # before updating it). Mark it failed so the dashboard retry button
+    # shows up instead of a spinner that never finishes.
+    try:
+        from datetime import timedelta
+        cutoff = (datetime.utcnow() - timedelta(minutes=STALE_GENERATING_MINUTES)).isoformat() + "Z"
+        url = f"{SUPABASE_URL}/rest/v1/content"
+        params = {
+            "select": "id,title,updated_at",
+            "status": "eq.generating",
+            "updated_at": f"lt.{cutoff}",
+            "deleted_at": "is.null",
+        }
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        items = resp.json() if resp.status_code == 200 else []
+        for item in items:
+            msg = f"stuck in generating >{STALE_GENERATING_MINUTES}min — subprocess likely crashed"
+            requests.patch(
+                f"{url}?id=eq.{item['id']}",
+                headers=HEADERS,
+                json={"status": "failed", "rejection_reason": msg},
+                timeout=10,
+            )
+            print(f"  Reaped stale generating: {item.get('title', item['id'][:8])}")
+    except Exception as e:
+        print(f"  Error reaping stale: {e}")
+
+
 def check_approved_content():
     """Check Supabase for approved content with youtube_publish_requested and no youtube_video_id."""
     try:
@@ -361,6 +394,9 @@ def main():
 
             # --- Check for scheduled content whose time has arrived ---
             promote_scheduled_content()
+
+            # --- Reap stale `generating` rows from crashed subprocesses ---
+            reap_stale_generating()
 
             # --- Check for approved content to publish to YouTube ---
             approved = check_approved_content()
