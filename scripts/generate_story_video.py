@@ -459,36 +459,21 @@ def main():
             art_paths = json.load(f)
         print(f"\n[4/6] Reusing {len(art_paths)} images")
 
-    # Step 5: Pick music — loop if shorter than the voice
+    # Step 5: Build music track by chaining multiple compositions with crossfade.
+    # Suno generations cap at ~3:30, but stories run 5:30-6:30 — looping a
+    # single composition over a 6-min story sounds repetitive. Chaining 2+
+    # DIFFERENT compositions gives musical variety over the story's arc.
     music_dir = MUSIC_ROOT / music_style
-    tracks = list(music_dir.glob("*.mp3"))
-    music_path = str(random.choice(tracks)) if tracks else None
-
-    # Pre-loop the music track if it's shorter than the voice file.
-    # Most library tracks are 2-4 minutes but 6-min stories need 5:30+.
-    if music_path and voice_path:
+    music_path = None
+    if voice_path:
         voice_dur = float(subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=nk=1:nw=1", str(voice_path)],
             capture_output=True, text=True,
         ).stdout.strip() or "0")
-        music_dur = float(subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=nk=1:nw=1", music_path],
-            capture_output=True, text=True,
-        ).stdout.strip() or "0")
         needed = voice_dur + 10  # voice + padding
-        if music_dur > 0 and music_dur < needed:
-            loops = int(needed / music_dur) + 1
-            looped_path = str(output_dir / f"{prefix}_music_looped.mp3")
-            subprocess.run(
-                ["ffmpeg", "-y", "-stream_loop", str(loops), "-i", music_path,
-                 "-t", str(needed), "-codec:a", "libmp3lame", "-b:a", "192k",
-                 looped_path],
-                capture_output=True,
-            )
-            print(f"  Music looped {loops}x -> {needed:.0f}s (track was {music_dur:.0f}s)")
-            music_path = looped_path
+        chained_path = output_dir / f"{prefix}_music_chained.mp3"
+        music_path = _build_crossfade_music(music_dir, needed, chained_path)
 
     # Step 5b: Convert to Remotion
     step_convert_remotion(script_path, ts_path, art_paths_path, voice_path, music_path, output_name)
@@ -826,6 +811,124 @@ def step_upload_drive(video_path, channel):
     except Exception as e:
         print(f"  Drive upload failed: {e}")
         return None
+
+
+def _probe_track(path):
+    # Return (duration_sec, composition_key) for a music file.
+    # Uses ID3 title tag as the dedupe key so v1/v2/v3 variants of the
+    # same Suno composition (which share a title) collapse to one key.
+    # Falls back to filename stem minus trailing `_v\d+` or `_\d+`.
+    dur = float(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nk=1:nw=1", str(path)],
+        capture_output=True, text=True,
+    ).stdout.strip() or "0")
+    title = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format_tags=title",
+         "-of", "default=nk=1:nw=1", str(path)],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if title:
+        key = title.strip().lower()
+    else:
+        import re as _re
+        key = _re.sub(r'_v?\d+$', '', Path(path).stem).lower()
+    return dur, key
+
+
+def _build_crossfade_music(music_dir, needed_sec, output_path, crossfade_sec=2.0):
+    # Pick DIFFERENT compositions from music_dir (deduped by ID3 title tag
+    # so v1/v2 of the same Suno gen don't double-dip) and chain them with
+    # short crossfades until the total covers needed_sec. If there's only
+    # one track in the folder, fall back to simple copy. If there aren't
+    # enough unique compositions to cover needed_sec, reuse compositions
+    # from the start rather than loop the same track back-to-back.
+    from collections import defaultdict
+
+    all_tracks = sorted(Path(music_dir).glob("*.mp3"))
+    if not all_tracks:
+        return None
+
+    by_comp = defaultdict(list)
+    for t in all_tracks:
+        dur, key = _probe_track(t)
+        by_comp[key].append((t, dur))
+
+    comp_keys = list(by_comp.keys())
+    random.shuffle(comp_keys)
+
+    picked = []
+
+    def _total():
+        return sum(d for _, d in picked) - max(0, len(picked) - 1) * crossfade_sec
+
+    # First pass: one track per unique composition
+    for key in comp_keys:
+        path, dur = random.choice(by_comp[key])
+        picked.append((path, dur))
+        if _total() >= needed_sec:
+            break
+
+    # Second pass: if exhausted and still short, cycle through again
+    guard = 0
+    while _total() < needed_sec and guard < 10:
+        for key in comp_keys:
+            if _total() >= needed_sec:
+                break
+            path, dur = random.choice(by_comp[key])
+            picked.append((path, dur))
+        guard += 1
+
+    # Single-track fast path: just copy/normalize
+    if len(picked) == 1:
+        single = picked[0][0]
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(single),
+             "-t", str(needed_sec),
+             "-codec:a", "libmp3lame", "-b:a", "192k",
+             str(output_path)],
+            capture_output=True, check=True,
+        )
+        print(f"  Music: {Path(single).name} ({picked[0][1]:.0f}s)")
+        return str(output_path)
+
+    # Multi-track path: acrossfade chain
+    inputs = []
+    for p, _ in picked:
+        inputs.extend(["-i", str(p)])
+    filter_parts = []
+    prev = "[0]"
+    for i in range(1, len(picked)):
+        out_tag = "[out]" if i == len(picked) - 1 else f"[a{i}]"
+        filter_parts.append(
+            f"{prev}[{i}]acrossfade=d={crossfade_sec}:c1=tri:c2=tri{out_tag}"
+        )
+        prev = out_tag
+    filter_complex = ";".join(filter_parts)
+
+    cmd = ["ffmpeg", "-y"] + inputs + [
+        "-filter_complex", filter_complex,
+        "-map", "[out]",
+        "-t", str(needed_sec),
+        "-codec:a", "libmp3lame", "-b:a", "192k",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  Music chain failed: {result.stderr[-400:]}")
+        # Fallback: copy the first track alone so the pipeline still proceeds
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(picked[0][0]),
+             "-t", str(needed_sec),
+             "-codec:a", "libmp3lame", "-b:a", "192k",
+             str(output_path)],
+            capture_output=True, check=True,
+        )
+        return str(output_path)
+
+    names = " + ".join(Path(p).name for p, _ in picked)
+    print(f"  Music chain ({len(picked)} tracks, ~{_total():.0f}s -> {needed_sec:.0f}s): {names}")
+    return str(output_path)
 
 
 def _cleanup_orphan_storage(video_storage_path, thumb_storage_path):
