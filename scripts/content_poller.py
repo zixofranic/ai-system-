@@ -349,7 +349,55 @@ def run_youtube_uploader():
     return result.returncode
 
 
+PID_FILE = Path("C:/AI/system/scripts/content_poller.pid")
+
+
+def _acquire_singleton_lock():
+    # Refuse to start if another content_poller is already running.
+    # Two parallel pollers caused duplicate YouTube uploads (both cycles
+    # found the same approved row, both spawned uploader subprocesses).
+    # Writes the current PID to a file; on startup, checks if the recorded
+    # PID is alive. Stale PID files (from crashed previous runs) are
+    # cleaned up automatically.
+    if PID_FILE.exists():
+        try:
+            prev_pid = int(PID_FILE.read_text().strip())
+        except (ValueError, OSError):
+            prev_pid = None
+        if prev_pid and prev_pid != os.getpid():
+            alive = False
+            try:
+                # On Windows, signal 0 doesn't exist; use psutil-style check
+                # via os.kill with signal 0 (raises OSError if dead).
+                if sys.platform == "win32":
+                    import ctypes
+                    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                    h = ctypes.windll.kernel32.OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION, False, prev_pid
+                    )
+                    if h:
+                        exit_code = ctypes.c_ulong()
+                        ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(exit_code))
+                        ctypes.windll.kernel32.CloseHandle(h)
+                        alive = exit_code.value == 259  # STILL_ACTIVE
+                else:
+                    os.kill(prev_pid, 0)
+                    alive = True
+            except (OSError, PermissionError):
+                alive = False
+            if alive:
+                print(f"FATAL: another content_poller is already running (PID {prev_pid}).")
+                print(f"       Stop it first, or delete {PID_FILE} if you're sure it's dead.")
+                sys.exit(1)
+            else:
+                print(f"  Stale PID file ({prev_pid} not alive) — cleaning up.")
+    PID_FILE.write_text(str(os.getpid()))
+    import atexit
+    atexit.register(lambda: PID_FILE.unlink(missing_ok=True))
+
+
 def main():
+    _acquire_singleton_lock()
     print("=" * 60)
     print("  CONTENT POLLER")
     print(f"  Checking Supabase every {POLL_INTERVAL // 60} minutes")

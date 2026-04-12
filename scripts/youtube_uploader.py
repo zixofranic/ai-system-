@@ -95,14 +95,22 @@ def _fetch_content(content_id: str) -> dict:
 
 
 def _fetch_approved_content() -> list:
-    """
-    Return all content rows with status='approved' and a video_drive_url set,
-    joined with channel settings.
-    """
+    # Return content rows that should be uploaded to YouTube:
+    #   - status=approved
+    #   - has a playable video (storage path or drive URL)
+    #   - NOT already uploaded (youtube_video_id IS NULL) — idempotency guard
+    #   - flag is set (generation_params->youtube_publish_requested = true)
+    # The youtube_video_id guard is the fix for a real duplicate-upload bug:
+    # two content_poller processes were running in parallel, both saw the
+    # same approved row, both spawned uploader subprocesses, both uploaded
+    # to YouTube, only one got to write youtube_video_id back to the DB —
+    # leaving an orphan YouTube video with no DB mapping.
     url = (
         f"{SUPABASE_URL}/rest/v1/content"
         f"?status=eq.approved"
         f"&or=(video_drive_url.not.is.null,video_storage_path.not.is.null)"
+        f"&youtube_video_id=is.null"
+        f"&generation_params->youtube_publish_requested=eq.true"
         f"&deleted_at=is.null"
         f"&order=created_at.asc"
         f"&select=*,channels:channel_id(id,name,slug,settings)"
