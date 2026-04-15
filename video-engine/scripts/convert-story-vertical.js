@@ -1,20 +1,24 @@
 #!/usr/bin/env node
 /**
- * Convert a condensed story into a 60-second vertical (9:16) Remotion timeline.
+ * Convert a standalone 60-second vertical story into a 9:16 Remotion timeline.
  *
- * Companion format to `convert-story.js` (horizontal 6-min version).
- * Uses the same sentence-build progressive captions as horizontal stories, but
- * the background is pan-and-scan across existing landscape art rather than a
- * separate image per scene.
+ * Each art path in art-paths.json is ONE full portrait image for ONE scene
+ * (matches the scene-first Python pipeline, which generates fresh 832x1216
+ * SDXL art per scene — no more pan-and-scan of landscape art).
+ *
+ * When --scene-timings is provided, uses those exact boundaries (derived
+ * from each scene's narration via Whisper alignment). Otherwise falls back
+ * to even-split snapped to sentence boundaries.
  *
  * Usage:
  *   node convert-story-vertical.js \
- *     --script condensed_script.json \
+ *     --script script.json \
  *     --timestamps timestamps.json \
  *     --art-paths art_paths.json \
+ *     --scene-timings scene_timings.json \
  *     --voice voice.mp3 \
  *     --music C:/path/to/music.mp3 \
- *     --output 2026-04-09-story-vertical-seneca \
+ *     --output 2026-04-14-story-vertical-seneca \
  *     --format story_vertical
  */
 
@@ -35,6 +39,9 @@ const artPaths = JSON.parse(fs.readFileSync(args["art-paths"], "utf-8"));
 const voicePath = args.voice;
 const musicPath = args.music || null;
 const outputName = args.output || "story-vertical";
+const sceneTimingsRaw = args["scene-timings"]
+  ? JSON.parse(fs.readFileSync(args["scene-timings"], "utf-8"))
+  : null;
 
 const WIDTH = 1080;
 const HEIGHT = 1920;
@@ -62,17 +69,28 @@ function getAudioDurationMs(audioPath) {
 const voiceFileEndMs = getAudioDurationMs(voicePath);
 // +120ms safety pad so the very last phoneme doesn't clip on playback
 const voiceEndMs = voiceFileEndMs + 120;
-const totalDurationMs = voiceEndMs + VOICE_START_MS + 800; // 800ms tail
+// 2000ms tail — ~1.5s of final image holding after the voice stops, then the
+// last element's exitTransition fade plays out. 800ms was too abrupt; user
+// reported it felt like the video cut mid-breath.
+const TAIL_MS = 2000;
+const totalDurationMs = voiceEndMs + VOICE_START_MS + TAIL_MS;
 
 console.log(`Story vertical: ${WIDTH}x${HEIGHT}  duration ${(totalDurationMs / 1000).toFixed(1)}s`);
 
 // --- Scene distribution ---
-// We want 3-4 scenes for a ~60s video. Reuse landscape art paths in order.
+// One art path = one scene. Scene-first pipeline generates the exact number
+// of portrait images needed.
 const validArts = artPaths.filter((p) => p !== null);
-const numScenes = Math.min(4, Math.max(2, validArts.length));
-console.log(`Using ${numScenes} scene(s) from ${validArts.length} available art image(s)`);
+const numScenes = validArts.length;
+if (numScenes === 0) {
+  console.error("No valid art paths — cannot build timeline");
+  process.exit(1);
+}
+console.log(
+  `Using ${numScenes} scene(s) — ${sceneTimingsRaw ? "explicit timings (scene-first)" : "even-split fallback"}`,
+);
 
-// Even time split across scenes, snapped to sentence boundaries
+// Even-split fallback (only used when --scene-timings not provided)
 function findSentenceBoundaries() {
   const boundaries = [{ wordIndex: 0, timeMs: 0 }];
   for (let i = 0; i < timestamps.length; i++) {
@@ -85,31 +103,49 @@ function findSentenceBoundaries() {
   return boundaries;
 }
 
-const sentenceBounds = findSentenceBoundaries();
-const sceneBreaks = [];
-const targetSceneDurationMs = voiceEndMs / numScenes;
-for (let s = 1; s < numScenes; s++) {
-  const idealMs = s * targetSceneDurationMs;
-  let bestIdx = 0;
-  let bestDist = Infinity;
-  for (let b = 0; b < sentenceBounds.length; b++) {
-    const d = Math.abs(sentenceBounds[b].timeMs - idealMs);
-    if (d < bestDist) {
-      bestDist = d;
-      bestIdx = b;
+function distributeEven() {
+  const sentenceBounds = findSentenceBoundaries();
+  const sceneBreaks = [];
+  const targetSceneDurationMs = voiceEndMs / numScenes;
+  for (let s = 1; s < numScenes; s++) {
+    const idealMs = s * targetSceneDurationMs;
+    let bestIdx = 0;
+    let bestDist = Infinity;
+    for (let b = 0; b < sentenceBounds.length; b++) {
+      const d = Math.abs(sentenceBounds[b].timeMs - idealMs);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = b;
+      }
     }
+    sceneBreaks.push(sentenceBounds[bestIdx].timeMs);
   }
-  sceneBreaks.push(sentenceBounds[bestIdx].timeMs);
+  const out = [];
+  let prev = 0;
+  for (let s = 0; s < numScenes; s++) {
+    const startMs = prev;
+    const endMs = s < numScenes - 1 ? sceneBreaks[s] : voiceEndMs;
+    out.push({ startMs, endMs });
+    prev = endMs;
+  }
+  return out;
 }
 
-const sceneTimings = [];
-let prevMs = 0;
-for (let s = 0; s < numScenes; s++) {
-  const startMs = prevMs;
-  const endMs = s < numScenes - 1 ? sceneBreaks[s] : voiceEndMs;
-  sceneTimings.push({ startMs, endMs });
-  prevMs = endMs;
+// Use explicit scene timings when Python provided them; trim/pad to match
+// the actual image count and snap the first/last to 0/voiceEndMs so there
+// is never a gap at the head or tail of the video.
+function useExplicitTimings() {
+  const trimmed = sceneTimingsRaw.slice(0, numScenes);
+  while (trimmed.length < numScenes) {
+    const last = trimmed[trimmed.length - 1] || { startMs: 0, endMs: voiceEndMs };
+    trimmed.push({ startMs: last.endMs, endMs: voiceEndMs });
+  }
+  trimmed[0].startMs = 0;
+  trimmed[trimmed.length - 1].endMs = voiceEndMs;
+  return trimmed;
 }
+
+const sceneTimings = sceneTimingsRaw ? useExplicitTimings() : distributeEven();
 
 // --- Output directory ---
 const destDir = path.join(__dirname, "..", "public", "content", outputName);
@@ -120,20 +156,33 @@ fs.mkdirSync(imagesDir, { recursive: true });
 fs.mkdirSync(audioDir, { recursive: true });
 
 // --- Scene elements ---
+// One portrait image per scene — no reuse, no pan-and-scan. Each image is
+// already 832x1216 (scales to 1080x1920). Add a gentle Ken-Burns zoom so
+// static shorts don't feel frozen.
 const elements = [];
 for (let i = 0; i < numScenes; i++) {
-  const artPath = validArts[i % validArts.length];
+  const artPath = validArts[i];
   const imgName = `scene${i + 1}`;
   fs.copyFileSync(artPath, path.join(imagesDir, `${imgName}.png`));
 
   const { startMs, endMs } = sceneTimings[i];
+  const startAbs = Math.round(startMs + VOICE_START_MS);
+  const endAbs = Math.round(endMs + VOICE_START_MS);
   elements.push({
-    startMs: Math.round(startMs + VOICE_START_MS),
-    endMs: Math.round(endMs + VOICE_START_MS),
+    startMs: startAbs,
+    endMs: endAbs,
     imageUrl: imgName,
     enterTransition: "fade",
     exitTransition: "fade",
-    animations: [],
+    animations: [
+      {
+        type: "scale",
+        from: i % 2 === 0 ? 1.0 : 1.05,
+        to: i % 2 === 0 ? 1.05 : 1.0,
+        startMs: startAbs,
+        endMs: endAbs,
+      },
+    ],
   });
 }
 
@@ -214,13 +263,43 @@ const audioElements = [
 ];
 
 if (musicPath && fs.existsSync(musicPath)) {
-  fs.copyFileSync(musicPath, path.join(audioDir, "music.mp3"));
+  // Duck the music so the closing line is heard clearly, not buried under
+  // strings. 100% until voiceEnd-3s, linear ramp to 30% over 1s, hold 30%
+  // through tail. Shorter ramp than horizontal since 60s videos have less
+  // room to breathe.
+  const duckStartSec = Math.max(0.5, (voiceEndMs - 3000) / 1000);
+  const rampSec = 1.0;
+  const target = 0.3;
+  const drop = 1 - target;
+  const volExpr =
+    `if(lt(t,${duckStartSec}),1,` +
+    `if(lt(t,${duckStartSec + rampSec}),1-${drop}*(t-${duckStartSec})/${rampSec},` +
+    `${target}))`;
+  const musicDst = path.join(audioDir, "music.mp3");
+  try {
+    execSync(
+      `ffmpeg -y -i "${musicPath}" -af "volume='${volExpr}':eval=frame" ` +
+        `-codec:a libmp3lame -b:a 192k "${musicDst}"`,
+      { stdio: "pipe" },
+    );
+    console.log(`Music ducked (100% -> ${target * 100}% at ${duckStartSec.toFixed(1)}s over ${rampSec}s)`);
+  } catch (e) {
+    console.warn(`Music ducking failed (${e.message}); falling back to plain copy`);
+    fs.copyFileSync(musicPath, musicDst);
+  }
   audioElements.push({
     startMs: 0,
     endMs: Math.round(totalDurationMs),
     audioUrl: "music",
   });
 }
+
+// Gibran detection — matches "Gibran" and "Gibran Khalil Gibran" (and
+// respects script.channel when set). Previously `=== "Gibran"` missed the
+// full name and fell through to the Wisdom watermark on Gibran videos.
+const isGibran =
+  (script.channel || "").toLowerCase() === "gibran" ||
+  (script.philosopher || "").toLowerCase().includes("gibran");
 
 // --- Timeline + metadata ---
 const timeline = {
@@ -234,13 +313,8 @@ const timeline = {
     height: HEIGHT,
     fps: FPS,
     philosopher: script.philosopher,
-    channel:
-      script.channel ||
-      (script.philosopher === "Gibran" ? "gibran" : "wisdom"),
-    watermark:
-      script.philosopher === "Gibran"
-        ? "Gibran Khalil Gibran"
-        : "Deep Echoes of Wisdom",
+    channel: isGibran ? "gibran" : "wisdom",
+    watermark: isGibran ? "Gibran Khalil Gibran" : "Deep Echoes of Wisdom",
     equalizerColor: script.equalizerColor || "#D4AF37",
   },
 };
@@ -251,14 +325,10 @@ const metadata = {
   height: HEIGHT,
   fps: FPS,
   philosopher: script.philosopher,
-  channel:
-    script.channel || (script.philosopher === "Gibran" ? "gibran" : "wisdom"),
+  channel: isGibran ? "gibran" : "wisdom",
   closingAttribution:
     script.closing_attribution || `Inspired by ${script.philosopher}`,
-  watermark:
-    script.philosopher === "Gibran"
-      ? "Gibran Khalil Gibran"
-      : "Deep Echoes of Wisdom",
+  watermark: isGibran ? "Gibran Khalil Gibran" : "Deep Echoes of Wisdom",
 };
 
 fs.writeFileSync(

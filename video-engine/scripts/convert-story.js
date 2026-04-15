@@ -35,6 +35,15 @@ const musicPath = args.music || null;
 const outputName = args.output || "story";
 const format = args.format || "story"; // story | short | midform | longform
 
+// Scene-first path: when the Python pipeline emitted scene timings derived
+// from the storyboarded scenes, use those exact boundaries instead of
+// even-splitting the audio. Each image then aligns with the narration
+// words for its own scene rather than landing on a mechanical chunk.
+// Falls back to even-split when the file is absent (legacy scripts).
+const sceneTimingsRaw = args["scene-timings"]
+  ? JSON.parse(fs.readFileSync(args["scene-timings"], "utf-8"))
+  : null;
+
 const VOICE_START_MS = 2000;
 const SENTENCE_ENDINGS = new Set([".", "!", "?", ";", ":"]);
 
@@ -73,7 +82,11 @@ const targetSceneDurationMs = voiceEndMs / numScenes;
 
 console.log(`Total duration: ${(totalDurationMs / 1000).toFixed(1)}s`);
 console.log(`Scenes: ${numScenes}`);
-console.log(`Target per scene: ${(targetSceneDurationMs / 1000).toFixed(1)}s`);
+if (sceneTimingsRaw) {
+  console.log(`Mode: scene-first (using ${sceneTimingsRaw.length} explicit timings)`);
+} else {
+  console.log(`Mode: even-split. Target per scene: ${(targetSceneDurationMs / 1000).toFixed(1)}s`);
+}
 
 // --- Find sentence boundaries in word timestamps ---
 // Returns array of { wordIndex, timeMs } for each sentence end
@@ -126,7 +139,29 @@ function distributeScenes() {
   return scenes;
 }
 
-const sceneTimings = distributeScenes();
+// --- Use explicit scene timings from the Python pipeline (scene-first mode) ---
+// `sceneTimingsRaw` holds one entry per storyboarded scene; the number of
+// rendered scenes is bounded by the number of valid art paths. If the
+// counts mismatch (e.g., one image failed to generate), we trim or pad to
+// match `numScenes` so every art path still gets a window.
+function useExplicitTimings() {
+  const trimmed = sceneTimingsRaw.slice(0, numScenes);
+  // Pad: if we have fewer timings than images (image-count > scene-count
+  // shouldn't happen with scene-first, but guard anyway), share the last
+  // window.
+  while (trimmed.length < numScenes) {
+    const last = trimmed[trimmed.length - 1] || { startMs: 0, endMs: voiceEndMs };
+    trimmed.push({ startMs: last.endMs, endMs: voiceEndMs });
+  }
+  // Force the last window to extend to voiceEndMs so we never leave a gap
+  // of silence between final image and audio end.
+  trimmed[trimmed.length - 1].endMs = voiceEndMs;
+  // Force the first window to start at 0 so we never leave a gap at the head.
+  trimmed[0].startMs = 0;
+  return trimmed;
+}
+
+const sceneTimings = sceneTimingsRaw ? useExplicitTimings() : distributeScenes();
 
 // Log distribution
 for (let i = 0; i < sceneTimings.length; i++) {
@@ -258,7 +293,29 @@ for (let i = 0; i < textElements.length - 1; i++) {
 // --- Audio ---
 fs.copyFileSync(voicePath, path.join(audioDir, "voice.mp3"));
 if (musicPath && fs.existsSync(musicPath)) {
-  fs.copyFileSync(musicPath, path.join(audioDir, "music.mp3"));
+  // Duck the music across the final seconds of the narration so the closing
+  // line rings out clear instead of being buried. 100% until voiceEnd-4s,
+  // linear ramp to 30% over 1.5s, hold at 30% through the tail fade.
+  const duckStartSec = Math.max(0.5, (voiceEndMs - 4000) / 1000);
+  const rampSec = 1.5;
+  const target = 0.3;
+  const drop = 1 - target; // 0.7
+  const volExpr =
+    `if(lt(t,${duckStartSec}),1,` +
+    `if(lt(t,${duckStartSec + rampSec}),1-${drop}*(t-${duckStartSec})/${rampSec},` +
+    `${target}))`;
+  const musicDst = path.join(audioDir, "music.mp3");
+  try {
+    execSync(
+      `ffmpeg -y -i "${musicPath}" -af "volume='${volExpr}':eval=frame" ` +
+        `-codec:a libmp3lame -b:a 192k "${musicDst}"`,
+      { stdio: "pipe" },
+    );
+    console.log(`Music ducked (100% -> ${target * 100}% at ${duckStartSec.toFixed(1)}s over ${rampSec}s)`);
+  } catch (e) {
+    console.warn(`Music ducking failed (${e.message}); falling back to plain copy`);
+    fs.copyFileSync(musicPath, musicDst);
+  }
 }
 
 const audioElements = [
@@ -285,18 +342,22 @@ const timeline = {
   audio: audioElements,
 };
 
+// Gibran detection — philosopher name is sometimes "Gibran", sometimes
+// "Gibran Khalil Gibran". Case-insensitive substring match catches both.
+// Previously `=== "Gibran"` failed on the full name and Gibran videos
+// incorrectly got the "Deep Echoes of Wisdom" watermark.
+const isGibran = (script.philosopher || "").toLowerCase().includes("gibran")
+  || (script.channel || "").toLowerCase() === "gibran";
+
 const metadata = {
   format,
   width: config.width,
   height: config.height,
   fps: config.fps,
   philosopher: script.philosopher,
-  channel: script.philosopher === "Gibran" ? "gibran" : "wisdom",
+  channel: isGibran ? "gibran" : "wisdom",
   closingAttribution: script.closing_attribution,
-  watermark:
-    script.philosopher === "Gibran"
-      ? "Gibran Khalil Gibran"
-      : "Deep Echoes of Wisdom",
+  watermark: isGibran ? "Gibran Khalil Gibran" : "Deep Echoes of Wisdom",
 };
 
 fs.writeFileSync(
