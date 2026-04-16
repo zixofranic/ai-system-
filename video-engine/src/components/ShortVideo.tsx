@@ -1,4 +1,5 @@
 import { Audio } from "@remotion/media";
+import { fitText } from "@remotion/layout-utils";
 import {
   AbsoluteFill,
   Img,
@@ -312,6 +313,15 @@ const ShortBackground: React.FC<{
   );
 };
 
+// Tuning for auto-fit quote text. Quote box is ~980px wide (1080 canvas − 50px
+// side padding × 2 − 52px internal padding × 2 − ~12px stroke buffer).
+// Tall box caps vertical extent to ~1300px so very long monologues (e.g. NA
+// character shorts) shrink instead of overflowing behind the equalizer.
+const QUOTE_MAX_FONT = 64;
+const QUOTE_MIN_FONT = 28;
+const QUOTE_BOX_WIDTH = 900;
+const QUOTE_BOX_MAX_HEIGHT = 1300;
+
 const QuoteOverlay: React.FC<{ text: string }> = ({ text }) => {
   const frame = useCurrentFrame();
   const { fps, durationInFrames } = useVideoConfig();
@@ -334,6 +344,33 @@ const QuoteOverlay: React.FC<{ text: string }> = ({ text }) => {
   const opacity = Math.min(interpolate(enter, [0, 1], [0, 1]), fadeOut);
   const translateY = interpolate(enter, [0, 1], [40, 0]);
 
+  // Fit the full quote within the box width. fitText only constrains width,
+  // so for very long text we also scale down proportionally based on the
+  // estimated wrapped height vs. the vertical cap.
+  const quoted = `“${text}”`;
+  const fitted = fitText({
+    fontFamily: "Georgia, serif",
+    fontWeight: "bold",
+    text: quoted,
+    withinWidth: QUOTE_BOX_WIDTH,
+  });
+
+  let fontSize = Math.min(QUOTE_MAX_FONT, fitted.fontSize);
+
+  // Estimate wrapped line count at this font size: ratio of full-text width
+  // (at current fontSize) to available width. Clamp to at least 1 line.
+  const lineHeightRatio = 1.375; // matches previous 88/64 ratio
+  const widthAtSize = (fitted.width * fontSize) / fitted.fontSize;
+  const estimatedLines = Math.max(1, Math.ceil(widthAtSize / QUOTE_BOX_WIDTH));
+  const estimatedHeight = estimatedLines * fontSize * lineHeightRatio;
+
+  if (estimatedHeight > QUOTE_BOX_MAX_HEIGHT) {
+    fontSize = Math.max(
+      QUOTE_MIN_FONT,
+      Math.floor(fontSize * (QUOTE_BOX_MAX_HEIGHT / estimatedHeight)),
+    );
+  }
+
   return (
     <AbsoluteFill
       style={{
@@ -349,14 +386,20 @@ const QuoteOverlay: React.FC<{ text: string }> = ({ text }) => {
           borderRadius: 16,
           padding: "48px 52px",
           maxWidth: "95%",
+          maxHeight: QUOTE_BOX_MAX_HEIGHT,
+          overflow: "hidden",
           opacity,
           transform: `translateY(${translateY}px)`,
+          WebkitMaskImage:
+            "linear-gradient(180deg, #000 0%, #000 88%, transparent 100%)",
+          maskImage:
+            "linear-gradient(180deg, #000 0%, #000 88%, transparent 100%)",
         }}
       >
         <div
           style={{
-            fontSize: 64,
-            lineHeight: "88px",
+            fontSize,
+            lineHeight: `${Math.round(fontSize * lineHeightRatio)}px`,
             color: "white",
             fontFamily: "Georgia, serif",
             fontWeight: "bold",
@@ -365,7 +408,7 @@ const QuoteOverlay: React.FC<{ text: string }> = ({ text }) => {
             textShadow: "0 2px 8px rgba(0,0,0,0.6)",
           }}
         >
-          &ldquo;{text}&rdquo;
+          {quoted}
         </div>
       </div>
     </AbsoluteFill>
