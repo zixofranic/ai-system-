@@ -342,12 +342,8 @@ const timeline = {
   audio: audioElements,
 };
 
-// Gibran detection — philosopher name is sometimes "Gibran", sometimes
-// "Gibran Khalil Gibran". Case-insensitive substring match catches both.
-// Previously `=== "Gibran"` failed on the full name and Gibran videos
-// incorrectly got the "Deep Echoes of Wisdom" watermark.
-const isGibran = (script.philosopher || "").toLowerCase().includes("gibran")
-  || (script.channel || "").toLowerCase() === "gibran";
+const { resolveChannelMeta } = require("./lib/channel-meta");
+const { channel, watermark } = resolveChannelMeta(script);
 
 const metadata = {
   format,
@@ -355,9 +351,9 @@ const metadata = {
   height: config.height,
   fps: config.fps,
   philosopher: script.philosopher,
-  channel: isGibran ? "gibran" : "wisdom",
+  channel,
   closingAttribution: script.closing_attribution,
-  watermark: isGibran ? "Gibran Khalil Gibran" : "Deep Echoes of Wisdom",
+  watermark,
 };
 
 fs.writeFileSync(

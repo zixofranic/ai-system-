@@ -313,14 +313,20 @@ const ShortBackground: React.FC<{
   );
 };
 
-// Tuning for auto-fit quote text. Quote box is ~980px wide (1080 canvas − 50px
-// side padding × 2 − 52px internal padding × 2 − ~12px stroke buffer).
-// Tall box caps vertical extent to ~1300px so very long monologues (e.g. NA
-// character shorts) shrink instead of overflowing behind the equalizer.
-const QUOTE_MAX_FONT = 64;
-const QUOTE_MIN_FONT = 28;
-const QUOTE_BOX_WIDTH = 900;
-const QUOTE_BOX_MAX_HEIGHT = 1300;
+// Quote overlay auto-scrolls long text with a dual alpha mask (fade in at top,
+// fade out at bottom). Keeps a comfortable reading font size (~56px) instead
+// of shrinking the text when the quote is a monologue-length block — common
+// for NA/AA recovery shorts where "the quote" is a full character passage.
+//
+// Short quotes (<= box height) don't scroll; the dual-mask is still applied
+// but sits fully inside the black region so there's no visible fade.
+const QUOTE_FONT = 56;
+const QUOTE_LINE_RATIO = 1.42;
+const QUOTE_BOX_WIDTH = 900; // inner text column width, matches padding math
+const QUOTE_BOX_HEIGHT = 1200; // max vertical extent before scroll kicks in
+const QUOTE_V_PAD = 56; // top/bottom internal padding of the black box
+const QUOTE_SCROLL_START_PCT = 0.12;
+const QUOTE_SCROLL_END_PCT = 0.92;
 
 const QuoteOverlay: React.FC<{ text: string }> = ({ text }) => {
   const frame = useCurrentFrame();
@@ -344,32 +350,52 @@ const QuoteOverlay: React.FC<{ text: string }> = ({ text }) => {
   const opacity = Math.min(interpolate(enter, [0, 1], [0, 1]), fadeOut);
   const translateY = interpolate(enter, [0, 1], [40, 0]);
 
-  // Fit the full quote within the box width. fitText only constrains width,
-  // so for very long text we also scale down proportionally based on the
-  // estimated wrapped height vs. the vertical cap.
   const quoted = `“${text}”`;
+
+  // Estimate wrapped text height. fitText gives single-line width; divide by
+  // our column width to estimate lines. Italic Georgia averages ~0.48em per
+  // char, but fitText already accounts for that — we just need line count.
   const fitted = fitText({
     fontFamily: "Georgia, serif",
+    fontStyle: "italic",
     fontWeight: "bold",
     text: quoted,
     withinWidth: QUOTE_BOX_WIDTH,
   });
+  // fitted.fontSize is the size at which the text fits on ONE line within
+  // QUOTE_BOX_WIDTH. Its actual width at that size is QUOTE_BOX_WIDTH.
+  // Scale to our target font to find how wide it would be; divide by
+  // column width to get an integer line count.
+  const widthAtTarget = (QUOTE_BOX_WIDTH * QUOTE_FONT) / fitted.fontSize;
+  const estimatedLines = Math.max(1, Math.ceil(widthAtTarget / QUOTE_BOX_WIDTH));
+  const textHeight = estimatedLines * QUOTE_FONT * QUOTE_LINE_RATIO;
 
-  let fontSize = Math.min(QUOTE_MAX_FONT, fitted.fontSize);
+  const visibleHeight = QUOTE_BOX_HEIGHT - 2 * QUOTE_V_PAD;
+  const scrollDistance = Math.max(0, textHeight - visibleHeight);
+  const needsScroll = scrollDistance > 0;
 
-  // Estimate wrapped line count at this font size: ratio of full-text width
-  // (at current fontSize) to available width. Clamp to at least 1 line.
-  const lineHeightRatio = 1.375; // matches previous 88/64 ratio
-  const widthAtSize = (fitted.width * fontSize) / fitted.fontSize;
-  const estimatedLines = Math.max(1, Math.ceil(widthAtSize / QUOTE_BOX_WIDTH));
-  const estimatedHeight = estimatedLines * fontSize * lineHeightRatio;
+  // When text fits, keep the box compact so it centers nicely over the art.
+  const boxHeight = needsScroll
+    ? QUOTE_BOX_HEIGHT
+    : Math.min(QUOTE_BOX_HEIGHT, textHeight + 2 * QUOTE_V_PAD);
 
-  if (estimatedHeight > QUOTE_BOX_MAX_HEIGHT) {
-    fontSize = Math.max(
-      QUOTE_MIN_FONT,
-      Math.floor(fontSize * (QUOTE_BOX_MAX_HEIGHT / estimatedHeight)),
-    );
-  }
+  // Scroll ramp — linger on the first lines, scroll through the middle, then
+  // linger on the last lines so the viewer has time to read top and bottom.
+  const scrollStart = Math.floor(durationInFrames * QUOTE_SCROLL_START_PCT);
+  const scrollEnd = Math.floor(durationInFrames * QUOTE_SCROLL_END_PCT);
+  const scrollY = needsScroll
+    ? interpolate(frame, [scrollStart, scrollEnd], [0, -scrollDistance], {
+        extrapolateLeft: "clamp",
+        extrapolateRight: "clamp",
+      })
+    : 0;
+
+  // Dual alpha mask — transparent at top 8%, transparent at bottom 8%, fully
+  // visible in between. Creates the fade-in / fade-out band around the scroll.
+  // Only applied when text actually scrolls so short quotes aren't faded.
+  const maskImage = needsScroll
+    ? "linear-gradient(180deg, transparent 0%, #000 10%, #000 90%, transparent 100%)"
+    : undefined;
 
   return (
     <AbsoluteFill
@@ -384,28 +410,28 @@ const QuoteOverlay: React.FC<{ text: string }> = ({ text }) => {
         style={{
           backgroundColor: "rgba(0, 0, 0, 0.5)",
           borderRadius: 16,
-          padding: "48px 52px",
+          padding: `${QUOTE_V_PAD}px 52px`,
           maxWidth: "95%",
-          maxHeight: QUOTE_BOX_MAX_HEIGHT,
+          height: boxHeight,
           overflow: "hidden",
           opacity,
           transform: `translateY(${translateY}px)`,
-          WebkitMaskImage:
-            "linear-gradient(180deg, #000 0%, #000 88%, transparent 100%)",
-          maskImage:
-            "linear-gradient(180deg, #000 0%, #000 88%, transparent 100%)",
+          WebkitMaskImage: maskImage,
+          maskImage,
         }}
       >
         <div
           style={{
-            fontSize,
-            lineHeight: `${Math.round(fontSize * lineHeightRatio)}px`,
+            fontSize: QUOTE_FONT,
+            lineHeight: `${Math.round(QUOTE_FONT * QUOTE_LINE_RATIO)}px`,
             color: "white",
             fontFamily: "Georgia, serif",
             fontWeight: "bold",
             fontStyle: "italic",
             textAlign: "center",
             textShadow: "0 2px 8px rgba(0,0,0,0.6)",
+            transform: `translateY(${scrollY}px)`,
+            willChange: "transform",
           }}
         >
           {quoted}

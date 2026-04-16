@@ -294,12 +294,8 @@ if (musicPath && fs.existsSync(musicPath)) {
   });
 }
 
-// Gibran detection — matches "Gibran" and "Gibran Khalil Gibran" (and
-// respects script.channel when set). Previously `=== "Gibran"` missed the
-// full name and fell through to the Wisdom watermark on Gibran videos.
-const isGibran =
-  (script.channel || "").toLowerCase() === "gibran" ||
-  (script.philosopher || "").toLowerCase().includes("gibran");
+const { resolveChannelMeta } = require("./lib/channel-meta");
+const { channel, watermark } = resolveChannelMeta(script);
 
 // --- Timeline + metadata ---
 const timeline = {
@@ -313,8 +309,8 @@ const timeline = {
     height: HEIGHT,
     fps: FPS,
     philosopher: script.philosopher,
-    channel: isGibran ? "gibran" : "wisdom",
-    watermark: isGibran ? "Gibran Khalil Gibran" : "Deep Echoes of Wisdom",
+    channel,
+    watermark,
     equalizerColor: script.equalizerColor || "#D4AF37",
   },
 };
@@ -325,10 +321,10 @@ const metadata = {
   height: HEIGHT,
   fps: FPS,
   philosopher: script.philosopher,
-  channel: isGibran ? "gibran" : "wisdom",
+  channel,
   closingAttribution:
     script.closing_attribution || `Inspired by ${script.philosopher}`,
-  watermark: isGibran ? "Gibran Khalil Gibran" : "Deep Echoes of Wisdom",
+  watermark,
 };
 
 fs.writeFileSync(
