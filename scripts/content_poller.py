@@ -25,6 +25,7 @@ POLL_INTERVAL = 300  # 5 minutes
 ORCHESTRATOR = Path("C:/AI/system/scripts/orchestrator.py")
 YOUTUBE_UPLOADER = Path("C:/AI/system/scripts/youtube_uploader.py")
 TIKTOK_UPLOADER = Path("C:/AI/system/scripts/tiktok_uploader.py")
+META_UPLOADER = Path("C:/AI/system/scripts/meta_uploader.py")
 COMFYUI_DIR = Path("C:/AI/system/ComfyUI")
 COMFYUI_PORT = 8188
 CONDA_BAT = Path("C:/Users/ziadf/miniconda3/condabin/conda.bat")
@@ -63,13 +64,14 @@ def check_queued_content():
 
 
 def check_tiktok_content():
-    """Check for approved SHORT content with tiktok_publish_requested and no tiktok_video_id.
-    Only shorts (9:16 vertical) are compatible with TikTok."""
+    """Check for approved/published SHORT content with tiktok_publish_requested and no tiktok_video_id.
+    Only shorts (9:16 vertical) are compatible with TikTok.
+    Must include 'published' status — content already uploaded to YouTube has status=published."""
     try:
         url = f"{SUPABASE_URL}/rest/v1/content"
         params = {
             "select": "id,philosopher,topic,channel_id,format",
-            "status": "eq.approved",
+            "status": "in.(approved,published)",
             "format": "eq.short",
             "or": "(video_drive_url.not.is.null,video_storage_path.not.is.null)",
             "generation_params->tiktok_publish_requested": "eq.true",
@@ -100,6 +102,56 @@ def run_tiktok_uploader():
                 print(f"    {line}")
     else:
         print(f"  TikTok uploader failed (exit {result.returncode})")
+        if result.stderr:
+            print(f"  Error: {result.stderr[:300]}")
+    return result.returncode
+
+
+def check_meta_content():
+    """Find approved/published shorts flagged for Meta publish with no
+    existing fb/ig post IDs."""
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/content"
+        params = {
+            "select": "id,philosopher,topic,channel_id,format",
+            "status": "in.(approved,published)",
+            "format": "eq.short",
+            "or": "(video_drive_url.not.is.null,video_storage_path.not.is.null)",
+            "generation_params->meta_publish_requested": "eq.true",
+            "deleted_at": "is.null",
+            "order": "created_at.asc",
+            "limit": "10",
+        }
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        items = resp.json() if resp.status_code == 200 else []
+        # Filter out rows that already have a meta_fb_post_id / meta_ig_post_id
+        # (generation_params is JSONB, so do it in Python to keep the query
+        # simple — matches how tiktok does it too).
+        return [
+            i for i in items
+            if not (i.get("generation_params") or {}).get("meta_fb_post_id")
+               and not (i.get("generation_params") or {}).get("meta_ig_post_id")
+        ]
+    except Exception as e:
+        print(f"  Error checking Meta: {e}")
+        return []
+
+
+def run_meta_uploader():
+    """Run meta_uploader.py to publish flagged content to FB Page + IG Reels."""
+    print("  Running Meta uploader...")
+    result = subprocess.run(
+        [PYTHON_CHATTERBOX, str(META_UPLOADER)],
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        capture_output=True, text=True, timeout=3600,
+    )
+    if result.returncode == 0:
+        print("  Meta uploader completed")
+        if result.stdout:
+            for line in result.stdout.strip().split("\n")[-5:]:
+                print(f"    {line}")
+    else:
+        print(f"  Meta uploader failed (exit {result.returncode})")
         if result.stderr:
             print(f"  Error: {result.stderr[:300]}")
     return result.returncode
@@ -473,6 +525,17 @@ def main():
                 print(f"[{now}] TikTok publish batch complete.")
             else:
                 print(f"[{now}] No content awaiting TikTok upload.")
+
+            # --- Check for approved content to publish to Meta (FB + IG) ---
+            meta_items = check_meta_content()
+            if meta_items:
+                print(f"\n[{now}] Found {len(meta_items)} item(s) for Meta:")
+                for item in meta_items:
+                    print(f"  - [{item['id'][:8]}] {item.get('philosopher','?')}")
+                run_meta_uploader()
+                print(f"[{now}] Meta publish batch complete.")
+            else:
+                print(f"[{now}] No content awaiting Meta upload.")
 
             print(f"[{now}] Sleeping {POLL_INTERVAL // 60} min...")
 
