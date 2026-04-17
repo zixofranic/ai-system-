@@ -361,7 +361,10 @@ def render_remotion_video(
 
     # --- Render via Remotion CLI ---
     remotion_cmd = str(VIDEO_ENGINE / "node_modules" / ".bin" / "remotion.cmd")
-    render_cmd = f'"{remotion_cmd}" render {project_id} "{output_path}" --codec=h264 --crf=18'
+    # CRF 24 keeps 60-90s 1080x1920 shorts under ~25MB (Supabase Storage's
+    # 50MB per-object default). CRF 18 produced ~90MB+ files on the 90s AA
+    # monologue and the TUS upload rejected with 413 Maximum size exceeded.
+    render_cmd = f'"{remotion_cmd}" render {project_id} "{output_path}" --codec=h264 --crf=24'
     print(f"  Rendering: {render_cmd}")
 
     subprocess.run(
