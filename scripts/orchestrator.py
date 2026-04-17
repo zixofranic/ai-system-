@@ -65,7 +65,7 @@ WORK_DIR = Path("C:/AI/system/pipeline_work")
 # ---------------------------------------------------------------------------
 # Philosopher -> Style mappings
 # ---------------------------------------------------------------------------
-PHILOSOPHER_TO_LORA = {
+PERSONA_TO_LORA = {
     "Marcus Aurelius": "stoic_classical_v1",
     "Seneca": "stoic_classical_v1",
     "Epictetus": "stoic_classical_v1",
@@ -87,7 +87,7 @@ PHILOSOPHER_TO_LORA = {
     "Vivekananda": "vedic_sacred_v1",
 }
 
-PHILOSOPHER_TO_MUSIC_STYLE = {
+PERSONA_TO_MUSIC_STYLE = {
     "Marcus Aurelius": "stoic_classical",
     "Seneca": "stoic_classical",
     "Epictetus": "stoic_classical",
@@ -111,7 +111,7 @@ PHILOSOPHER_TO_MUSIC_STYLE = {
 
 # Explicit mapping from philosopher display name to Ollama model name.
 # Use this whenever the lowercase-with-underscores form doesn't match.
-PHILOSOPHER_TO_OLLAMA_MODEL = {
+PERSONA_TO_OLLAMA_MODEL = {
     "Marcus Aurelius": "marcus_aurelius",
     "Seneca": "seneca",
     "Epictetus": "epictetus",
@@ -131,10 +131,15 @@ PHILOSOPHER_TO_OLLAMA_MODEL = {
     "Da Vinci": "da_vinci",
     "Tesla": "tesla",
     "Vivekananda": "vivekananda",
+    # NA archetypes — custom Ollama models with persona + compliance baked into SYSTEM prompt.
+    # Modelfiles at C:\AI\na\ollama\Modelfile.{the_old_timer,the_sponsor,the_voice_of_the_rooms}
+    "The Old-Timer": "the_old_timer",
+    "The Sponsor": "the_sponsor",
+    "The Voice of the Rooms": "the_voice_of_the_rooms",
 }
 
 
-PHILOSOPHER_TO_VOICE_SETTINGS = {
+PERSONA_TO_VOICE_SETTINGS = {
     "Marcus Aurelius": {"exaggeration": 0.3},
     "Seneca": {"exaggeration": 0.5},
     "Epictetus": {"exaggeration": 0.6},
@@ -153,6 +158,34 @@ PHILOSOPHER_TO_VOICE_SETTINGS = {
     "Da Vinci": {"exaggeration": 0.4},
     "Tesla": {"exaggeration": 0.5},
     "Vivekananda": {"exaggeration": 0.5},
+    # NA archetypes
+    "The Old-Timer": {"exaggeration": 0.3},        # calm, steady narrator
+    "The Sponsor": {"exaggeration": 0.5},          # warm, direct
+    "The Voice of the Rooms": {"exaggeration": 0.4},  # honest, gentle
+}
+
+# ---------------------------------------------------------------------------
+# Voice ID routing — philosopher-specific wins, channel default otherwise
+# ---------------------------------------------------------------------------
+# ElevenLabs voice IDs per archetype (NA)
+PERSONA_TO_VOICE_ID = {
+    "The Old-Timer": "EkK5I93UQWFDigLMpZcX",
+    "The Sponsor": "VAnZB441uRGQ8uoZunqz",
+    "The Voice of the Rooms": "h2sm0NbeIZXHBzJOMYcQ",
+}
+
+# Chatterbox reference-audio filenames per archetype.
+# Populated only after Chatterbox passes the quality bar for an archetype.
+# Keys live in C:\AI\system\voice\recordings\.
+PERSONA_TO_CHATTERBOX_REF: dict = {
+    # "The Old-Timer": "na_old_timer_5min.wav",  # enable when CB quality passes
+}
+
+# Channel music pools — multi-style pool drawn from when picking a track.
+# Falls through to CHANNEL_DEFAULT_MUSIC_STYLE if the channel has no pool entry.
+CHANNEL_MUSIC_POOL = {
+    "na": ["stoic_classical", "gibran"],   # soft mixed pool per user direction 2026-04-16
+    "aa": ["stoic_classical", "gibran"],   # same soft pool — AA tone maps to NA aesthetic
 }
 
 EQUALIZER_COLORS = {
@@ -165,6 +198,8 @@ EQUALIZER_COLORS = {
     "aesthetic_gilded": "#FFD700",
     "renaissance_genius": "#CD853F",
     "vedic_sacred": "#FF8C00",
+    # NA uses the warm-gold sun color from the Fellows brand family
+    "recovery_soft": "#E8B868",
 }
 
 # Default ComfyUI SDXL + LoRA workflow template
@@ -309,16 +344,73 @@ def _ensure_channel_data(content: dict) -> dict:
     return content
 
 
+# ---------------------------------------------------------------------------
+# Compliance screen — for recovery channels (NA, AA) only.
+#
+# Screens generated script fields against a corpus of forbidden phrases
+# (NA Basic Text, Just For Today, Big Book, 12&12, etc.) BEFORE any TTS/art
+# spend. For channels not in the corpus (wisdom, gibran) this is a no-op.
+# ---------------------------------------------------------------------------
+def _compliance_screen_or_raise(script_fields: dict, channel_slug: str) -> None:
+    """Screen a dict of generated text fields against the compliance filter.
+
+    On failure, logs the hits and raises RuntimeError so the content row is
+    marked failed before any downstream spend. Caller is expected to let the
+    exception propagate to the outer process_* handler.
+    """
+    from compliance_filter import check_all as _check_all
+    ok, reason, details = _check_all(script_fields, channel_slug)
+    if ok:
+        return
+    print(f"  [compliance] REJECTED on channel '{channel_slug}': {reason}")
+    for field, hits in (details.get("hits_by_field") or {}).items():
+        for hit in hits:
+            forbid = str(hit.get("forbidden", ""))[:80]
+            print(f"    - {field} [{hit.get('kind')}]: {forbid}")
+    raise RuntimeError(
+        f"Compliance filter rejected {channel_slug} content before TTS: {reason}"
+    )
+
+
 # Channel-level defaults for when philosopher mapping doesn't match.
 # Used by pick_music / LoRA selection so Gibran content never falls back to Stoic.
 CHANNEL_DEFAULT_MUSIC_STYLE = {
     "wisdom": "stoic_classical",
     "gibran": "gibran",
+    # NA/AA use a meta-style for equalizer color only; actual track selection
+    # draws from CHANNEL_MUSIC_POOL[slug] (stoic_classical + gibran folders).
+    "na": "recovery_soft",
+    "aa": "recovery_soft",
 }
 CHANNEL_DEFAULT_LORA = {
     "wisdom": "stoic_classical_v1",
     "gibran": "gibran_style_v1",
+    # NA/AA run raw SDXL (no LoRA) until recovery_grounded_v1 is trained.
+    "na": None,
+    "aa": None,
 }
+
+# Top-of-video watermark text per channel. Matches the Remotion JS resolver
+# (video-engine/scripts/lib/channel-meta.js) so both the standalone playground
+# and the pipeline use the same branding.
+CHANNEL_WATERMARK = {
+    "wisdom": "Deep Echoes of Wisdom",
+    "gibran": "Gibran Khalil Gibran",
+    "na": "One Day At A Time",
+    "aa": "Easy Does It",
+}
+
+
+def watermark_for_channel(channel_slug: str) -> str:
+    """Resolve the top-of-video watermark for a channel. Unknown channels
+    get the slug uppercased as a last-resort label so NA/AA can't silently
+    fall through to the Wisdom watermark."""
+    if not channel_slug:
+        return CHANNEL_WATERMARK["wisdom"]
+    slug = channel_slug.lower()
+    if slug in CHANNEL_WATERMARK:
+        return CHANNEL_WATERMARK[slug]
+    return slug.upper()
 
 
 def update_supabase(content_id: str, updates: dict):
@@ -428,7 +520,7 @@ def generate_quote(philosopher: str, topic: str) -> str:
         f"{dedup}"
     )
 
-    ollama_model = PHILOSOPHER_TO_OLLAMA_MODEL.get(
+    ollama_model = PERSONA_TO_OLLAMA_MODEL.get(
         philosopher, philosopher.lower().replace(" ", "_")
     )
     try:
@@ -456,10 +548,15 @@ def generate_quote(philosopher: str, topic: str) -> str:
 # ---------------------------------------------------------------------------
 # Art generation via ComfyUI
 # ---------------------------------------------------------------------------
-def _build_comfyui_workflow(prompt: str, lora_name: str,
+def _build_comfyui_workflow(prompt: str, lora_name,
                             width: int, height: int,
                             filename_prefix: str) -> dict:
-    """Build a ComfyUI workflow JSON with LoRA for SDXL generation."""
+    """Build a ComfyUI workflow JSON with optional LoRA for SDXL generation.
+
+    lora_name may be None or empty string — in that case we drop node 11 and
+    run raw SDXL (template defaults already wire KSampler + CLIPs to the
+    checkpoint at node 10).
+    """
     import copy
     workflow = copy.deepcopy(_COMFYUI_WORKFLOW_TEMPLATE)
 
@@ -473,27 +570,30 @@ def _build_comfyui_workflow(prompt: str, lora_name: str,
     # Positive prompt
     workflow["6"]["inputs"]["text"] = prompt
 
-    # LoRA
-    lora_file = f"{lora_name}.safetensors"
-    workflow["11"]["inputs"]["lora_name"] = lora_file
-
-    # Wire the KSampler through the LoRA loader instead of direct checkpoint
-    workflow["3"]["inputs"]["model"] = ["11", 0]
-    workflow["6"]["inputs"]["clip"] = ["11", 1]
-    workflow["7"]["inputs"]["clip"] = ["11", 1]
-
     # Output filename
     workflow["9"]["inputs"]["filename_prefix"] = filename_prefix
+
+    # LoRA — optional. When set, insert the LoraLoader into the graph.
+    # When None/empty, drop node 11 and let KSampler/CLIPs pull directly from
+    # the checkpoint (node 10) — which is the template default.
+    if lora_name:
+        workflow["11"]["inputs"]["lora_name"] = f"{lora_name}.safetensors"
+        workflow["3"]["inputs"]["model"] = ["11", 0]
+        workflow["6"]["inputs"]["clip"] = ["11", 1]
+        workflow["7"]["inputs"]["clip"] = ["11", 1]
+    else:
+        workflow.pop("11", None)
 
     return workflow
 
 
-def generate_art(prompt: str, lora_name: str, width: int, height: int,
+def generate_art(prompt: str, lora_name, width: int, height: int,
                  output_path: str) -> str:
     """
-    Call ComfyUI API to generate an image using SDXL + LoRA.
+    Call ComfyUI API to generate an image using SDXL (with optional LoRA).
     Polls for completion and downloads the result.
 
+    lora_name may be None/empty — the workflow builder will run raw SDXL.
     Returns the local file path of the saved image.
     """
     output_path = str(output_path)
@@ -563,19 +663,117 @@ ELEVENLABS_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_WISDOM = os.environ.get("ELEVENLABS_VOICE_WISDOM", "0ABJJI7ZYmWZBiUBMHUW")
 ELEVENLABS_VOICE_GIBRAN = os.environ.get("ELEVENLABS_VOICE_GIBRAN", "R68HwD2GzEdWfqYZP9FQ")
 
+# Channel-level default voice IDs for channels without per-philosopher voices.
+# PERSONA_TO_VOICE_ID takes precedence over this map.
+CHANNEL_DEFAULT_VOICE_ID = {
+    "wisdom": ELEVENLABS_VOICE_WISDOM,
+    "gibran": ELEVENLABS_VOICE_GIBRAN,
+}
+
+
+# ---------------------------------------------------------------------------
+# ElevenLabs credit-floor gate
+#
+# Before each EL call, check account usage. If the projected remaining credit
+# after the call would drop below the configured floor, refuse. This prevents
+# accidental monthly-quota blowouts when running at scale across multiple
+# channels. Disable by setting ELEVENLABS_CREDIT_FLOOR=0.
+# ---------------------------------------------------------------------------
+class ElevenLabsCreditFloorExceeded(RuntimeError):
+    """Raised when an EL call would push remaining credits below the floor."""
+    pass
+
+
+_EL_SUBSCRIPTION_CACHE = {"ts": 0.0, "data": None}
+
+
+def _el_subscription(force_refresh: bool = False) -> dict:
+    """Fetch /v1/user/subscription with a 60s in-process cache.
+
+    Returns the parsed JSON dict on success, or None on any failure.
+    Requires the ELEVENLABS_API_KEY to have the user_read permission.
+    """
+    import time
+    now = time.time()
+    cached = _EL_SUBSCRIPTION_CACHE.get("data")
+    if not force_refresh and cached and (now - _EL_SUBSCRIPTION_CACHE["ts"]) < 60:
+        return cached
+    try:
+        resp = requests.get(
+            "https://api.elevenlabs.io/v1/user/subscription",
+            headers={"xi-api-key": ELEVENLABS_KEY},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            _EL_SUBSCRIPTION_CACHE["ts"] = now
+            _EL_SUBSCRIPTION_CACHE["data"] = data
+            return data
+        print(f"  [voice] WARNING: EL subscription fetch HTTP {resp.status_code}: "
+              f"{resp.text[:120] if resp.text else ''}")
+    except Exception as e:
+        print(f"  [voice] WARNING: EL subscription fetch failed: {e}")
+    return cached  # return stale cache if we have one, else None
+
+
+def _el_credit_gate(estimated_chars: int = 0) -> None:
+    """Raise ElevenLabsCreditFloorExceeded if projected remaining after the
+    planned call would fall below `floor * character_limit`.
+
+    Floor is controlled by ELEVENLABS_CREDIT_FLOOR env var (fraction 0-1).
+    Default 0.05 (5%). Set to 0 to disable the gate.
+
+    Fails open if subscription data can't be fetched — do not block pipeline
+    because of a transient EL outage.
+    """
+    try:
+        floor = float(os.environ.get("ELEVENLABS_CREDIT_FLOOR", "0.05"))
+    except ValueError:
+        floor = 0.05
+    if floor <= 0:
+        return
+
+    sub = _el_subscription()
+    if not sub:
+        print("  [voice] WARNING: EL credit gate bypassed — no subscription data")
+        return
+
+    limit = int(sub.get("character_limit") or 0)
+    used = int(sub.get("character_count") or 0)
+    if limit <= 0:
+        return
+
+    remaining = limit - used
+    projected_remaining = remaining - estimated_chars
+    min_required = int(limit * floor)
+    if projected_remaining < min_required:
+        pct_used = used / limit * 100
+        raise ElevenLabsCreditFloorExceeded(
+            f"ElevenLabs credit floor breached: "
+            f"{used}/{limit} used ({pct_used:.1f}%), "
+            f"{remaining} remaining, estimated {estimated_chars} more needed, "
+            f"floor = {min_required} ({floor*100:.0f}% of limit). "
+            f"Upgrade plan or lower ELEVENLABS_CREDIT_FLOOR."
+        )
+
 
 def generate_voice(text: str, output_path: str,
                    channel_slug: str,
+                   philosopher: str = None,
+                   tts_provider: str = "elevenlabs",
                    exaggeration: float = 0.5,
                    cfg_weight: float = 0.5,
                    slow_factor: float = 1.0) -> str:
     """
-    Generate voice via ElevenLabs TTS API.
+    Generate voice via ElevenLabs TTS (default) or Chatterbox (when enabled
+    per archetype in PERSONA_TO_CHATTERBOX_REF).
 
-    channel_slug is REQUIRED — it determines which voice to use.
+    channel_slug is REQUIRED.
+    philosopher: when provided, PERSONA_TO_VOICE_ID wins over channel default.
+    tts_provider: "elevenlabs" (default) or "chatterbox". Chatterbox path
+      only triggers when the archetype has a registered reference clip.
     slow_factor: 1.0 = normal speed; <1.0 slows playback via ffmpeg atempo
-      while preserving pitch. E.g. 0.88 = 12% slower (used for shorts where
-      the default 11labs cadence feels rushed).
+      while preserving pitch. E.g. 0.88 = 12% slower.
     Returns the local file path of the saved audio.
     """
     from elevenlabs import ElevenLabs, VoiceSettings
@@ -584,7 +782,37 @@ def generate_voice(text: str, output_path: str,
         raise ValueError("generate_voice requires a channel_slug — refusing to default to wisdom voice")
 
     output_path = str(output_path)
-    voice_id = ELEVENLABS_VOICE_GIBRAN if channel_slug == "gibran" else ELEVENLABS_VOICE_WISDOM
+
+    # Chatterbox path — dormant until the CB client is implemented.
+    # If a caller requests it AND a reference clip is registered for this
+    # archetype, warn loudly and fall through to ElevenLabs rather than
+    # crashing the pipeline. A dashboard flag flip must NEVER brick content
+    # generation — EL is always the safe fallback.
+    if tts_provider == "chatterbox" and philosopher in PERSONA_TO_CHATTERBOX_REF:
+        print(
+            f"  [voice] WARNING: tts_provider=chatterbox requested for '{philosopher}' "
+            f"but Chatterbox dispatch is not yet implemented — falling back to ElevenLabs."
+        )
+        # Intentional fall-through to the EL block below.
+
+    # ElevenLabs path (default).
+    # Priority: philosopher-specific voice > channel default voice.
+    voice_id = (
+        PERSONA_TO_VOICE_ID.get(philosopher)
+        or CHANNEL_DEFAULT_VOICE_ID.get(channel_slug)
+    )
+    if not voice_id:
+        raise ValueError(
+            f"No ElevenLabs voice ID for channel='{channel_slug}' philosopher='{philosopher}'. "
+            "Add to PERSONA_TO_VOICE_ID or CHANNEL_DEFAULT_VOICE_ID."
+        )
+
+    # Gibran voice is 10% faster — the default ElevenLabs cadence sounds too slow
+    if channel_slug == "gibran":
+        slow_factor *= 1.1
+
+    # Credit-floor gate — refuse if this call would push us below the floor
+    _el_credit_gate(estimated_chars=len(text))
 
     client = ElevenLabs(api_key=ELEVENLABS_KEY)
     audio = client.text_to_speech.convert(
@@ -630,42 +858,68 @@ def generate_voice(text: str, output_path: str,
 # ---------------------------------------------------------------------------
 # Music selection
 # ---------------------------------------------------------------------------
+def _collect_tracks(styles) -> list:
+    """Collect all mp3/wav tracks from one or more music style folders."""
+    if isinstance(styles, str):
+        styles = [styles]
+    tracks = []
+    for s in styles:
+        d = MUSIC_ROOT / s
+        if d.exists():
+            tracks.extend(d.glob("*.mp3"))
+            tracks.extend(d.glob("*.wav"))
+    return tracks
+
+
 def pick_music(philosopher: str, channel_slug: str = None) -> str:
     """
     Pick a random music track for this content.
 
     Resolution order:
-      1. PHILOSOPHER_TO_MUSIC_STYLE[philosopher]  (exact match)
-      2. CHANNEL_DEFAULT_MUSIC_STYLE[channel_slug]  (channel-aware fallback)
-      3. 'stoic_classical' (last resort)
+      1. PERSONA_TO_MUSIC_STYLE[philosopher]  (single style)
+      2. CHANNEL_MUSIC_POOL[channel_slug]         (multi-style pool, e.g. NA)
+      3. CHANNEL_DEFAULT_MUSIC_STYLE[channel_slug] (single-style fallback)
+      4. any style folder with tracks              (last resort)
     """
-    style = PHILOSOPHER_TO_MUSIC_STYLE.get(philosopher)
-    if not style and channel_slug:
-        style = CHANNEL_DEFAULT_MUSIC_STYLE.get(channel_slug)
-    if not style:
-        style = "stoic_classical"
-
-    style_dir = MUSIC_ROOT / style
-
-    if style_dir.exists():
-        tracks = list(style_dir.glob("*.mp3")) + list(style_dir.glob("*.wav"))
+    # 1. Philosopher-specific single style
+    style = PERSONA_TO_MUSIC_STYLE.get(philosopher)
+    if style:
+        tracks = _collect_tracks(style)
         if tracks:
             chosen = random.choice(tracks)
             print(f"  [music] Selected: {chosen.name} (style: {style})")
             return str(chosen)
 
-    # Fallback: pick from any style that has tracks
+    # 2. Channel multi-style pool (e.g. NA pulls from stoic_classical + gibran)
+    if channel_slug:
+        pool = CHANNEL_MUSIC_POOL.get(channel_slug)
+        if pool:
+            tracks = _collect_tracks(pool)
+            if tracks:
+                chosen = random.choice(tracks)
+                print(f"  [music] Selected: {chosen.name} (pool: {pool})")
+                return str(chosen)
+
+    # 3. Channel default single style
+    if channel_slug:
+        style = CHANNEL_DEFAULT_MUSIC_STYLE.get(channel_slug)
+        if style:
+            tracks = _collect_tracks(style)
+            if tracks:
+                chosen = random.choice(tracks)
+                print(f"  [music] Selected: {chosen.name} (channel default: {style})")
+                return str(chosen)
+
+    # 4. Last-ditch fallback: any style folder with tracks
     for fallback_dir in MUSIC_ROOT.iterdir():
         if fallback_dir.is_dir():
-            tracks = list(fallback_dir.glob("*.mp3")) + list(fallback_dir.glob("*.wav"))
+            tracks = _collect_tracks(fallback_dir.name)
             if tracks:
                 chosen = random.choice(tracks)
                 print(f"  [music] Fallback: {chosen.name} (from {fallback_dir.name})")
                 return str(chosen)
 
-    raise FileNotFoundError(
-        f"No music tracks found in {MUSIC_ROOT} for style '{style}'"
-    )
+    raise FileNotFoundError(f"No music tracks found in {MUSIC_ROOT}")
 
 
 # ---------------------------------------------------------------------------
@@ -1090,12 +1344,73 @@ def _get_philosopher_style(philosopher: str) -> str:
     )
 
 
-def _build_art_prompt(philosopher: str, quote: str, topic: str) -> str:
+# ---------------------------------------------------------------------------
+# NA / AA recovery-aesthetic art — Hopper/Wyeth American realist quiet.
+# No classical architecture, no historical costume, no posed faces.
+# ---------------------------------------------------------------------------
+_NA_SCENE_POOL = [
+    "hands wrapped around a worn ceramic coffee mug on a simple kitchen counter at dawn",
+    "an empty wooden porch chair at sunrise, dew on the railing, long golden light",
+    "a silhouette from behind at a kitchen window, morning light spilling in, face not visible",
+    "a screen door half open onto a porch, warm dawn light pooling on the wooden floor",
+    "a pair of worn work boots on a wooden floor beside a closed door, soft morning light",
+    "an empty diner booth at dawn, steam rising from a single white coffee cup",
+    "a single lit window in an old apartment building against a pre-dawn blue sky",
+    "a paperback book and a half-full coffee mug on a small wooden kitchen table",
+    "a cell phone face-down on a kitchen counter next to a small notebook and pen",
+    "a worn leather armchair by a window, morning light through half-closed blinds",
+    "a hand reaching for a mug on a nightstand, a single warm bedside lamp glowing",
+    "two hands folded on a kitchen table in morning light, one older one younger",
+    "a mug of coffee steaming on a windowsill, quiet street visible through the glass",
+    "a folded jacket over the back of a kitchen chair, sunrise through the window",
+    "a silhouette sitting on a front step at dawn, a mug held in both hands",
+]
+
+_NA_STYLE = (
+    "oil painting in the american realist tradition of edward hopper and "
+    "andrew wyeth, intimate quiet composition, warm golden dawn light, "
+    "muted earth tones with charcoal shadows, single directional light source, "
+    "grounded and anonymous atmosphere, soft painterly brushwork"
+)
+
+
+def _build_art_prompt_na(quote: str, topic: str,
+                         scene_hint: str = None) -> str:
+    """NA/AA recovery aesthetic — Hopper/Wyeth quiet, grounded, anonymous.
+
+    If scene_hint is provided (e.g. from Opus's art_scene field), it wins over
+    the fallback scene pool — gives content-specific imagery.
+    """
+    if scene_hint and scene_hint.strip():
+        scene = scene_hint.strip()
+    else:
+        import hashlib
+        seed_src = (quote + "|" + topic).encode("utf-8")
+        h = int(hashlib.sha256(seed_src).hexdigest()[:8], 16)
+        scene = _NA_SCENE_POOL[h % len(_NA_SCENE_POOL)]
+    return (
+        f"{scene}, "
+        f"rule of thirds composition, shallow depth of field, intimate framing, "
+        f"{_NA_STYLE}, "
+        f"ultra detailed brushwork, cinematic quiet, masterpiece oil painting"
+    )
+
+
+def _build_art_prompt(philosopher: str, quote: str, topic: str,
+                      channel_slug: str = None,
+                      scene_hint: str = None) -> str:
     """Build a ComfyUI-friendly image generation prompt for a quote.
+
+    Channel-aware:
+      - na, aa: Hopper/Wyeth recovery aesthetic (no classical, no costume)
+      - everything else: philosopher-flavored classical painting aesthetic
 
     Structure: SUBJECT first (front-loaded in SDXL for emphasis),
     then composition tokens, then style card, then quality tokens.
     """
+    if channel_slug in ("na", "aa"):
+        return _build_art_prompt_na(quote, topic, scene_hint=scene_hint)
+
     style = _get_philosopher_style(philosopher)
 
     # For shorts we don't have per-chunk narration — use the quote + topic
@@ -1170,38 +1485,61 @@ def process_short(content: dict):
     work = _content_work_dir(content_id)
     print(f"\n  Processing short: {philosopher} / {topic} [channel={channel_slug}]")
 
-    # --- Step 1: Quote ---
+    # --- Step 1: Quote (+ metadata for recovery channels) ---
+    # Recovery channels (NA/AA) use Opus to produce a longer ~40s short with
+    # baked-in title/description/tags + a specific art scene. Saves the
+    # separate Haiku metadata roundtrip and raises craft quality.
+    # Wisdom/Gibran keep the Ollama quote -> Haiku metadata pipeline.
     log_step(content_id, "quote", 1, "running")
+    na_art_scene_hint = None
     try:
-        # Sanitize any pre-existing quote_text in case a prior run stored
-        # tag-polluted text (e.g. "[AI-generated in the spirit of X]") and
-        # retry is reusing it.
-        quote = sanitize_quote(content.get("quote_text") or "")
-        if not quote or quote.lower() in ("pending generation", "pending"):
-            quote = generate_quote(philosopher, topic)
+        if channel_slug in ("na", "aa"):
+            from ai_writer import generate_recovery_short_script
+            previous = _fetch_recent_quotes(philosopher)
+            script = generate_recovery_short_script(
+                philosopher, topic, channel_slug,
+                target_seconds=40, previous_quotes=previous,
+            )
+            quote = sanitize_quote(script.get("quote", ""))
+            title = script.get("title") or f"{philosopher}: {topic[:40]}"
+            description = script.get("description", "")
+            tags = script.get("tags", [])
+            na_art_scene_hint = script.get("art_scene") or None
+            print(f"  [quote] Opus {channel_slug} short: {len(quote.split())} words")
+        else:
+            quote = sanitize_quote(content.get("quote_text") or "")
+            if not quote or quote.lower() in ("pending generation", "pending"):
+                quote = generate_quote(philosopher, topic)
+            try:
+                meta = generate_youtube_metadata(philosopher, quote, topic)
+                title = meta.get("title", f"{philosopher} on {topic}")
+                description = meta.get("description", "")
+                tags = meta.get("tags", [])
+            except Exception as meta_err:
+                print(f"  [meta] Warning: metadata generation failed ({meta_err}), using defaults")
+                title = f"{philosopher} on {topic}"
+                description = quote
+                tags = [philosopher, topic, "philosophy", "wisdom"]
         log_step(content_id, "quote", 1, "success")
         print(f"  [quote] {quote[:80]}...")
     except Exception as e:
         log_step(content_id, "quote", 1, "failed", str(e))
         raise
 
-    # --- Step 2: Metadata ---
-    try:
-        meta = generate_youtube_metadata(philosopher, quote, topic)
-        title = meta.get("title", f"{philosopher} on {topic}")
-        description = meta.get("description", "")
-        tags = meta.get("tags", [])
-    except Exception as e:
-        print(f"  [meta] Warning: metadata generation failed ({e}), using defaults")
-        title = f"{philosopher} on {topic}"
-        description = quote
-        tags = [philosopher, topic, "philosophy", "wisdom"]
+    # --- Compliance screen — fail fast before TTS/art spend (NA/AA only) ---
+    _compliance_screen_or_raise(
+        {"quote": quote, "title": title, "description": description},
+        channel_slug,
+    )
 
     # --- Step 3: Art ---
     log_step(content_id, "image", 2, "running")
     try:
-        art_prompt = _build_art_prompt(philosopher, quote, topic)
-        lora = PHILOSOPHER_TO_LORA.get(philosopher) or CHANNEL_DEFAULT_LORA.get(channel_slug, "stoic_classical_v1")
+        art_prompt = _build_art_prompt(philosopher, quote, topic,
+                                       channel_slug=channel_slug,
+                                       scene_hint=na_art_scene_hint)
+        # None/empty lora => raw SDXL (no LoRA) path in _build_comfyui_workflow.
+        lora = PERSONA_TO_LORA.get(philosopher) or CHANNEL_DEFAULT_LORA.get(channel_slug)
         art_path = str(work / "art.png")
         generate_art(art_prompt, lora, 832, 1216, art_path)
         log_step(content_id, "image", 2, "success")
@@ -1215,7 +1553,8 @@ def process_short(content: dict):
     log_step(content_id, "voice", 3, "running")
     try:
         voice_path = str(work / "voice.wav")
-        generate_voice(quote, voice_path, channel_slug=channel_slug, slow_factor=0.88)
+        generate_voice(quote, voice_path, channel_slug=channel_slug,
+                       philosopher=philosopher, slow_factor=0.88)
         log_step(content_id, "voice", 3, "success")
     except Exception as e:
         log_step(content_id, "voice", 3, "failed", str(e))
@@ -1223,7 +1562,7 @@ def process_short(content: dict):
 
     # --- Step 5: Music ---
     music_path = pick_music(philosopher, channel_slug=channel_slug)
-    music_style = PHILOSOPHER_TO_MUSIC_STYLE.get(philosopher) or CHANNEL_DEFAULT_MUSIC_STYLE.get(channel_slug, "stoic_classical")
+    music_style = PERSONA_TO_MUSIC_STYLE.get(philosopher) or CHANNEL_DEFAULT_MUSIC_STYLE.get(channel_slug, "stoic_classical")
     eq_color = EQUALIZER_COLORS.get(music_style, "#D4AF37")
 
     # --- Step 6: Assemble video ---
@@ -1241,6 +1580,7 @@ def process_short(content: dict):
             channel_name=channel_name,
             title=title,
             equalizer_color=eq_color,
+            watermark=watermark_for_channel(channel_slug),
         )
         log_step(content_id, "video", 4, "success")
     except Exception as e:
@@ -1343,10 +1683,18 @@ def process_midform(content: dict):
     # --- Step 1: Quotes (with dedup) ---
     log_step(content_id, "quote", 1, "running")
     try:
-        from ai_writer import generate_midform_script
         previous = _fetch_recent_quotes(philosopher)
-        script = generate_midform_script(philosopher, topic, num_quotes=num_quotes,
-                                         previous_quotes=previous)
+        # Recovery channels (NA/AA) repurpose the midform slot as a single-
+        # narration "daily meditation" instead of 4-quote bridges.
+        if channel_slug in ("na", "aa"):
+            from ai_writer import generate_daily_meditation_script
+            script = generate_daily_meditation_script(
+                philosopher, topic, channel_slug, previous_topics=previous
+            )
+        else:
+            from ai_writer import generate_midform_script
+            script = generate_midform_script(philosopher, topic, num_quotes=num_quotes,
+                                             previous_quotes=previous)
         quotes = script.get("quotes", [])
         narration_segments = script.get("narration_segments", [])
         if not quotes:
@@ -1358,10 +1706,16 @@ def process_midform(content: dict):
         log_step(content_id, "quote", 1, "failed", str(e))
         raise
 
+    # --- Compliance screen — fail fast before TTS/art spend (NA/AA only) ---
+    _compliance_fields = {f"quote_{i}": q for i, q in enumerate(quotes)}
+    _compliance_fields.update({f"narration_{i}": n for i, n in enumerate(narration_segments) if n})
+    _compliance_screen_or_raise(_compliance_fields, channel_slug)
+
     # --- Step 2: Art (one per quote) ---
     log_step(content_id, "image", 2, "running")
     try:
-        lora = PHILOSOPHER_TO_LORA.get(philosopher) or CHANNEL_DEFAULT_LORA.get(channel_slug, "stoic_classical_v1")
+        # None/empty lora => raw SDXL (no LoRA) path in _build_comfyui_workflow.
+        lora = PERSONA_TO_LORA.get(philosopher) or CHANNEL_DEFAULT_LORA.get(channel_slug)
         art_paths = []
         art_prompts = script.get("art_prompts", [])
         for i, quote in enumerate(quotes):
@@ -1369,7 +1723,7 @@ def process_midform(content: dict):
             if i < len(art_prompts) and art_prompts[i]:
                 art_prompt = art_prompts[i]
             else:
-                art_prompt = _build_art_prompt(philosopher, quote, topic)
+                art_prompt = _build_art_prompt(philosopher, quote, topic, channel_slug=channel_slug)
             art_path = str(work / f"art_{i}.png")
             generate_art(art_prompt, lora, 1216, 832, art_path)  # landscape
             art_paths.append(art_path)
@@ -1389,7 +1743,8 @@ def process_midform(content: dict):
                 narration = narration_segments[i].strip() + " "
             full_text = narration + quote
             voice_path = str(work / f"voice_{i}.wav")
-            generate_voice(full_text, voice_path, channel_slug=channel_slug)
+            generate_voice(full_text, voice_path, channel_slug=channel_slug,
+                           philosopher=philosopher)
             voice_paths.append(voice_path)
             if narration:
                 print(f"  [voice {i}] narration ({len(narration)}ch) + quote ({len(quote)}ch)")
@@ -1400,7 +1755,7 @@ def process_midform(content: dict):
 
     # --- Step 4: Music ---
     music_path = pick_music(philosopher, channel_slug=channel_slug)
-    music_style = PHILOSOPHER_TO_MUSIC_STYLE.get(philosopher) or CHANNEL_DEFAULT_MUSIC_STYLE.get(channel_slug, "stoic_classical")
+    music_style = PERSONA_TO_MUSIC_STYLE.get(philosopher) or CHANNEL_DEFAULT_MUSIC_STYLE.get(channel_slug, "stoic_classical")
     eq_color = EQUALIZER_COLORS.get(music_style, "#D4AF37")
 
     # --- Step 5: Assemble ---
@@ -1420,6 +1775,7 @@ def process_midform(content: dict):
             title=midform_title,
             narration_segments=narration_segments,
             equalizer_color=eq_color,
+            watermark=watermark_for_channel(channel_slug),
         )
         log_step(content_id, "video", 4, "success")
     except Exception as e:
@@ -1525,12 +1881,21 @@ def _batch_process(items: list):
                     quote = generate_quote(philosopher, topic)
                 quotes = [quote]
                 narration_segments = []
-                art_prompt_base = _build_art_prompt(philosopher, quote, topic)
+                art_prompt_base = _build_art_prompt(philosopher, quote, topic,
+                                                    channel_slug=content["channels"]["slug"])
                 art_prompts = [art_prompt_base]
             else:
-                from ai_writer import generate_midform_script
-                script = generate_midform_script(philosopher, topic,
-                                                 previous_quotes=previous)
+                # Recovery channels use daily-meditation writer in the midform slot
+                _slug = content["channels"]["slug"]
+                if _slug in ("na", "aa"):
+                    from ai_writer import generate_daily_meditation_script
+                    script = generate_daily_meditation_script(
+                        philosopher, topic, _slug, previous_topics=previous
+                    )
+                else:
+                    from ai_writer import generate_midform_script
+                    script = generate_midform_script(philosopher, topic,
+                                                     previous_quotes=previous)
                 quotes = script.get("quotes", [])
                 narration_segments = script.get("narration_segments", [])
                 art_prompts = script.get("art_prompts", [])
@@ -1538,6 +1903,12 @@ def _batch_process(items: list):
                     raise ValueError("Script returned no quotes")
 
             log_step(cid, "quote", 1, "success")
+
+            # Compliance screen — fail fast before TTS/art spend (NA/AA only)
+            _comp_fields = {f"quote_{i}": q for i, q in enumerate(quotes)}
+            _comp_fields.update({f"narration_{i}": n for i, n in enumerate(narration_segments) if n})
+            _compliance_screen_or_raise(_comp_fields, content["channels"]["slug"])
+
             results[cid] = {
                 "quotes": quotes,
                 "narration_segments": narration_segments,
@@ -1560,7 +1931,8 @@ def _batch_process(items: list):
         content = data["content"]
         philosopher = content["philosopher"]
         channel_slug = content["channels"]["slug"]
-        lora = PHILOSOPHER_TO_LORA.get(philosopher) or CHANNEL_DEFAULT_LORA.get(channel_slug, "stoic_classical_v1")
+        # None/empty lora => raw SDXL (no LoRA) path in _build_comfyui_workflow.
+        lora = PERSONA_TO_LORA.get(philosopher) or CHANNEL_DEFAULT_LORA.get(channel_slug)
         content_type = content.get("format", "short")
         work = data["work"]
 
@@ -1579,7 +1951,8 @@ def _batch_process(items: list):
                 else:
                     prompt = _build_art_prompt(
                         philosopher, quote,
-                        content.get("topic", "life and wisdom")
+                        content.get("topic", "life and wisdom"),
+                        channel_slug=content["channels"]["slug"],
                     )
                 art_path = str(work / f"art_{i}.png")
                 generate_art(prompt, lora, art_w, art_h, art_path)
@@ -1623,6 +1996,7 @@ def _batch_process(items: list):
                 voice_path = str(work / f"voice_{i}.wav")
                 generate_voice(full_text, voice_path,
                                channel_slug=channel_slug,
+                               philosopher=philosopher,
                                slow_factor=slow_factor)
                 voice_paths.append(voice_path)
 
@@ -1655,7 +2029,7 @@ def _batch_process(items: list):
         try:
             # Music
             music_path = pick_music(philosopher, channel_slug=channel_slug)
-            music_style = PHILOSOPHER_TO_MUSIC_STYLE.get(philosopher) or CHANNEL_DEFAULT_MUSIC_STYLE.get(channel_slug, "stoic_classical")
+            music_style = PERSONA_TO_MUSIC_STYLE.get(philosopher) or CHANNEL_DEFAULT_MUSIC_STYLE.get(channel_slug, "stoic_classical")
             eq_color = EQUALIZER_COLORS.get(music_style, "#D4AF37")
 
             # Assembly
@@ -1676,6 +2050,7 @@ def _batch_process(items: list):
                 title=batch_title,
                 narration_segments=data.get("narration_segments"),
                 equalizer_color=eq_color,
+                watermark=watermark_for_channel(channel_slug),
             )
             log_step(cid, "video", 4, "success")
 
