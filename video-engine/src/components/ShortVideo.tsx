@@ -1,5 +1,4 @@
 import { Audio } from "@remotion/media";
-import { fitText } from "@remotion/layout-utils";
 import {
   AbsoluteFill,
   Img,
@@ -313,20 +312,30 @@ const ShortBackground: React.FC<{
   );
 };
 
-// Quote overlay auto-scrolls long text with a dual alpha mask (fade in at top,
-// fade out at bottom). Keeps a comfortable reading font size (~56px) instead
-// of shrinking the text when the quote is a monologue-length block — common
-// for NA/AA recovery shorts where "the quote" is a full character passage.
+// Quote overlay: fixed-height black box with a top + bottom alpha fade.
+// The text block inside translates vertically across the viewport over the
+// sequence duration. Short quotes appear to sit still (scrollDistance=0).
+// Longer monologues — common for NA/AA character shorts — scroll behind the
+// alpha bands so lines gently fade in at the top edge and fade out at the
+// bottom edge of the black frame.
 //
-// Short quotes (<= box height) don't scroll; the dual-mask is still applied
-// but sits fully inside the black region so there's no visible fade.
-const QUOTE_FONT = 56;
-const QUOTE_LINE_RATIO = 1.42;
-const QUOTE_BOX_WIDTH = 900; // inner text column width, matches padding math
-const QUOTE_BOX_HEIGHT = 1200; // max vertical extent before scroll kicks in
-const QUOTE_V_PAD = 56; // top/bottom internal padding of the black box
-const QUOTE_SCROLL_START_PCT = 0.12;
+// We deliberately avoid fitText-based line counting here; that estimate
+// undercounts word-wrap and produced an undersized box that leaked text
+// in the first AA render. Instead we ALWAYS reserve the same fixed box
+// height and let the inner text flow without a height cap — then translate
+// it over time. If the text happens to fit, the scroll amount is zero.
+const QUOTE_FONT = 54;
+const QUOTE_LINE_RATIO = 1.45;
+const QUOTE_BOX_HEIGHT = 1180;
+const QUOTE_V_PAD = 48;
+const QUOTE_SCROLL_START_PCT = 0.08;
 const QUOTE_SCROLL_END_PCT = 0.92;
+// Conservative words-per-line assumption for Georgia bold italic at 54px
+// inside the ~900px padded column. Rounded DOWN on purpose — overestimating
+// lines is safe (gives a longer scroll ramp on short text, no visible
+// effect), underestimating is what caused the overflow bug.
+const WORDS_PER_LINE = 4.5;
+const LINE_PAD_EXTRA = 1; // add 1 line of slack for punctuation / closing quote
 
 const QuoteOverlay: React.FC<{ text: string }> = ({ text }) => {
   const frame = useCurrentFrame();
@@ -352,50 +361,30 @@ const QuoteOverlay: React.FC<{ text: string }> = ({ text }) => {
 
   const quoted = `“${text}”`;
 
-  // Estimate wrapped text height. fitText gives single-line width; divide by
-  // our column width to estimate lines. Italic Georgia averages ~0.48em per
-  // char, but fitText already accounts for that — we just need line count.
-  const fitted = fitText({
-    fontFamily: "Georgia, serif",
-    fontStyle: "italic",
-    fontWeight: "bold",
-    text: quoted,
-    withinWidth: QUOTE_BOX_WIDTH,
-  });
-  // fitted.fontSize is the size at which the text fits on ONE line within
-  // QUOTE_BOX_WIDTH. Its actual width at that size is QUOTE_BOX_WIDTH.
-  // Scale to our target font to find how wide it would be; divide by
-  // column width to get an integer line count.
-  const widthAtTarget = (QUOTE_BOX_WIDTH * QUOTE_FONT) / fitted.fontSize;
-  const estimatedLines = Math.max(1, Math.ceil(widthAtTarget / QUOTE_BOX_WIDTH));
+  // Word-count based line estimate. Robust against fitText oddities.
+  const wordCount = quoted.split(/\s+/).filter(Boolean).length;
+  const estimatedLines = Math.ceil(wordCount / WORDS_PER_LINE) + LINE_PAD_EXTRA;
   const textHeight = estimatedLines * QUOTE_FONT * QUOTE_LINE_RATIO;
 
   const visibleHeight = QUOTE_BOX_HEIGHT - 2 * QUOTE_V_PAD;
   const scrollDistance = Math.max(0, textHeight - visibleHeight);
-  const needsScroll = scrollDistance > 0;
 
-  // When text fits, keep the box compact so it centers nicely over the art.
-  const boxHeight = needsScroll
-    ? QUOTE_BOX_HEIGHT
-    : Math.min(QUOTE_BOX_HEIGHT, textHeight + 2 * QUOTE_V_PAD);
-
-  // Scroll ramp — linger on the first lines, scroll through the middle, then
-  // linger on the last lines so the viewer has time to read top and bottom.
+  // Scroll ramp — hold the first lines for ~8% of duration, scroll across
+  // the middle, then hold the last lines at ~8% tail.
   const scrollStart = Math.floor(durationInFrames * QUOTE_SCROLL_START_PCT);
   const scrollEnd = Math.floor(durationInFrames * QUOTE_SCROLL_END_PCT);
-  const scrollY = needsScroll
-    ? interpolate(frame, [scrollStart, scrollEnd], [0, -scrollDistance], {
-        extrapolateLeft: "clamp",
-        extrapolateRight: "clamp",
-      })
-    : 0;
+  const scrollY = interpolate(
+    frame,
+    [scrollStart, scrollEnd],
+    [0, -scrollDistance],
+    { extrapolateLeft: "clamp", extrapolateRight: "clamp" },
+  );
 
-  // Dual alpha mask — transparent at top 8%, transparent at bottom 8%, fully
-  // visible in between. Creates the fade-in / fade-out band around the scroll.
-  // Only applied when text actually scrolls so short quotes aren't faded.
-  const maskImage = needsScroll
-    ? "linear-gradient(180deg, transparent 0%, #000 10%, #000 90%, transparent 100%)"
-    : undefined;
+  // Dual alpha mask — always applied. For short text that fits, the fade
+  // bands happen above/below where the text actually sits, so the text
+  // still renders crisp (no visible fade).
+  const maskImage =
+    "linear-gradient(180deg, transparent 0%, #000 9%, #000 91%, transparent 100%)";
 
   return (
     <AbsoluteFill
@@ -412,7 +401,7 @@ const QuoteOverlay: React.FC<{ text: string }> = ({ text }) => {
           borderRadius: 16,
           padding: `${QUOTE_V_PAD}px 52px`,
           maxWidth: "95%",
-          height: boxHeight,
+          height: QUOTE_BOX_HEIGHT,
           overflow: "hidden",
           opacity,
           transform: `translateY(${translateY}px)`,
