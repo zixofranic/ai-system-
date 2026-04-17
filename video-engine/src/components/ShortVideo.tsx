@@ -51,6 +51,16 @@ export const ShortVideo: React.FC<z.infer<typeof shortVideoSchema>> = ({
     timeline.metadata?.watermark || "Deep Echoes of Wisdom";
   const philosopher = timeline.metadata?.philosopher || "";
 
+  // Two rendering modes:
+  //   - "monologue"  (NA/AA) — 60s+ character narration, scrolling text with
+  //                  dual alpha mask, top + bottom dark gradients for the
+  //                  fade bands.
+  //   - "aphorism"   (Wisdom/Gibran) — 15-20s short quote, static centered
+  //                  text in a solid dark box over the art, NO dark gradients
+  //                  (the box itself provides contrast).
+  const channel = (timeline.metadata?.channel || "").toLowerCase();
+  const isMonologue = channel === "na" || channel === "aa";
+
   // Separate text elements by role
   const quotes = timeline.text.filter(
     (t) => t.role === "quote" || !t.role,
@@ -81,21 +91,16 @@ export const ShortVideo: React.FC<z.infer<typeof shortVideoSchema>> = ({
         );
       })}
 
-      {/* Top gradient for watermark */}
-      <AbsoluteFill
-        style={{
-          background: DARK_GRADIENT_TOP,
-          zIndex: 5,
-        }}
-      />
-
-      {/* Bottom gradient for text readability */}
-      <AbsoluteFill
-        style={{
-          background: DARK_GRADIENT_BOTTOM,
-          zIndex: 5,
-        }}
-      />
+      {/* Dark gradients — ONLY for NA/AA monologue shorts where the
+          scrolling text needs top + bottom fade bands. Aphorism shorts
+          (Wisdom/Gibran) render over the clean art; their text sits in
+          its own solid dark box and doesn't need the overlay. */}
+      {isMonologue && (
+        <>
+          <AbsoluteFill style={{ background: DARK_GRADIENT_TOP, zIndex: 5 }} />
+          <AbsoluteFill style={{ background: DARK_GRADIENT_BOTTOM, zIndex: 5 }} />
+        </>
+      )}
 
       {/* Watermark at top */}
       <AbsoluteFill
@@ -119,7 +124,7 @@ export const ShortVideo: React.FC<z.infer<typeof shortVideoSchema>> = ({
         </div>
       </AbsoluteFill>
 
-      {/* Quote text — centered in lower half */}
+      {/* Quote text — mode-specific overlay */}
       {quotes.map((element, index) => {
         const { startFrame, duration } = calculateFrameTiming(
           element.startMs,
@@ -132,7 +137,11 @@ export const ShortVideo: React.FC<z.infer<typeof shortVideoSchema>> = ({
             from={startFrame}
             durationInFrames={duration}
           >
-            <QuoteOverlay text={element.text} />
+            {isMonologue ? (
+              <MonologueOverlay text={element.text} />
+            ) : (
+              <AphorismOverlay text={element.text} />
+            )}
           </Sequence>
         );
       })}
@@ -312,32 +321,93 @@ const ShortBackground: React.FC<{
   );
 };
 
-// Quote overlay: fixed-height black box with a top + bottom alpha fade.
-// The text block inside translates vertically across the viewport over the
-// sequence duration. Short quotes appear to sit still (scrollDistance=0).
-// Longer monologues — common for NA/AA character shorts — scroll behind the
-// alpha bands so lines gently fade in at the top edge and fade out at the
-// bottom edge of the black frame.
+// AphorismOverlay — used for Wisdom/Gibran shorts.
 //
-// We deliberately avoid fitText-based line counting here; that estimate
-// undercounts word-wrap and produced an undersized box that leaked text
-// in the first AA render. Instead we ALWAYS reserve the same fixed box
-// height and let the inner text flow without a height cap — then translate
-// it over time. If the text happens to fit, the scroll amount is zero.
+// Short 1-3 sentence quotes (15-40 words, ~15-20s videos). Static text,
+// centered in a solid dark rounded box over the art. No scroll, no alpha
+// mask, no top/bottom gradients. This is the original pre-2026-04-17
+// rendering — restored after the monologue scroll/mask work was
+// accidentally applied to short quotes too.
+const AphorismOverlay: React.FC<{ text: string }> = ({ text }) => {
+  const frame = useCurrentFrame();
+  const { fps, durationInFrames } = useVideoConfig();
+
+  const enter = spring({
+    frame,
+    fps,
+    config: { damping: 200 },
+    durationInFrames: 12,
+  });
+
+  const fadeOutFrames = Math.min(20, Math.floor(durationInFrames / 4));
+  const fadeOut = interpolate(
+    frame,
+    [durationInFrames - fadeOutFrames, durationInFrames],
+    [1, 0],
+    { extrapolateLeft: "clamp", extrapolateRight: "clamp" },
+  );
+
+  const opacity = Math.min(interpolate(enter, [0, 1], [0, 1]), fadeOut);
+  const translateY = interpolate(enter, [0, 1], [40, 0]);
+
+  return (
+    <AbsoluteFill
+      style={{
+        zIndex: 15,
+        justifyContent: "center",
+        alignItems: "center",
+        padding: "0 50px",
+      }}
+    >
+      <div
+        style={{
+          backgroundColor: "rgba(10, 14, 22, 0.88)",
+          borderRadius: 16,
+          padding: "48px 52px",
+          maxWidth: "95%",
+          opacity,
+          transform: `translateY(${translateY}px)`,
+        }}
+      >
+        <div
+          style={{
+            fontSize: 64,
+            lineHeight: "88px",
+            color: "white",
+            fontFamily: "Georgia, serif",
+            fontWeight: "bold",
+            fontStyle: "italic",
+            textAlign: "center",
+            textShadow: "0 2px 8px rgba(0,0,0,0.6)",
+          }}
+        >
+          &ldquo;{text}&rdquo;
+        </div>
+      </div>
+    </AbsoluteFill>
+  );
+};
+
+// MonologueOverlay — used for NA/AA shorts.
+//
+// Fixed-height dark box with a top + bottom alpha fade. Long character
+// narrations (60-90s, 130-175 words) scroll vertically over the sequence
+// so lines gently fade in at the top edge and out at the bottom. Short
+// quotes collapse the scroll (distance=0) but the mask still sits around
+// invisible empty space.
+//
+// Line estimate is word-count-based because fitText-based estimation
+// undercounts wrap and produced an overflow on the first AA render.
 const QUOTE_FONT = 54;
 const QUOTE_LINE_RATIO = 1.45;
 const QUOTE_BOX_HEIGHT = 1180;
 const QUOTE_V_PAD = 48;
 const QUOTE_SCROLL_START_PCT = 0.08;
 const QUOTE_SCROLL_END_PCT = 0.92;
-// Conservative words-per-line assumption for Georgia bold italic at 54px
-// inside the ~900px padded column. Rounded DOWN on purpose — overestimating
-// lines is safe (gives a longer scroll ramp on short text, no visible
-// effect), underestimating is what caused the overflow bug.
 const WORDS_PER_LINE = 4.5;
-const LINE_PAD_EXTRA = 1; // add 1 line of slack for punctuation / closing quote
+const LINE_PAD_EXTRA = 1;
 
-const QuoteOverlay: React.FC<{ text: string }> = ({ text }) => {
+const MonologueOverlay: React.FC<{ text: string }> = ({ text }) => {
   const frame = useCurrentFrame();
   const { fps, durationInFrames } = useVideoConfig();
 
