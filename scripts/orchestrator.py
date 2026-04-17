@@ -2080,24 +2080,40 @@ def _batch_process(items: list):
             )
             log_step(cid, "video", 4, "success")
 
-            # Upload to Supabase Storage (primary) + Drive (fallback)
+            # Upload to Supabase Storage (primary) + Drive (fallback).
+            #
+            # Persist video_storage_path to the content row IMMEDIATELY after
+            # a successful upload — not at the end of the batch — so a later
+            # crash or SIGTERM can't orphan the upload. Previously the path
+            # was only written in the final update_supabase(cid, updates) call
+            # ~80 lines below, and any death in that window left ready rows
+            # with NULL storage paths (invisible on the review page).
             drive_url = None
             video_storage_path = None
             log_step(cid, "upload", 5, "running")
             try:
                 from supabase_storage import upload_to_storage
                 video_storage_path = upload_to_storage(video_path, "wisdom-videos", channel_slug, vid_format)
+                if not video_storage_path:
+                    raise RuntimeError("upload_to_storage returned empty path")
+                update_supabase(cid, {
+                    "video_storage_path": video_storage_path,
+                    "local_machine_path": video_path,
+                })
                 print(f"  [{cid[:8]}] Storage: {video_storage_path}")
                 log_step(cid, "upload", 5, "success")
             except Exception as e:
+                log_step(cid, "upload", 5, "failed", str(e))
                 print(f"  [{cid[:8]}] Storage failed, trying Drive: {e}")
                 try:
                     if channel.get("google_drive_folder_id"):
                         drive_url = upload_to_drive(video_path, channel)
+                        update_supabase(cid, {
+                            "video_drive_url": drive_url,
+                            "local_machine_path": video_path,
+                        })
                         print(f"  [{cid[:8]}] Drive: {drive_url}")
-                    log_step(cid, "upload", 5, "success")
                 except Exception as e2:
-                    log_step(cid, "upload", 5, "failed", str(e2))
                     print(f"  [{cid[:8]}] Upload warning: {e2}")
 
             # YouTube metadata — for NA/AA shorts, reuse the title/description/
@@ -2120,7 +2136,7 @@ def _batch_process(items: list):
                     description = quotes[0]
                     tags = [philosopher, topic, "philosophy"]
 
-            # Thumbnail
+            # Thumbnail — same persist-immediately pattern as video upload.
             thumb_drive_url = None
             thumb_storage_path = None
             try:
@@ -2135,23 +2151,37 @@ def _batch_process(items: list):
                 try:
                     from supabase_storage import upload_to_storage as upload_thumb
                     thumb_storage_path = upload_thumb(thumb_path, "wisdom-thumbnails", channel_slug, vid_format)
+                    if thumb_storage_path:
+                        update_supabase(cid, {"thumbnail_storage_path": thumb_storage_path})
                 except Exception as ts_e:
                     print(f"  [{cid[:8]}] Thumb storage failed: {ts_e}")
                     if channel.get("google_drive_folder_id") and drive_url:
                         thumb_drive_url = upload_to_drive(thumb_path, channel)
+                        update_supabase(cid, {"thumbnail_drive_url": thumb_drive_url})
                 print(f"  [{cid[:8]}] Thumbnail: {thumb_path}")
             except Exception as thumb_e:
                 print(f"  [{cid[:8]}] Thumbnail warning: {thumb_e}")
 
-            # Update Supabase — status='ready' signals generation is done;
-            # human approves in dashboard → status becomes 'approved' →
-            # content_poller triggers youtube_uploader.py automatically.
+            # Final metadata update — status='ready' signals generation is
+            # done; human approves in dashboard → status becomes 'approved'
+            # → content_poller triggers youtube_uploader.py automatically.
+            #
+            # Invariant: a row cannot flip to 'ready' without a persisted
+            # video URL (storage path or drive url). Both fields were
+            # already persisted above via their own update_supabase calls,
+            # so by this point the URL is either saved or the row should
+            # be marked failed rather than ready.
+            if not video_storage_path and not drive_url:
+                mark_failed(cid, "upload step: no video URL persisted; "
+                                  "render completed but no storage/drive fallback succeeded")
+                print(f"  [{cid[:8]}] FAILED: no upload URL after render")
+                continue
+
             updates = {
                 "status": "ready",
                 "quote_text": " | ".join(quotes) if len(quotes) > 1 else quotes[0],
                 "title": title,
                 "description": description,
-                "local_machine_path": video_path,
                 "generation_params": {
                     "lora": data.get("lora", ""),
                     "voice_settings": data.get("voice_settings", {}),
@@ -2160,14 +2190,6 @@ def _batch_process(items: list):
                     "tags": tags,
                 },
             }
-            if video_storage_path:
-                updates["video_storage_path"] = video_storage_path
-            if thumb_storage_path:
-                updates["thumbnail_storage_path"] = thumb_storage_path
-            if drive_url:
-                updates["video_drive_url"] = drive_url
-            if thumb_drive_url:
-                updates["thumbnail_drive_url"] = thumb_drive_url
             update_supabase(cid, updates)
             print(f"  [{cid[:8]}] DONE -> {video_path}")
 
