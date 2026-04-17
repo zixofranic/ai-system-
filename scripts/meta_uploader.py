@@ -59,6 +59,7 @@ FELLOWS_URL = os.environ.get(
     "FELLOWS_SUPABASE_URL", "https://cujwhqoezvehwhhigxmr.supabase.co"
 )
 STORAGE_BUCKET = "wisdom-videos"  # same bucket for all channels
+THUMBNAIL_BUCKET = "wisdom-thumbnails"
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -146,6 +147,17 @@ def resolve_public_video_url(content):
     raise ValueError("No video URL available (no storage_path or drive_url)")
 
 
+def resolve_public_thumbnail_url(content):
+    """Public URL for the pre-rendered thumbnail (JPEG). Used as the IG Reel
+    cover_url and the FB video thumbnail. Without this, both platforms grab
+    the first video frame — which is black for our fade-in Remotion renders,
+    leaving Reels visually blank in the grid."""
+    storage_path = content.get("thumbnail_storage_path")
+    if storage_path:
+        return f"{FELLOWS_URL}/storage/v1/object/public/{THUMBNAIL_BUCKET}/{storage_path}"
+    return None
+
+
 # --- Caption builder ------------------------------------------------------
 
 
@@ -179,16 +191,17 @@ def build_caption(content, channel_slug):
 # --- Facebook Page video upload ------------------------------------------
 
 
-def publish_to_facebook_page(page_id, page_token, video_url, caption):
+def publish_to_facebook_page(page_id, page_token, video_url, caption, thumb_url=None):
     """POST the video to the FB Page via file_url (Meta fetches it)."""
     url = f"{GRAPH_BASE}/{page_id}/videos"
-    # Page posts support "description" (the body text). title is optional;
-    # we skip it so the description is the sole visible copy.
     payload = {
         "file_url": video_url,
         "description": caption,
         "access_token": page_token,
     }
+    # thumb on FB uses field name "thumb" accepting a public URL.
+    if thumb_url:
+        payload["thumb"] = thumb_url
     resp = requests.post(url, data=payload, timeout=600)
     data = resp.json()
     if "id" not in data:
@@ -199,18 +212,25 @@ def publish_to_facebook_page(page_id, page_token, video_url, caption):
 # --- Instagram Reels upload ----------------------------------------------
 
 
-def publish_to_instagram_reel(ig_user_id, page_token, video_url, caption):
+def publish_to_instagram_reel(ig_user_id, page_token, video_url, caption, cover_url=None):
     """Two-step IG content publishing: create container -> poll -> publish."""
     # Step 1 — create the media container (REELS)
+    payload = {
+        "media_type": "REELS",
+        "video_url": video_url,
+        "caption": caption,
+        "access_token": page_token,
+        "share_to_feed": "true",
+    }
+    # cover_url overrides the first-frame thumbnail that IG picks by default.
+    # Our renders fade in from black so the default leaves a black tile in
+    # the Reels grid. Passing our pre-rendered thumbnail gives a proper
+    # cover image.
+    if cover_url:
+        payload["cover_url"] = cover_url
     container_resp = requests.post(
         f"{GRAPH_BASE}/{ig_user_id}/media",
-        data={
-            "media_type": "REELS",
-            "video_url": video_url,
-            "caption": caption,
-            "access_token": page_token,
-            "share_to_feed": "true",
-        },
+        data=payload,
         timeout=120,
     )
     container_data = container_resp.json()
@@ -297,12 +317,17 @@ def process_content(content, dry_run=False, fb_only=False, ig_only=False):
         print(f"    {e}")
         return False
 
+    thumb_url = resolve_public_thumbnail_url(content)
+    if not thumb_url:
+        print("    Warning: no thumbnail_storage_path — IG will show black cover")
+
     channel_slug = (channel.get("slug") or "wisdom").lower()
     caption = build_caption(content, channel_slug)
 
     if dry_run:
         print(f"    [dry-run] Would publish to page={page_id} ig={ig_user_id}")
         print(f"    [dry-run] video_url={video_url}")
+        print(f"    [dry-run] thumb_url={thumb_url}")
         print(f"    [dry-run] caption={caption[:200]}...")
         return True
 
@@ -314,7 +339,7 @@ def process_content(content, dry_run=False, fb_only=False, ig_only=False):
         try:
             print(f"    Publishing to FB Page {page_id}...")
             fb_post_id = publish_to_facebook_page(
-                page_id, page_token, video_url, caption
+                page_id, page_token, video_url, caption, thumb_url=thumb_url
             )
             print(f"    FB published: {fb_post_id}")
         except Exception as e:
@@ -328,7 +353,7 @@ def process_content(content, dry_run=False, fb_only=False, ig_only=False):
             try:
                 print(f"    Publishing to IG {ig_user_id}...")
                 ig_post_id = publish_to_instagram_reel(
-                    ig_user_id, page_token, video_url, caption
+                    ig_user_id, page_token, video_url, caption, cover_url=thumb_url
                 )
                 print(f"    IG Reel published: {ig_post_id}")
             except Exception as e:
@@ -353,7 +378,8 @@ def fetch_items():
         headers=HEADERS,
         params={
             "select": "id,title,description,philosopher,channel_id,format,"
-                      "video_drive_url,video_storage_path,generation_params",
+                      "video_drive_url,video_storage_path,thumbnail_storage_path,"
+                      "generation_params",
             "status": "in.(approved,published)",
             "format": "eq.short",
             "or": "(video_drive_url.not.is.null,video_storage_path.not.is.null)",
