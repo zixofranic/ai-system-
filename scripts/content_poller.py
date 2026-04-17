@@ -26,6 +26,11 @@ ORCHESTRATOR = Path("C:/AI/system/scripts/orchestrator.py")
 YOUTUBE_UPLOADER = Path("C:/AI/system/scripts/youtube_uploader.py")
 TIKTOK_UPLOADER = Path("C:/AI/system/scripts/tiktok_uploader.py")
 META_UPLOADER = Path("C:/AI/system/scripts/meta_uploader.py")
+ANALYTICS_FETCHER = Path("C:/AI/system/scripts/analytics_fetcher.py")
+
+# Analytics runs every Nth poller tick. Poller ticks every 5 min, so 6 = 30 min.
+ANALYTICS_EVERY_N_TICKS = 6
+_tick_count = 0
 COMFYUI_DIR = Path("C:/AI/system/ComfyUI")
 COMFYUI_PORT = 8188
 CONDA_BAT = Path("C:/Users/ziadf/miniconda3/condabin/conda.bat")
@@ -152,6 +157,27 @@ def run_meta_uploader():
                 print(f"    {line}")
     else:
         print(f"  Meta uploader failed (exit {result.returncode})")
+        if result.stderr:
+            print(f"  Error: {result.stderr[:300]}")
+    return result.returncode
+
+
+def run_analytics_fetcher():
+    """Pull view/like stats for every published row across YT/TK/FB/IG.
+    Writes to content.generation_params.platform_stats."""
+    print("  Running analytics fetcher...")
+    result = subprocess.run(
+        [PYTHON_CHATTERBOX, str(ANALYTICS_FETCHER)],
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        capture_output=True, text=True, timeout=1800,
+    )
+    if result.returncode == 0:
+        print("  Analytics fetcher completed")
+        if result.stdout:
+            for line in result.stdout.strip().split("\n")[-5:]:
+                print(f"    {line}")
+    else:
+        print(f"  Analytics fetcher failed (exit {result.returncode})")
         if result.stderr:
             print(f"  Error: {result.stderr[:300]}")
     return result.returncode
@@ -536,6 +562,14 @@ def main():
                 print(f"[{now}] Meta publish batch complete.")
             else:
                 print(f"[{now}] No content awaiting Meta upload.")
+
+            # --- Analytics fetcher every Nth tick (default 30 min) ---
+            global _tick_count
+            _tick_count += 1
+            if _tick_count % ANALYTICS_EVERY_N_TICKS == 0:
+                print(f"\n[{now}] Tick {_tick_count} — running analytics fetcher")
+                run_analytics_fetcher()
+                print(f"[{now}] Analytics batch complete.")
 
             print(f"[{now}] Sleeping {POLL_INTERVAL // 60} min...")
 
