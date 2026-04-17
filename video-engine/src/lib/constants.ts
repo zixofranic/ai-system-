@@ -3,9 +3,11 @@ export const INTRO_DURATION = 2 * FPS; // 2s intro
 export const IMAGE_WIDTH = 1920;
 export const IMAGE_HEIGHT = 1080;
 
-// Background music volume (0-1). Lowered from 0.35 → 0.22 on 2026-04-08
-// so the James Burton narration sits clearly on top.
-export const MUSIC_VOLUME = 0.22;
+// Background music volume (0-1). Lowered from 0.35 → 0.22 on 2026-04-08,
+// then 0.22 → 0.16 on 2026-04-17 to lift perceived voice volume on NA/AA
+// monologue shorts. Voice already sits at 1.0 (Remotion's max), so the
+// only way to make narration feel louder is to drop the music floor.
+export const MUSIC_VOLUME = 0.16;
 // How many frames to fade music in at start and out at end
 export const MUSIC_FADE_FRAMES = 2 * FPS; // 2 seconds
 
