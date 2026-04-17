@@ -1496,9 +1496,12 @@ def process_short(content: dict):
         if channel_slug in ("na", "aa"):
             from ai_writer import generate_recovery_short_script
             previous = _fetch_recent_quotes(philosopher)
+            # 60s target -> ~130-175 words. The ShortVideo QuoteOverlay
+            # scrolls long text, so we lean into a monologue-length piece
+            # that gives the scroll + fade animation something to do.
             script = generate_recovery_short_script(
                 philosopher, topic, channel_slug,
-                target_seconds=40, previous_quotes=previous,
+                target_seconds=60, previous_quotes=previous,
             )
             quote = sanitize_quote(script.get("quote", ""))
             title = script.get("title") or f"{philosopher}: {topic[:40]}"
