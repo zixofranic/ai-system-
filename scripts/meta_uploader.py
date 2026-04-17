@@ -344,6 +344,10 @@ def process_content(content, dry_run=False, fb_only=False, ig_only=False):
 
 
 def fetch_items():
+    # Filter meta_publish_requested=true in the PostgREST query, NOT in
+    # Python. The previous version fetched the oldest 20 approved shorts
+    # and filtered client-side, which silently dropped newly-flagged rows
+    # once the backlog of older shorts grew past 20.
     resp = requests.get(
         f"{SUPABASE_URL}/rest/v1/content",
         headers=HEADERS,
@@ -353,6 +357,7 @@ def fetch_items():
             "status": "in.(approved,published)",
             "format": "eq.short",
             "or": "(video_drive_url.not.is.null,video_storage_path.not.is.null)",
+            "generation_params->meta_publish_requested": "eq.true",
             "deleted_at": "is.null",
             "order": "created_at.asc",
             "limit": "20",
@@ -360,10 +365,10 @@ def fetch_items():
         timeout=10,
     )
     items = resp.json() if resp.status_code == 200 else []
+    # Still exclude rows that have already been published (fb or ig id set).
     return [
         i for i in items
-        if (i.get("generation_params") or {}).get("meta_publish_requested")
-           and not (i.get("generation_params") or {}).get("meta_fb_post_id")
+        if not (i.get("generation_params") or {}).get("meta_fb_post_id")
            and not (i.get("generation_params") or {}).get("meta_ig_post_id")
     ]
 
