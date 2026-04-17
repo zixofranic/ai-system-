@@ -1879,14 +1879,37 @@ def _batch_process(items: list):
             previous = _fetch_recent_quotes(philosopher)
 
             if content_type == "short":
-                quote = sanitize_quote(content.get("quote_text") or "")
-                if not quote or quote.lower() in ("pending generation", "pending"):
-                    quote = generate_quote(philosopher, topic)
+                _slug = content["channels"]["slug"]
+                recovery_script = None
+                if _slug in ("na", "aa"):
+                    # NA/AA shorts use the Opus-grade recovery writer aiming at
+                    # ~60s of narration (130-175 words). This is the path the
+                    # content_poller actually hits — the identical block in
+                    # process_short() is only reached when orchestrator is
+                    # invoked with CLI args, not via the poller's batch path.
+                    from ai_writer import generate_recovery_short_script
+                    recovery_script = generate_recovery_short_script(
+                        philosopher, topic, _slug,
+                        target_seconds=60, previous_quotes=previous,
+                    )
+                    quote = sanitize_quote(recovery_script.get("quote", ""))
+                    print(f"  [{cid[:8]}] [quote] Opus {_slug} short: {len(quote.split())} words")
+                else:
+                    quote = sanitize_quote(content.get("quote_text") or "")
+                    if not quote or quote.lower() in ("pending generation", "pending"):
+                        quote = generate_quote(philosopher, topic)
                 quotes = [quote]
                 narration_segments = []
-                art_prompt_base = _build_art_prompt(philosopher, quote, topic,
-                                                    channel_slug=content["channels"]["slug"])
+                art_prompt_base = _build_art_prompt(
+                    philosopher, quote, topic,
+                    channel_slug=_slug,
+                    scene_hint=(recovery_script or {}).get("art_scene"),
+                )
                 art_prompts = [art_prompt_base]
+                # Stash the Opus-provided metadata so the later results dict
+                # can forward title/description/tags into the Supabase update.
+                if recovery_script:
+                    results.setdefault(cid, {})["recovery_script"] = recovery_script
             else:
                 # Recovery channels use daily-meditation writer in the midform slot
                 _slug = content["channels"]["slug"]
@@ -2077,18 +2100,25 @@ def _batch_process(items: list):
                     log_step(cid, "upload", 5, "failed", str(e2))
                     print(f"  [{cid[:8]}] Upload warning: {e2}")
 
-            # YouTube metadata — generate via ai_writer for SEO-optimised
-            # title, description, and tags before marking ready
-            try:
-                meta = generate_youtube_metadata(philosopher, quotes[0], topic)
-                title = meta.get("title") or f"{philosopher} on {topic}"
-                description = meta.get("description", "")
-                tags = meta.get("tags", [])
-            except Exception as _meta_e:
-                print(f"  [{cid[:8]}] Warning: metadata gen failed ({_meta_e}), using defaults")
-                title = f"{philosopher} on {topic}"
-                description = quotes[0]
-                tags = [philosopher, topic, "philosophy"]
+            # YouTube metadata — for NA/AA shorts, reuse the title/description/
+            # tags baked into the Opus recovery script (no extra Haiku round-
+            # trip). For other channels, run generate_youtube_metadata.
+            recovery_script = data.get("recovery_script")
+            if recovery_script:
+                title = recovery_script.get("title") or f"{philosopher} on {topic}"
+                description = recovery_script.get("description", "")
+                tags = recovery_script.get("tags", []) or []
+            else:
+                try:
+                    meta = generate_youtube_metadata(philosopher, quotes[0], topic)
+                    title = meta.get("title") or f"{philosopher} on {topic}"
+                    description = meta.get("description", "")
+                    tags = meta.get("tags", [])
+                except Exception as _meta_e:
+                    print(f"  [{cid[:8]}] Warning: metadata gen failed ({_meta_e}), using defaults")
+                    title = f"{philosopher} on {topic}"
+                    description = quotes[0]
+                    tags = [philosopher, topic, "philosophy"]
 
             # Thumbnail
             thumb_drive_url = None
