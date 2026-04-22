@@ -237,7 +237,12 @@ CHANNEL_VOICE = {
     # close-mic intimate, not cinematic. Reverb would push it toward
     # podcast-y / fake. Tune later if needed.
     "na": {
-        "provider_default": "elevenlabs",
+        # 2026-04-22: flipped to chatterbox. Approved by Ziad — acceptable
+        # with today's slow_factor gating (so EL-era 12% stretch doesn't
+        # stack on top of CB's own atempo=0.85). Emergency rollback:
+        # NA_TTS_PROVIDER=elevenlabs in .env (env override path works
+        # both directions — see _resolve_tts_provider).
+        "provider_default": "chatterbox",
         "chatterbox": {
             "atempo": 0.85,           # less aggressive than Gibran (0.80)
             "reverb": None,
@@ -254,7 +259,8 @@ CHANNEL_VOICE = {
         },
     },
     "aa": {
-        "provider_default": "elevenlabs",
+        # 2026-04-22: flipped to chatterbox alongside NA. Same rationale.
+        "provider_default": "chatterbox",
         "chatterbox": {
             "atempo": 0.85,
             "reverb": None,
