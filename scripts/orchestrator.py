@@ -174,12 +174,187 @@ PERSONA_TO_VOICE_ID = {
     "The Voice of the Rooms": "h2sm0NbeIZXHBzJOMYcQ",
 }
 
-# Chatterbox reference-audio filenames per archetype.
-# Populated only after Chatterbox passes the quality bar for an archetype.
-# Keys live in C:\AI\system\voice\recordings\.
-PERSONA_TO_CHATTERBOX_REF: dict = {
-    # "The Old-Timer": "na_old_timer_5min.wav",  # enable when CB quality passes
+# NOTE: persona-level Chatterbox refs were considered (PERSONA_TO_CHATTERBOX_REF)
+# but never populated — Chatterbox is currently CHANNEL-scoped, not
+# persona-scoped (see CHANNEL_CHATTERBOX_REF below). Add a persona-level
+# map only when an archetype actually needs a different reference clip
+# from the channel default.
+
+# --- Per-channel voice configuration ---
+#
+# One nested map keyed by channel slug. Replaces the four parallel dicts
+# (CHANNEL_TTS_PROVIDER + CHANNEL_CHATTERBOX_REF/ATEMPO/REVERB) that
+# could fall out of sync — adding a channel with `chatterbox.ref` set
+# but `chatterbox.atempo` missing would have rendered without time-
+# stretch and quietly produced a too-fast voice. Now it's structurally
+# impossible to half-configure a channel.
+#
+# Resolver: `_resolve_voice_config(channel_slug)` returns the merged
+# config (env-overridden provider on top of the static defaults below).
+#
+# Status as of 2026-04-19:
+#   - Wisdom / NA / AA → ElevenLabs only (Chatterbox declined for these
+#     channels per feedback_chatterbox_declined memory)
+#   - Gibran → ElevenLabs by default, flipped to Chatterbox via
+#     switch_gibran_tts.py (writes GIBRAN_TTS_PROVIDER env var to .env)
+CHANNEL_VOICE = {
+    "wisdom": {
+        "provider_default": "elevenlabs",
+    },
+    "gibran": {
+        "provider_default": "chatterbox",  # 2026-04-21: Gibran moved off ElevenLabs entirely
+        # Chatterbox profile — now the default. Env var GIBRAN_TTS_PROVIDER
+        # was already set to chatterbox; this just makes the code agree.
+        # ref:    Built 2026-04-19 from 12.7 min of clean EL Gibran output;
+        #         A_v2_slow recipe (long_ref) won the A/B/C blind test.
+        # atempo: CB native cadence runs ~20% faster than EL — this
+        #         time-stretches without pitch artifacts. 0.80 is the
+        #         limit before single-pass artifacts become audible.
+        # reverb: ffmpeg `aecho=in_gain:out_gain:delays(ms):decays`,
+        #         multi-tap via `|`. Two short taps with low decay add
+        #         a tiny room-sound to CB's dry zero-shot output.
+        "chatterbox": {
+            "ref":    "gibran_long_ref.wav",
+            "atempo": 0.80,
+            "reverb": "aecho=0.85:0.85:40|60:0.18|0.10",
+            # Soft landing — terminal falling intonation on the last 1.5s.
+            # Cinematic essays especially benefit since they end on a
+            # quotable line that should "settle" rather than just stop.
+            "tail_fade": {"duration": 1.5, "pitch_factor": 0.94, "volume_target": 0.7},
+        },
+    },
+    # NA / AA share the same three archetype voices (per CLAUDE.md). The
+    # CB profile picks a persona-specific reference; absence falls back
+    # to the channel default ref. Re-evaluation 2026-04-20: previous
+    # 2026-04-16 attempt declined CB because pacing felt rushed and the
+    # pause cues weren't honored. Since then we shipped the
+    # _chatterbox_pause_hints (em-dash → period rewrite) + atempo +
+    # reverb post-process, which should close most of the gap. This
+    # re-test runs through the same 3 reference clips that 2026-04-16
+    # used so the comparison is apples-to-apples.
+    #
+    # NO REVERB on recovery channels — the rooms-of-recovery aesthetic is
+    # close-mic intimate, not cinematic. Reverb would push it toward
+    # podcast-y / fake. Tune later if needed.
+    "na": {
+        "provider_default": "elevenlabs",
+        "chatterbox": {
+            "atempo": 0.85,           # less aggressive than Gibran (0.80)
+            "reverb": None,
+            # Smaller pitch drop (0.96 ~ -0.7 semitones) than Gibran — the
+            # recovery voice is already conversational; too much drop reads
+            # as melodramatic. Volume tapers slightly to 0.75.
+            "tail_fade": {"duration": 1.2, "pitch_factor": 0.96, "volume_target": 0.75},
+            "ref": "na_old_timer_5min.wav",   # fallback when no persona match
+            "persona_refs": {
+                "The Old-Timer":          "na_old_timer_5min.wav",
+                "The Sponsor":            "na_sponsor_5min.wav",
+                "The Voice of the Rooms": "na_rooms_5min.wav",
+            },
+        },
+    },
+    "aa": {
+        "provider_default": "elevenlabs",
+        "chatterbox": {
+            "atempo": 0.85,
+            "reverb": None,
+            "tail_fade": {"duration": 1.2, "pitch_factor": 0.96, "volume_target": 0.75},
+            "ref": "na_old_timer_5min.wav",
+            "persona_refs": {  # AA shares NA's voice clones
+                "The Old-Timer":          "na_old_timer_5min.wav",
+                "The Sponsor":            "na_sponsor_5min.wav",
+                "The Voice of the Rooms": "na_rooms_5min.wav",
+            },
+        },
+    },
 }
+
+
+def _resolve_voice_config(channel_slug: str, philosopher: str = None) -> dict:
+    """Return the resolved voice config for a channel + (optional) persona.
+
+    Returns dict with keys: provider, chatterbox (or None).
+    `provider` is post-env-override; `chatterbox` is None when CB isn't
+    qualified for this channel even if the env asks for it.
+
+    For NA/AA, the chatterbox profile carries `persona_refs` keyed by
+    archetype (The Old-Timer / The Sponsor / The Voice of the Rooms).
+    The resolver picks the right ref for `philosopher` and writes it
+    back into the returned cb dict's `ref` key. Falls back to the
+    channel-level `ref` when no persona match exists.
+    """
+    cfg = CHANNEL_VOICE.get(channel_slug, {"provider_default": "elevenlabs"})
+    provider = _resolve_tts_provider(channel_slug)
+    cb = cfg.get("chatterbox") if provider == "chatterbox" else None
+    if cb and philosopher:
+        # Copy so we don't mutate the static config dict
+        cb = dict(cb)
+        persona_refs = cb.get("persona_refs") or {}
+        if philosopher in persona_refs:
+            cb["ref"] = persona_refs[philosopher]
+        # else: keep cb["ref"] as the channel default
+    return {"provider": provider, "chatterbox": cb}
+
+
+def _resolve_tts_provider(channel_slug: str) -> str:
+    """Resolve the active TTS provider for a channel.
+
+    Order of precedence:
+      1. Channel-specific env var ({CHANNEL}_TTS_PROVIDER=chatterbox)
+         — set/cleared via switch_gibran_tts.py and analogous tools
+      2. CHANNEL_VOICE[channel].provider_default
+      3. "elevenlabs" hard fallback (never silently break a render)
+
+    Env values are normalized: "cb" / "chatterbox" / "elevenlabs" / "el".
+
+    A previous global PIPELINE_TTS_PROVIDER override was removed because
+    a single env var that flips ALL channels at once is footgun-shaped —
+    we always want per-channel control.
+    """
+    def _norm(v):
+        if not v:
+            return None
+        v = v.strip().lower()
+        if v in ("cb", "chatterbox"):
+            return "chatterbox"
+        if v in ("el", "elevenlabs", "11labs"):
+            return "elevenlabs"
+        return v
+
+    n = _norm(os.environ.get(f"{channel_slug.upper()}_TTS_PROVIDER"))
+    if n in ("chatterbox", "elevenlabs"):
+        return n
+    return (CHANNEL_VOICE.get(channel_slug, {}).get("provider_default")
+            or "elevenlabs")
+
+
+def _chatterbox_pause_hints(text: str) -> str:
+    """Pre-process text for Chatterbox to maximize honored pauses.
+
+    Empirical findings (2026-04-19, anchor-sentence test, see
+    cb_punctuation_test.py):
+      - PERIOD is the only punctuation CB honors strongly (~840ms gap)
+      - Comma / colon get a modest pause (~440ms)
+      - Em-dash, ellipsis, semicolon, question, exclamation all
+        produce gaps within ±100ms of baseline (effectively ignored)
+      - Extra whitespace around punctuation does NOTHING — `. ` vs
+        `.  ` vs `.   ` all produced identical 840ms gaps
+      - Newline behaves like a period
+
+    So the right preprocessing is: convert weak/ignored marks into
+    PERIODS where the writer intended a real beat, and leave commas /
+    colons alone (they're already getting their share). Don't bother
+    padding whitespace.
+    """
+    # Em-dashes — Gibran loves them, CB ignores them. Convert to period
+    # for a real ~840ms beat. Both spaced (` — `) and tight (`—`).
+    text = text.replace(" — ", ". ").replace("—", ". ")
+    # Semicolons — also ignored by CB. Treat the same way.
+    text = text.replace("; ", ". ")
+    # Ellipsis — surprised us; CB barely pauses on `...`. If the writer
+    # wanted a trailing beat, give them a real period.
+    text = text.replace("... ", ". ").replace("…", ".")
+    return text
 
 # Channel music pools — multi-style pool drawn from when picking a track.
 # Falls through to CHANNEL_DEFAULT_MUSIC_STYLE if the channel has no pool entry.
@@ -201,6 +376,91 @@ EQUALIZER_COLORS = {
     # NA uses the warm-gold sun color from the Fellows brand family
     "recovery_soft": "#E8B868",
 }
+
+
+# --- Gibran-only long-form format gate ----------------------------------
+#
+# Gibran non-short content (anything where format != 'short') must have
+# both `gibran_long_form_style` and `gibran_target_seconds` set on the
+# content row before generation. The columns are added by the migration
+# at scripts/migrations/2026_04_19_gibran_long_form_format_fields.sql.
+# Set via the dashboard modal OR scripts/set_gibran_format.py.
+#
+# Existing rows already rendered (status published/ready) never re-enter
+# the queue, so they're naturally grandfathered. New planned rows have
+# NULLs and get refused — orchestrator marks them rejected with a clear
+# rejection_reason so they show up in the dashboard with the right cue.
+
+GIBRAN_VALID_STYLES = ("essay", "anthology")
+GIBRAN_VALID_SECONDS_RANGE = (60, 3600)
+
+
+def _resolve_gibran_choice(content: dict) -> tuple:
+    """Validate the gibran_long_form_style + gibran_target_seconds fields
+    on a content row. Returns (style, seconds, error_or_None).
+
+    Tolerates the columns being absent entirely (migration not yet applied)
+    by treating them as None and surfacing a single "migration missing"
+    error instead of crashing.
+    """
+    style = content.get("gibran_long_form_style")
+    seconds = content.get("gibran_target_seconds")
+    if style is None and seconds is None:
+        return None, None, (
+            "Gibran non-short row missing gibran_long_form_style + "
+            "gibran_target_seconds — set via dashboard modal or "
+            "scripts/set_gibran_format.py"
+        )
+    if style not in GIBRAN_VALID_STYLES:
+        return style, seconds, (
+            f"gibran_long_form_style='{style}' invalid; "
+            f"must be one of {GIBRAN_VALID_STYLES}"
+        )
+    lo, hi = GIBRAN_VALID_SECONDS_RANGE
+    if seconds is None or not isinstance(seconds, int) or seconds < lo or seconds > hi:
+        return style, seconds, (
+            f"gibran_target_seconds={seconds!r} invalid; "
+            f"must be int in [{lo}, {hi}]"
+        )
+    return style, seconds, None
+
+
+def _apply_gibran_format_gate(queued: list) -> list:
+    """Filter the queue: any Gibran non-short row missing the new format
+    fields gets rejected immediately with a clear rejection_reason.
+    Returns the queue minus those rejected rows.
+
+    Rationale: forcing the choice at queue-pickup time (rather than at
+    queue-creation time) means the dashboard can rely on the orchestrator
+    as the source-of-truth gate even if a row was queued via the legacy
+    path or directly via SQL.
+    """
+    surviving = []
+    for content in queued:
+        slug = (content.get("channels") or {}).get("slug")
+        fmt = content.get("format", "short")
+        if slug != "gibran" or fmt == "short":
+            surviving.append(content)
+            continue
+        style, seconds, err = _resolve_gibran_choice(content)
+        if err:
+            cid = content["id"]
+            print(f"  REJECTED gibran-{fmt} {cid[:8]}: {err}")
+            # generation_log.step has a CHECK constraint — "publish" with
+            # step_order=0 is the existing convention for queue-rejection
+            # entries (see midform/story_vertical reject paths).
+            log_step(cid, "publish", 0, "failed", err)
+            try:
+                update_supabase(cid, {
+                    "status": "rejected",
+                    "rejection_reason": err,
+                })
+            except Exception as e:
+                print(f"    [WARN] couldn't mark row rejected: {e}")
+            continue
+        surviving.append(content)
+    return surviving
+
 
 # Default ComfyUI SDXL + LoRA workflow template
 # Placeholder values are filled at runtime via _build_comfyui_workflow()
@@ -413,14 +673,73 @@ def watermark_for_channel(channel_slug: str) -> str:
     return slug.upper()
 
 
-def update_supabase(content_id: str, updates: dict):
-    """PATCH a content row in Supabase."""
+def update_supabase(content_id: str, updates: dict, *,
+                    allow_deleted: bool = False):
+    """PATCH a content row in Supabase.
+
+    By default the PATCH is gated on `deleted_at IS NULL` so that a row
+    soft-deleted by the dashboard MID-GENERATION cannot be silently
+    resurrected by the pipeline's status-promotion writes. Without this,
+    a row deleted at T+30s during a 10-minute essay render would still
+    flip to status=ready at T+10m and the dashboard would hide it (real
+    incident 2026-04-20: River-of-Change essay rendered + uploaded onto
+    a tombstoned row, invisible until manually un-deleted).
+
+    Pass `allow_deleted=True` only for explicit "resurrect" operations.
+
+    Returns the PATCHed rows (Prefer: return=representation). When the
+    row was tombstoned mid-flight the array is empty — we log a warning
+    so the failure is visible in the poller log instead of silent.
+    """
     url = f"{SUPABASE_URL}/rest/v1/content?id=eq.{content_id}"
+    if not allow_deleted:
+        url += "&deleted_at=is.null"
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
-    resp = requests.patch(url, headers=_supabase_headers(),
-                          json=updates, timeout=30)
+    headers = _supabase_headers()
+    headers["Prefer"] = "return=representation"
+    resp = requests.patch(url, headers=headers, json=updates, timeout=30)
     resp.raise_for_status()
-    return resp.json()
+    body = resp.json()
+    if not allow_deleted and isinstance(body, list) and len(body) == 0:
+        # PATCH matched zero rows — the deleted_at filter blocked it.
+        # The row was soft-deleted while the pipeline was running. Don't
+        # raise (pipeline can't recover), but log loudly so it shows up
+        # in poller.log.
+        print(f"  [{content_id[:8]}] WARN: update_supabase no-op — "
+              f"row was soft-deleted mid-generation (deleted_at != NULL). "
+              f"Skipping update: {list(updates.keys())}")
+    return body
+
+
+def _is_deleted(content_id: str) -> bool:
+    """Cheap pre-flight check: returns True iff the row is soft-deleted.
+    Pipeline entry points call this before kicking off expensive work
+    (Opus + SDXL + voice + Remotion) so they can bail early instead of
+    rendering ~10 min of video onto a tombstoned row.
+    """
+    url = (f"{SUPABASE_URL}/rest/v1/content"
+           f"?id=eq.{content_id}&select=deleted_at")
+    try:
+        resp = requests.get(url, headers=_supabase_headers(), timeout=10)
+        resp.raise_for_status()
+        rows = resp.json()
+        return bool(rows and rows[0].get("deleted_at"))
+    except Exception as e:
+        # If the check itself fails, don't block generation — let the
+        # downstream update_supabase guard catch it after the fact.
+        print(f"  [{content_id[:8]}] WARN: _is_deleted check failed ({e}); "
+              f"proceeding with generation")
+        return False
+
+
+def _bail_if_deleted(content_id: str, where: str) -> bool:
+    """Convenience: print a clear message and return True if the row is
+    deleted. Caller should `return` immediately when this returns True."""
+    if _is_deleted(content_id):
+        print(f"  [{content_id[:8]}] BAIL ({where}): row is soft-deleted; "
+              f"refusing to generate. Un-delete via dashboard if intentional.")
+        return True
+    return False
 
 
 def mark_failed(content_id: str, reason) -> None:
@@ -757,23 +1076,221 @@ def _el_credit_gate(estimated_chars: int = 0) -> None:
         )
 
 
+def _apply_tail_fade(in_path: str, out_path: str,
+                     duration_s: float = 1.5,
+                     pitch_factor: float = 0.94,
+                     volume_target: float = 0.7) -> bool:
+    """Add a "soft landing" to the END of an audio file.
+
+    Splits the clip at `duration_s` from the end, pitch-shifts the tail
+    by `pitch_factor` (0.94 = drop ~1 semitone) using librubberband
+    (time-preserving — no time-stretch artifact), and tapers the volume
+    from 1.0 to `volume_target` across the tail using an exponential-sine
+    curve.
+
+    Real natural human voices DO drop pitch at the end of declarative
+    sentences (linguistic term: "terminal falling intonation"). Chatterbox
+    sometimes produces a flat end where this drop is missing — this
+    post-process restores the natural feel.
+
+    Returns True on success, False if ffmpeg failed (caller keeps the
+    pre-fade file rather than crashing the pipeline).
+    """
+    import subprocess
+    # Get total duration via ffprobe
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nk=1:nw=1", in_path],
+            capture_output=True, text=True, check=True,
+        )
+        total = float(probe.stdout.strip())
+    except (subprocess.CalledProcessError, ValueError) as e:
+        print(f"  [voice] WARN: tail_fade ffprobe failed ({e}); skipping post-process")
+        return False
+
+    # If clip is too short for a meaningful tail, skip
+    if total < duration_s + 0.5:
+        print(f"  [voice] tail_fade skipped — clip {total:.2f}s shorter than tail+headroom")
+        return False
+
+    head_end = total - duration_s  # split point
+    # Filter graph:
+    #   asplit -> two copies
+    #   head: trim to [0, head_end]
+    #   tail: trim to [head_end, end], reset PTS, pitch-shift, fade to target
+    #   concat both back
+    filter_graph = (
+        f"[0:a]asplit=2[a][b];"
+        f"[a]atrim=end={head_end:.4f},asetpts=PTS-STARTPTS[head];"
+        f"[b]atrim=start={head_end:.4f},asetpts=PTS-STARTPTS,"
+        f"rubberband=pitch={pitch_factor},"
+        f"volume=eval=frame:volume='1-(1-{volume_target})*(t/{duration_s})'[tail];"
+        f"[head][tail]concat=n=2:v=0:a=1[out]"
+    )
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", in_path, "-filter_complex", filter_graph,
+             "-map", "[out]", out_path],
+            check=True, capture_output=True,
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"  [voice] WARN: tail_fade ffmpeg failed "
+              f"({e.stderr[:200] if e.stderr else e}); keeping pre-fade output")
+        return False
+
+
+def _generate_voice_chatterbox(text: str, output_path: str,
+                               channel_slug: str,
+                               cb_cfg: dict,
+                               temperature: float = 0.75,
+                               exaggeration: float = 0.5,
+                               cfg_weight: float = 0.5,
+                               chunk_size: int = 240,
+                               seed: int = 4242) -> str:
+    """Synthesize via Chatterbox using the channel's CB profile.
+
+    cb_cfg comes from CHANNEL_VOICE[channel].chatterbox — atomic config:
+        ref:    reference_audio filename in voice/recordings/
+        atempo: ffmpeg time-stretch factor (1.0 = no change)
+        reverb: optional ffmpeg `aecho` expression baked into output
+
+    Recipe (from the Gibran A_v2_slow A/B/C blind test on 2026-04-19):
+      1. Pre-process text via _chatterbox_pause_hints — converts em-dash,
+         semicolon, ellipsis -> period (the only mark CB strongly honors).
+      2. POST /tts with voice_mode=clone + the channel's registered
+         reference. speed_factor stays at 1.0 (CB's native speed_factor
+         pitch-shifts; we time-stretch with ffmpeg atempo instead).
+      3. Single ffmpeg pass: atempo + optional reverb chained.
+
+    Returns the final WAV path.
+    """
+    import subprocess
+
+    ref_filename = cb_cfg["ref"]
+    atempo = cb_cfg.get("atempo", 1.0)
+    reverb = cb_cfg.get("reverb")
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "text": _chatterbox_pause_hints(text),
+        "voice_mode": "clone",
+        "reference_audio_filename": ref_filename,
+        "output_format": "wav",
+        "split_text": True,
+        "chunk_size": chunk_size,
+        "temperature": temperature,
+        "exaggeration": exaggeration,
+        "cfg_weight": cfg_weight,
+        "speed_factor": 1.0,
+        "seed": seed,
+        "language": "en",
+    }
+    raw_path = output_path + ".cb_raw.wav"
+    print(f"  [voice] Chatterbox synth ({channel_slug}, ref={ref_filename}, "
+          f"text={len(text)}ch, atempo={atempo}"
+          + (f", reverb={reverb}" if reverb else "")
+          + ")...")
+    resp = requests.post(f"{CHATTERBOX_URL}/tts", json=payload, timeout=1800)
+    resp.raise_for_status()
+    with open(raw_path, "wb") as f:
+        f.write(resp.content)
+
+    # Build a single ffmpeg filter chain: atempo + optional silence-cap
+    # + optional reverb. Doing them in one pass keeps things simple and
+    # avoids extra disk I/O.
+    #
+    # silence-cap: Chatterbox occasionally inserts a runaway 5-10s gap
+    # at a sentence/chunk boundary (real bug observed 2026-04-20: the
+    # NA "Voice of the Rooms" 90-day-clean short had a 9.1s silent stretch
+    # mid-audio). silenceremove with stop_periods=-1 finds every silence
+    # longer than `silence_cap_trigger` seconds and trims it down to
+    # `silence_cap_keep` seconds — natural ~0.5-1.5s sentence pauses are
+    # left intact, only the pathological gaps get squashed.
+    silence_cap_trigger = cb_cfg.get("silence_cap_trigger", 2.0)
+    silence_cap_keep    = cb_cfg.get("silence_cap_keep", 1.0)
+    silence_cap_threshold = cb_cfg.get("silence_cap_threshold", "-30dB")
+    filter_parts = []
+    if atempo and atempo != 1.0:
+        filter_parts.append(f"atempo={atempo}")
+    if silence_cap_trigger and silence_cap_keep:
+        filter_parts.append(
+            f"silenceremove=stop_periods=-1:"
+            f"stop_duration={silence_cap_trigger}:"
+            f"stop_threshold={silence_cap_threshold}:"
+            f"stop_silence={silence_cap_keep}"
+        )
+    if reverb:
+        filter_parts.append(reverb)
+
+    if filter_parts:
+        chain = ",".join(filter_parts)
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", raw_path, "-filter:a", chain,
+                 output_path],
+                check=True, capture_output=True,
+            )
+            os.remove(raw_path)
+        except subprocess.CalledProcessError as e:
+            # Roll back to raw if the chain fails — better dry-but-coherent
+            # than no audio at all.
+            print(f"  [voice] WARN: ffmpeg chain '{chain}' failed "
+                  f"({e.stderr[:120] if e.stderr else e}); keeping raw output")
+            os.replace(raw_path, output_path)
+    else:
+        os.replace(raw_path, output_path)
+
+    # Optional tail-fade — adds the missing "terminal falling intonation"
+    # that natural voices have at the end of a declarative sentence. CB
+    # sometimes ends flat; this gives the perceptual feel of the voice
+    # softly landing instead of just stopping. Configurable per channel.
+    tail_cfg = cb_cfg.get("tail_fade")
+    tail_status = "off"
+    if tail_cfg:
+        tmp_path = output_path + ".pre_tailfade.wav"
+        os.replace(output_path, tmp_path)
+        ok = _apply_tail_fade(
+            tmp_path, output_path,
+            duration_s=tail_cfg.get("duration", 1.5),
+            pitch_factor=tail_cfg.get("pitch_factor", 0.94),
+            volume_target=tail_cfg.get("volume_target", 0.7),
+        )
+        if ok:
+            os.remove(tmp_path)
+            tail_status = (
+                f"on(d={tail_cfg.get('duration',1.5)}s,"
+                f"pitch={tail_cfg.get('pitch_factor',0.94)},"
+                f"vol={tail_cfg.get('volume_target',0.7)})"
+            )
+        else:
+            os.replace(tmp_path, output_path)
+
+    print(f"  [voice] Saved (Chatterbox, atempo={atempo}, "
+          f"reverb={'on' if reverb else 'off'}, tail_fade={tail_status}): {output_path}")
+    return output_path
+
+
 def generate_voice(text: str, output_path: str,
                    channel_slug: str,
                    philosopher: str = None,
-                   tts_provider: str = "elevenlabs",
+                   tts_provider: str = None,
                    exaggeration: float = 0.5,
                    cfg_weight: float = 0.5,
                    slow_factor: float = 1.0) -> str:
     """
-    Generate voice via ElevenLabs TTS (default) or Chatterbox (when enabled
-    per archetype in PERSONA_TO_CHATTERBOX_REF).
+    Generate voice via ElevenLabs OR Chatterbox per CHANNEL_VOICE config.
 
     channel_slug is REQUIRED.
     philosopher: when provided, PERSONA_TO_VOICE_ID wins over channel default.
-    tts_provider: "elevenlabs" (default) or "chatterbox". Chatterbox path
-      only triggers when the archetype has a registered reference clip.
-    slow_factor: 1.0 = normal speed; <1.0 slows playback via ffmpeg atempo
-      while preserving pitch. E.g. 0.88 = 12% slower.
+    tts_provider: forces "elevenlabs" or "chatterbox". When None (default),
+      _resolve_voice_config(channel_slug) reads env vars and CHANNEL_VOICE
+      — the recommended path because it lets switch_gibran_tts.py flip
+      without touching any caller.
+    slow_factor: EL-only scalar; <1.0 slows playback via ffmpeg atempo
+      while preserving pitch. CB ignores it (uses its own per-channel
+      atempo from CHANNEL_VOICE[channel].chatterbox.atempo).
     Returns the local file path of the saved audio.
     """
     from elevenlabs import ElevenLabs, VoiceSettings
@@ -783,17 +1300,34 @@ def generate_voice(text: str, output_path: str,
 
     output_path = str(output_path)
 
-    # Chatterbox path — dormant until the CB client is implemented.
-    # If a caller requests it AND a reference clip is registered for this
-    # archetype, warn loudly and fall through to ElevenLabs rather than
-    # crashing the pipeline. A dashboard flag flip must NEVER brick content
-    # generation — EL is always the safe fallback.
-    if tts_provider == "chatterbox" and philosopher in PERSONA_TO_CHATTERBOX_REF:
-        print(
-            f"  [voice] WARNING: tts_provider=chatterbox requested for '{philosopher}' "
-            f"but Chatterbox dispatch is not yet implemented — falling back to ElevenLabs."
-        )
-        # Intentional fall-through to the EL block below.
+    # Resolve provider + CB config in one go. Pass philosopher so NA/AA
+    # archetype-aware references (The Old-Timer / The Sponsor / The Voice
+    # of the Rooms) get picked correctly per-row.
+    voice_cfg = _resolve_voice_config(channel_slug, philosopher=philosopher)
+    if tts_provider is None:
+        tts_provider = voice_cfg["provider"]
+        ref_for_log = (voice_cfg.get("chatterbox") or {}).get("ref", "-")
+        print(f"  [voice] resolved tts_provider={tts_provider} "
+              f"channel={channel_slug} persona={philosopher!r} ref={ref_for_log}")
+
+    # Chatterbox path — only enabled when the channel has a CB profile in
+    # CHANNEL_VOICE. If CB is requested but the channel isn't qualified,
+    # fall back to EL loudly rather than silently producing garbage.
+    if tts_provider == "chatterbox":
+        cb_cfg = voice_cfg["chatterbox"]
+        if not cb_cfg or not cb_cfg.get("ref"):
+            print(
+                f"  [voice] WARNING: tts_provider=chatterbox requested for "
+                f"channel='{channel_slug}' but no Chatterbox profile is "
+                f"registered in CHANNEL_VOICE — falling back to ElevenLabs."
+            )
+        else:
+            return _generate_voice_chatterbox(
+                text=text,
+                output_path=output_path,
+                channel_slug=channel_slug,
+                cb_cfg=cb_cfg,
+            )
 
     # ElevenLabs path (default).
     # Priority: philosopher-specific voice > channel default voice.
@@ -1248,12 +1782,12 @@ PHILOSOPHER_VISUAL_STYLE = {
     "Gibran": (
         "symbolist watercolor painting, warm ochre and earth-tone palette, "
         "soft dreamlike edges, mystical atmosphere, art nouveau influence, "
-        "luminous washes, spiritual symbolism, Kahlil Gibran's own painting style"
+        "luminous washes, spiritual symbolism, Khalil Gibran's own painting style"
     ),
     "Gibran Khalil Gibran": (
         "symbolist watercolor painting, warm ochre and earth-tone palette, "
         "soft dreamlike edges, mystical atmosphere, art nouveau influence, "
-        "luminous washes, spiritual symbolism, Kahlil Gibran's own painting style"
+        "luminous washes, spiritual symbolism, Khalil Gibran's own painting style"
     ),
     # --- Eastern philosophy: ink wash ---
     "Lao Tzu": (
@@ -1454,7 +1988,9 @@ def _final_video_path(channel_slug: str, format_name: str,
     Format is normalized: 'short' -> 'short', 'midform' -> 'midform',
     'longform' -> 'longform', 'story' -> 'story'.
     """
-    fmt = format_name if format_name in ("short", "midform", "longform", "story") else "short"
+    fmt = format_name if format_name in (
+        "short", "midform", "longform", "story", "story_vertical"
+    ) else "short"
     out_dir = Path(f"C:/AI/{channel_slug}/videos/{fmt}")
     out_dir.mkdir(parents=True, exist_ok=True)
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -1475,6 +2011,8 @@ def process_short(content: dict):
     For single-item processing, we still do art-then-voice sequentially.
     """
     content_id = content["id"]
+    if _bail_if_deleted(content_id, "process_short"):
+        return
     philosopher = content["philosopher"]
     topic = content.get("topic", "life and wisdom")
     content = _ensure_channel_data(content)
@@ -1551,13 +2089,17 @@ def process_short(content: dict):
         raise
 
     # --- Step 4: Voice ---
-    # slow_factor=0.88 slows shorts narration 12% — default 11labs cadence
-    # feels too rushed for the James Burton voice on 12-15s shorts.
+    # slow_factor=0.88 = 12% slowdown via ffmpeg atempo. Tuned for the
+    # Wisdom James Burton voice; the NA/AA recovery archetypes already
+    # speak conversationally, and stretching their EL output produces
+    # ~1.8s pauses on commas/periods (esp. on scripts with single-word
+    # fragments like "Joy. Surprise."). Gate to wisdom only.
+    short_slow_factor = 0.88 if channel_slug == "wisdom" else 1.0
     log_step(content_id, "voice", 3, "running")
     try:
         voice_path = str(work / "voice.wav")
         generate_voice(quote, voice_path, channel_slug=channel_slug,
-                       philosopher=philosopher, slow_factor=0.88)
+                       philosopher=philosopher, slow_factor=short_slow_factor)
         log_step(content_id, "voice", 3, "success")
     except Exception as e:
         log_step(content_id, "voice", 3, "failed", str(e))
@@ -1580,7 +2122,7 @@ def process_short(content: dict):
             music_path=music_path,
             output_path=video_path,
             format="short",
-            channel_name=channel_name,
+            channel_slug=channel_slug,
             title=title,
             equalizer_color=eq_color,
             watermark=watermark_for_channel(channel_slug),
@@ -1672,6 +2214,8 @@ def process_midform(content: dict):
     Similar to short but generates multiple quotes + art pieces.
     """
     content_id = content["id"]
+    if _bail_if_deleted(content_id, "process_midform"):
+        return
     philosopher = content["philosopher"]
     topic = content.get("topic", "life and wisdom")
     content = _ensure_channel_data(content)
@@ -1774,7 +2318,7 @@ def process_midform(content: dict):
             music_path=music_path,
             output_path=video_path,
             format="midform",
-            channel_name=channel_name,
+            channel_slug=channel_slug,
             title=midform_title,
             narration_segments=narration_segments,
             equalizer_color=eq_color,
@@ -2006,8 +2550,10 @@ def _batch_process(items: list):
         work = data["work"]
         fmt = content.get("format", "short")
         # Shorts need a 12% slowdown so the narration doesn't feel rushed.
-        # Midform/longform handle their own pacing.
-        slow_factor = 0.88 if fmt == "short" else 1.0
+        # Midform/longform handle their own pacing. Wisdom-only — NA/AA
+        # archetype voices are already conversational and stretching them
+        # produces ~1.8s pauses on commas/periods.
+        slow_factor = 0.88 if (fmt == "short" and channel_slug == "wisdom") else 1.0
 
         try:
             log_step(cid, "voice", 3, "running")
@@ -2072,7 +2618,7 @@ def _batch_process(items: list):
                 music_path=music_path,
                 output_path=video_path,
                 format=vid_format,
-                channel_name=channel_name,
+                channel_slug=channel_slug,
                 title=batch_title,
                 narration_segments=data.get("narration_segments"),
                 equalizer_color=eq_color,
@@ -2202,9 +2748,145 @@ def _batch_process(items: list):
 # ---------------------------------------------------------------------------
 # Story pipeline delegation
 # ---------------------------------------------------------------------------
+def _run_gibran_essay_pipeline(content: dict):
+    """Delegate Gibran cinematic essay format to generate_gibran_essay.py
+    as a subprocess (mirrors the story / meditation delegation pattern).
+    Long essays can run 10-20 min of voice + 20-40 SDXL renders, so we
+    isolate from the poller process and keep a per-run log file."""
+    cid = content["id"]
+    if _bail_if_deleted(cid, "_run_gibran_essay_pipeline"):
+        return
+    print(f"\n--- Gibran Essay Pipeline: {content.get('title', '?')[:60]} ---")
+    update_supabase(cid, {"status": "generating"})
+    log_step(cid, "video", 0, "running")  # step_order=0 marks outer-pipeline wrapper
+
+    cmd = [
+        sys.executable,
+        str(Path(__file__).parent / "generate_gibran_essay.py"),
+        "--content-id", cid,
+    ]
+    logs_dir = Path(__file__).parent / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    log_file = logs_dir / f"essay_{cid[:8]}_{ts}.log"
+    print(f"  Subprocess log: {log_file}")
+
+    try:
+        with open(log_file, "w", encoding="utf-8") as lf:
+            proc = subprocess.Popen(
+                cmd, stdout=lf, stderr=subprocess.STDOUT, text=True,
+                cwd=str(Path(__file__).parent),
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            )
+            try:
+                # 45 min cap — covers a 20-min essay with ~30 SDXL renders.
+                returncode = proc.wait(timeout=2700)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+                raise
+
+        if returncode != 0:
+            tail = ""
+            try:
+                with open(log_file, "r", encoding="utf-8", errors="replace") as lf:
+                    tail = "".join(lf.readlines()[-25:])[-1500:]
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Gibran essay pipeline failed (exit {returncode}). Tail:\n{tail}"
+            )
+        log_step(cid, "video", 0, "success")
+        print(f"  Gibran essay completed for {cid}")
+    except subprocess.TimeoutExpired:
+        log_step(cid, "video", 0, "failed", f"Timeout (log: {log_file})")
+        mark_failed(cid, f"essay pipeline: timeout (log: {log_file})")
+        raise
+    except Exception as e:
+        log_step(cid, "video", 0, "failed", str(e))
+        mark_failed(cid, f"essay pipeline: {e}")
+        raise
+
+
+def _run_meditation_pipeline(content: dict):
+    """Delegate story_vertical (Portrait Short) format to
+    generate_meditation_short.py as a subprocess.
+
+    See generate_meditation_short.py for the full pipeline. We launch it as a
+    subprocess for the same reason as the story pipeline: long-running
+    Whisper + SDXL + Remotion calls that we want to keep isolated from the
+    poller process and easily diagnosable from a per-run log file.
+    """
+    cid = content["id"]
+    if _bail_if_deleted(cid, "_run_meditation_pipeline"):
+        return
+    philosopher = content.get("philosopher", "Marcus Aurelius")
+    topic = content.get("topic", "life")
+    content = _ensure_channel_data(content)
+    channel_slug = content["channels"]["slug"]
+
+    print(f"\n--- Meditation Pipeline: {philosopher} on {topic} [channel={channel_slug}] ---")
+    update_supabase(cid, {"status": "generating"})
+    log_step(cid, "video", 0, "running")  # step_order=0 marks outer-pipeline wrapper
+
+    cmd = [
+        sys.executable, str(Path(__file__).parent / "generate_meditation_short.py"),
+        "--content-id", cid,
+        "--philosopher", philosopher,
+        "--topic", topic,
+        "--channel-slug", channel_slug,
+    ]
+    queued_title = content.get("title")
+    if queued_title:
+        cmd.extend(["--queued-title", queued_title])
+
+    logs_dir = Path(__file__).parent / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    log_file = logs_dir / f"meditation_{cid[:8]}_{ts}.log"
+    print(f"  Subprocess log: {log_file}")
+
+    try:
+        with open(log_file, "w", encoding="utf-8") as lf:
+            proc = subprocess.Popen(
+                cmd, stdout=lf, stderr=subprocess.STDOUT, text=True,
+                cwd=str(Path(__file__).parent),
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            )
+            try:
+                returncode = proc.wait(timeout=1500)  # 25 min cap
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+                raise
+
+        if returncode != 0:
+            tail = ""
+            try:
+                with open(log_file, "r", encoding="utf-8", errors="replace") as lf:
+                    tail = "".join(lf.readlines()[-25:])[-1500:]
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Meditation pipeline failed (exit {returncode}). Tail:\n{tail}"
+            )
+        log_step(cid, "video", 0, "success")
+        print(f"  Meditation pipeline completed for {cid}")
+    except subprocess.TimeoutExpired:
+        log_step(cid, "video", 0, "failed", f"Timeout (log: {log_file})")
+        mark_failed(cid, f"meditation pipeline: timeout (log: {log_file})")
+        raise
+    except Exception as e:
+        log_step(cid, "video", 0, "failed", str(e))
+        mark_failed(cid, f"meditation pipeline: {e}")
+        raise
+
+
 def _run_story_pipeline(content: dict):
     """Delegate story format to generate_story_video.py as a subprocess."""
     cid = content["id"]
+    if _bail_if_deleted(cid, "_run_story_pipeline"):
+        return
     philosopher = content.get("philosopher", "Marcus Aurelius")
     topic = content.get("topic", "life")
     content = _ensure_channel_data(content)
@@ -2306,6 +2988,12 @@ def main():
     if args.limit > 0:
         queued = queued[:args.limit]
 
+    # Gibran-only: gate any non-short rows that haven't picked a format
+    # style + duration. Mark them rejected with a clear reason so the
+    # dashboard surfaces them as "needs format choice" instead of silently
+    # holding them in the queue.
+    queued = _apply_gibran_format_gate(queued)
+
     print(f"Found {len(queued)} queued item(s)")
 
     if not queued:
@@ -2331,26 +3019,45 @@ def main():
         for content in queued:
             try:
                 content_type = content.get("format", "short")
-                # Midform was killed 2026-04-09. Any queued midform item is
-                # rejected loudly instead of silently rendering a dead-zone
-                # video.
-                if content_type == "midform":
-                    msg = "midform format killed — reject and flag"
-                    print(f"  REJECTED: {content['id']} ({msg})")
-                    log_step(content["id"], "publish", 0, "failed", msg)
-                    update_supabase(content["id"], {
-                        "status": "rejected",
-                        "rejection_reason": "midform format discontinued; use short or story",
-                    })
+                # story_vertical (Portrait Short, 9:16, ~60s) runs through
+                # the standalone meditation pipeline — Opus writes a
+                # philosopher-voice mini-narrative, SDXL paints scene-per-art,
+                # Whisper aligns word timestamps, Remotion's
+                # StoryVerticalVideo composition renders the 9:16 output.
+                # NO parent story required — works straight from the queue.
+                # 2026-04-18 fix.
+                if content_type == "story_vertical":
+                    _run_meditation_pipeline(content)
+                    print(f"  Done: {content['id']}")
+                    continue
+                # Gibran cinematic essay (post-format-gate) — routes any
+                # Gibran non-short row whose gibran_long_form_style='essay'
+                # to the cinematic essay pipeline regardless of nominal
+                # format ("story" / "midform" / "longform"). The format
+                # column is now a length category; style is the renderer.
+                slug = (content.get("channels") or {}).get("slug")
+                if slug == "gibran" and content.get("gibran_long_form_style") == "essay":
+                    _run_gibran_essay_pipeline(content)
+                    print(f"  Done: {content['id']}")
                     continue
                 if content_type == "story":
                     _run_story_pipeline(content)
                 elif content_type == "short":
                     process_short(content)
-                elif content_type in ("longform", "compilation"):
+                elif content_type in ("longform", "compilation", "midform"):
                     process_midform(content)
                 else:
-                    process_short(content)
+                    # Unknown format — refuse rather than guess. Previously
+                    # this defaulted to process_short and silently produced
+                    # the wrong artifact for any format we hadn't enumerated.
+                    msg = f"unknown format '{content_type}' — refusing to guess pipeline"
+                    print(f"  REJECTED: {content['id']} ({msg})")
+                    log_step(content["id"], "publish", 0, "failed", msg)
+                    update_supabase(content["id"], {
+                        "status": "rejected",
+                        "rejection_reason": msg,
+                    })
+                    continue
                 print(f"  Done: {content['id']}")
             except Exception as e:
                 print(f"  FAILED: {content['id']} - {e}")
@@ -2358,11 +3065,13 @@ def main():
                 log_step(content["id"], "publish", 0, "failed", str(e))
                 mark_failed(content["id"], e)
     else:
-        # Reject midform up front (killed 2026-04-09)
-        midforms = [c for c in queued if c.get("format") == "midform"]
-        for content in midforms:
-            msg = "midform format discontinued; use short or story"
-            print(f"  REJECTED midform: {content['id']}")
+        # Reject story_vertical up front — needs parent story, not queue path
+        # (silently rendered as midform before 2026-04-18).
+        story_verticals = [c for c in queued if c.get("format") == "story_vertical"]
+        for content in story_verticals:
+            msg = ("story_vertical can't be generated from the queue — "
+                   "use scripts/generate_story_vertical.py with a parent story")
+            print(f"  REJECTED story_vertical: {content['id']}")
             log_step(content["id"], "publish", 0, "failed", msg)
             try:
                 update_supabase(content["id"], {
@@ -2372,11 +3081,50 @@ def main():
             except Exception:
                 pass
 
+        # Gibran cinematic essays — own subprocess pipeline (mirrors story).
+        # Pulled out before the batched path because they run 10-20 min of
+        # voice + many SDXL renders; batching with shorts wastes the
+        # VRAM-aware optimization.
+        gibran_essays = [
+            c for c in queued
+            if (c.get("channels") or {}).get("slug") == "gibran"
+            and c.get("gibran_long_form_style") == "essay"
+            and c.get("format") != "short"
+        ]
+        for content in gibran_essays:
+            try:
+                _run_gibran_essay_pipeline(content)
+                print(f"  Done (gibran-essay): {content['id']}")
+            except Exception as e:
+                print(f"  FAILED (gibran-essay): {content['id']} - {e}")
+                traceback.print_exc()
+                mark_failed(content["id"], f"gibran essay: {e}")
+        gibran_essay_ids = {c["id"] for c in gibran_essays}
+
+        # Midform (treated as longform — up to 20 min). Gibran essays already
+        # handled above; anything else routes to process_midform.
+        non_essay_midforms = [
+            c for c in queued
+            if c.get("format") == "midform"
+            and c["id"] not in gibran_essay_ids
+        ]
+        for content in non_essay_midforms:
+            try:
+                process_midform(content)
+                print(f"  Done (midform): {content['id']}")
+            except Exception as e:
+                print(f"  FAILED (midform): {content['id']} - {e}")
+                traceback.print_exc()
+                mark_failed(content["id"], f"midform: {e}")
+
         # Stories run separately (own pipeline), rest go through batch
-        stories = [c for c in queued if c.get("format") == "story"]
+        stories = [c for c in queued
+                   if c.get("format") == "story"
+                   and c["id"] not in gibran_essay_ids]
         non_stories = [
             c for c in queued
-            if c.get("format") not in ("story", "midform")
+            if c.get("format") not in ("story", "midform", "story_vertical")
+            and c["id"] not in gibran_essay_ids
         ]
         for content in stories:
             try:
