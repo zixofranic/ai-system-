@@ -209,6 +209,45 @@ def promote_scheduled_content():
 
 
 STALE_GENERATING_MINUTES = 45
+# Scheduled rows whose scheduled_at passed more than this many days ago
+# (and were never promoted, e.g. because the system was down at the time)
+# are considered abandoned. Mark failed so they don't sit hidden forever.
+STALE_SCHEDULED_DAYS = 30
+
+
+def reap_stale_scheduled():
+    """Mark scheduled rows whose scheduled_at is >30 days past as failed.
+
+    promote_scheduled_content runs every tick and promotes scheduled →
+    approved when the time arrives. If the system was down at promotion
+    time, the next tick catches it. If the row sits scheduled forever
+    (e.g. status flipped manually then forgotten) it should eventually
+    surface as a failure rather than vanishing into the past.
+    """
+    try:
+        from datetime import timedelta
+        cutoff = (datetime.utcnow() - timedelta(days=STALE_SCHEDULED_DAYS)).isoformat() + "Z"
+        url = f"{SUPABASE_URL}/rest/v1/content"
+        params = {
+            "select": "id,title,scheduled_at",
+            "status": "eq.scheduled",
+            "scheduled_at": f"lt.{cutoff}",
+            "deleted_at": "is.null",
+        }
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        items = resp.json() if resp.status_code == 200 else []
+        for item in items:
+            msg = (f"stale scheduled — scheduled_at was {item.get('scheduled_at')} "
+                   f"(>{STALE_SCHEDULED_DAYS} days past) and never promoted")
+            requests.patch(
+                f"{url}?id=eq.{item['id']}",
+                headers=HEADERS,
+                json={"status": "failed", "rejection_reason": msg},
+                timeout=10,
+            )
+            print(f"  Reaped stale scheduled: {item.get('title', item['id'][:8])}")
+    except Exception as e:
+        print(f"  Error reaping stale scheduled: {e}")
 
 
 def reap_stale_generating():
@@ -390,9 +429,10 @@ def run_orchestrator():
 
 
 def update_status(content_id, status, error=None):
-    """Update content status in Supabase."""
+    """Update content status in Supabase. Skips soft-deleted rows so we
+    don't resurrect a tombstoned row by writing status back onto it."""
     try:
-        url = f"{SUPABASE_URL}/rest/v1/content?id=eq.{content_id}"
+        url = f"{SUPABASE_URL}/rest/v1/content?id=eq.{content_id}&deleted_at=is.null"
         body = {"status": status}
         if error:
             body["rejection_reason"] = error
@@ -523,6 +563,9 @@ def main():
 
             # --- Reap stale `generating` rows from crashed subprocesses ---
             reap_stale_generating()
+
+            # --- Reap stale `scheduled` rows from missed promotions ---
+            reap_stale_scheduled()
 
             # --- Check for approved content to publish to YouTube ---
             approved = check_approved_content()
