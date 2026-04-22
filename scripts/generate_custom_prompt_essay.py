@@ -271,6 +271,24 @@ def main():
     log_step(cid, "quote", 1, "running")
 
     if is_custom_script:
+        # Python-side compliance backstop for NA/AA — the dashboard server
+        # action runs a substring check too, but that mirror only covers
+        # the obvious cases. compliance_filter has the full corpus + fuzzy
+        # matching, so re-run here before any pipeline spend on a row that
+        # somehow slipped past the dashboard guard.
+        if slug in ("na", "aa"):
+            try:
+                from compliance_filter import check as compliance_check
+                ok, reason, details = compliance_check(custom_prompt, channel_slug=slug)
+                if not ok:
+                    log_step(cid, "quote", 1, "failed", f"compliance: {reason}")
+                    raise SystemExit(
+                        f"Compliance gate: pasted text rejected for {slug} — {reason}. "
+                        f"Details: {details}"
+                    )
+            except ImportError:
+                print("  [compliance] WARN: compliance_filter not importable; skipping check")
+
         print(f"  [custom-prompt] bypassing LLM — {len(custom_prompt)} chars verbatim")
         try:
             script = _build_script_from_custom_prompt(
