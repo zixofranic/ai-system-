@@ -246,6 +246,16 @@ CHANNEL_VOICE = {
         "chatterbox": {
             "atempo": 0.85,           # less aggressive than Gibran (0.80)
             "reverb": None,
+            # "calmer, not slower" tuning (2026-04-22):
+            #   - exaggeration 0.25 (was default 0.5) — less upbeat, more
+            #     settled delivery. The archetypes read livelier than the
+            #     recovery-rooms tone calls for at 0.5.
+            #   - pitch_ratio 0.97 — drops the whole voice ~-0.5 semitone
+            #     for a grounded, centered quality. Duration unchanged
+            #     (asetrate → aresample → compensating atempo; see filter
+            #     chain in _generate_voice_chatterbox).
+            "exaggeration": 0.25,
+            "pitch_ratio": 0.97,
             # Smaller pitch drop (0.96 ~ -0.7 semitones) than Gibran — the
             # recovery voice is already conversational; too much drop reads
             # as melodramatic. Volume tapers slightly to 0.75.
@@ -264,6 +274,8 @@ CHANNEL_VOICE = {
         "chatterbox": {
             "atempo": 0.85,
             "reverb": None,
+            "exaggeration": 0.25,        # calmer delivery — see NA comment
+            "pitch_ratio": 0.97,         # -0.5 semitone, grounded feel
             "tail_fade": {"duration": 1.2, "pitch_factor": 0.96, "volume_target": 0.75},
             "ref": "na_old_timer_5min.wav",
             "persona_refs": {  # AA shares NA's voice clones
@@ -400,6 +412,27 @@ CHANNEL_MUSIC_POOL = {
     "na": ["stoic_classical", "gibran"],   # soft mixed pool per user direction 2026-04-16
     "aa": ["stoic_classical", "gibran"],   # same soft pool — AA tone maps to NA aesthetic
 }
+
+# Per-channel default equalizer/accent colors. The pipeline already maps
+# music_style → color; this fallback ensures each channel has a distinct
+# visual identity even when the music style is unset or shared. Used by
+# cinematic and remotion paths via _resolve_eq_color.
+CHANNEL_DEFAULT_EQ = {
+    "wisdom": "#D4AF37",   # warm gold (James Burton voice, classical aesthetic)
+    "gibran": "#C2603C",   # terracotta / burnt sienna (matches AIVideo intro)
+    "na":     "#4F8FB8",   # calm blue — clear-water feel for recovery
+    "aa":     "#7A9E7E",   # soft sage — grounding green for sobriety
+}
+
+
+def _resolve_eq_color(music_style: str | None, channel_slug: str | None) -> str:
+    """Pick the equalizer color: music style first (where defined), then
+    channel default, then a generic fallback."""
+    by_style = EQUALIZER_COLORS.get(music_style) if music_style else None
+    if by_style:
+        return by_style
+    return CHANNEL_DEFAULT_EQ.get(channel_slug or "", "#D4AF37")
+
 
 EQUALIZER_COLORS = {
     "stoic_classical": "#8B7355",
@@ -1187,6 +1220,11 @@ def _generate_voice_chatterbox(text: str, output_path: str,
                                cfg_weight: float = 0.5,
                                chunk_size: int = 240,
                                seed: int = 4242) -> str:
+    # Per-channel overrides from cb_cfg win over the default arg values.
+    # `exaggeration` lower = calmer (less expressive/upbeat). NA/AA
+    # archetype voices sounded upbeat by default — dropped them to 0.25
+    # per user feedback 2026-04-22 ("make him calmer, not slower").
+    exaggeration = cb_cfg.get("exaggeration", exaggeration)
     """Synthesize via Chatterbox using the channel's CB profile.
 
     cb_cfg comes from CHANNEL_VOICE[channel].chatterbox — atomic config:
@@ -1250,6 +1288,20 @@ def _generate_voice_chatterbox(text: str, output_path: str,
     silence_cap_keep    = cb_cfg.get("silence_cap_keep", 1.0)
     silence_cap_threshold = cb_cfg.get("silence_cap_threshold", "-30dB")
     filter_parts = []
+    # Optional global pitch drop — asetrate lowers the sample rate which
+    # drops pitch AND shortens duration; aresample back to 44100 then an
+    # atempo compensating bump restores duration with the pitch change
+    # preserved. Use a tiny ratio (0.97 ≈ -0.5 semitones) to deepen the
+    # voice slightly → reads "calmer" without changing speed. Set per
+    # channel via cb_cfg.pitch_ratio; skip when 1.0 or missing.
+    pitch_ratio = cb_cfg.get("pitch_ratio")
+    if pitch_ratio and pitch_ratio != 1.0:
+        # asetrate drops pitch + duration; aresample restores sample rate;
+        # atempo=1/pitch_ratio restores the original duration. Net effect:
+        # pure pitch shift, no tempo change.
+        filter_parts.append(f"asetrate=44100*{pitch_ratio}")
+        filter_parts.append("aresample=44100")
+        filter_parts.append(f"atempo={1.0/pitch_ratio:.6f}")
     if atempo and atempo != 1.0:
         filter_parts.append(f"atempo={atempo}")
     if silence_cap_trigger and silence_cap_keep:
@@ -2147,7 +2199,7 @@ def process_short(content: dict):
     # --- Step 5: Music ---
     music_path = pick_music(philosopher, channel_slug=channel_slug)
     music_style = PERSONA_TO_MUSIC_STYLE.get(philosopher) or CHANNEL_DEFAULT_MUSIC_STYLE.get(channel_slug, "stoic_classical")
-    eq_color = EQUALIZER_COLORS.get(music_style, "#D4AF37")
+    eq_color = _resolve_eq_color(music_style, channel_slug)
 
     # --- Step 6: Assemble video ---
     log_step(content_id, "video", 4, "running")
@@ -2352,7 +2404,7 @@ def process_midform(content: dict):
     # --- Step 4: Music ---
     music_path = pick_music(philosopher, channel_slug=channel_slug)
     music_style = PERSONA_TO_MUSIC_STYLE.get(philosopher) or CHANNEL_DEFAULT_MUSIC_STYLE.get(channel_slug, "stoic_classical")
-    eq_color = EQUALIZER_COLORS.get(music_style, "#D4AF37")
+    eq_color = _resolve_eq_color(music_style, channel_slug)
 
     # --- Step 5: Assemble ---
     log_step(content_id, "video", 4, "running")
@@ -2718,7 +2770,7 @@ def _batch_process(items: list):
             # Music
             music_path = pick_music(philosopher, channel_slug=channel_slug)
             music_style = PERSONA_TO_MUSIC_STYLE.get(philosopher) or CHANNEL_DEFAULT_MUSIC_STYLE.get(channel_slug, "stoic_classical")
-            eq_color = EQUALIZER_COLORS.get(music_style, "#D4AF37")
+            eq_color = _resolve_eq_color(music_style, channel_slug)
 
             # Assembly
             log_step(cid, "video", 4, "running")
@@ -2775,7 +2827,7 @@ def _batch_process(items: list):
                                  else f"cinematic scene illustrating: {q[:80]}")
                     scenes.append({"narration": narration, "direction": direction})
 
-                render_cinematic_essay(
+                cine_out = render_cinematic_essay(
                     title=batch_title,
                     philosopher=philosopher,
                     channel_slug=channel_slug,
@@ -2786,6 +2838,12 @@ def _batch_process(items: list):
                     art_aspect=LANDSCAPE,
                     equalizer_color=eq_color,
                 )
+                # Stash the cinematic-produced thumbnail so the thumbnail
+                # block downstream uses it instead of regenerating from
+                # data["art_paths"][0] (which has silently failed for
+                # some pipeline_work states — captured stdout was lost).
+                if cine_out.get("thumb_path"):
+                    data["_cinematic_thumb_path"] = cine_out["thumb_path"]
             else:
                 render_remotion_video(
                     quotes=quotes,
@@ -2865,12 +2923,22 @@ def _batch_process(items: list):
             try:
                 from thumbnail_generator import generate_thumbnail, generate_thumbnail_from_video
                 thumb_path = video_path.replace(".mp4", "_thumb.jpg")
-                first_art = data["art_paths"][0] if data.get("art_paths") else None
-                if first_art and Path(first_art).exists():
-                    tw, th = (1080, 1920) if content_type == "short" else (1920, 1080)
-                    generate_thumbnail(first_art, title, thumb_path, tw, th)
+                # Cinematic pipeline already generates a thumbnail with the
+                # right title + aspect — prefer it when available. Avoids
+                # re-running PIL on art_0.png and the silent-failure class
+                # of bugs we hit on NA midform.
+                cine_thumb = data.get("_cinematic_thumb_path")
+                if cine_thumb and Path(cine_thumb).exists():
+                    if cine_thumb != thumb_path:
+                        import shutil as _shutil
+                        _shutil.copy(cine_thumb, thumb_path)
                 else:
-                    generate_thumbnail_from_video(video_path, title, thumb_path, 1080, 1920)
+                    first_art = data["art_paths"][0] if data.get("art_paths") else None
+                    if first_art and Path(first_art).exists():
+                        tw, th = (1080, 1920) if content_type == "short" else (1920, 1080)
+                        generate_thumbnail(first_art, title, thumb_path, tw, th)
+                    else:
+                        generate_thumbnail_from_video(video_path, title, thumb_path, 1080, 1920)
                 # Verify the file actually landed before uploading. PIL
                 # can throw + be caught upstream and the video-frame
                 # fallback returns None on ffmpeg failure — both leave

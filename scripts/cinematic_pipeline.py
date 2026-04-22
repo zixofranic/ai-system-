@@ -255,6 +255,24 @@ def render_cinematic_essay(
     subprocess.run(render_cmd, cwd=str(VIDEO_ENGINE),
                    check=True, shell=True, timeout=1800)
 
+    # 8) Thumbnail — first scene art + title overlay. Aspect matches the
+    # rendered video so the dashboard review card isn't letterboxed.
+    # Lives next to the video file. Caller can choose to upload or skip.
+    thumb_path = None
+    try:
+        from thumbnail_generator import generate_thumbnail
+        thumb_path = str(Path(output_path).with_suffix("")) + "_thumb.jpg"
+        thumb_w, thumb_h = (1080, 1920) if is_portrait else (1920, 1080)
+        generate_thumbnail(art_paths[0], title, thumb_path, thumb_w, thumb_h)
+        if not Path(thumb_path).exists():
+            print(f"[thumb] WARN: generated path missing: {thumb_path}")
+            thumb_path = None
+        else:
+            print(f"[thumb] {thumb_path}")
+    except Exception as e:
+        print(f"[thumb] WARN: thumbnail generation failed ({e})")
+        thumb_path = None
+
     print(f"\n[done] {output_path}")
     return {
         "video_path": output_path,
@@ -262,6 +280,7 @@ def render_cinematic_essay(
         "voice_mp3":  voice_mp3,
         "art_paths":  art_paths,
         "music_path": music_path,
+        "thumb_path": thumb_path,
         "full_narration": full_narration,
         "scene_timings": scene_timings,
         "timestamps_path": str(timestamps_path),
