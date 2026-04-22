@@ -1,16 +1,29 @@
 """
-Generate a cinematic Gibran essay end-to-end.
+Generate a cinematic essay end-to-end — Custom Prompts + Gibran regular.
 
-Reads a Gibran content row that has gibran_long_form_style='essay' and a
-target_seconds set, calls Opus for the script, hands off to
-cinematic_pipeline.render_cinematic_essay, uploads to Supabase storage,
-updates the row to status=ready.
+Two entry paths converge here:
 
-Invoked by orchestrator's `_run_gibran_essay_pipeline` as a subprocess
+  1. CUSTOM PROMPTS (any channel: gibran, wisdom, na, aa).
+     The user pasted an LLM-written script on the dashboard; the adapter
+     preserves the prose VERBATIM (no LLM rewrite), splits on blank lines
+     into scenes, auto-generates art directions from each scene's opening
+     words, and runs it through the cinematic pipeline. Routed here when
+     `generation_params.is_custom_script = true`.
+
+  2. GIBRAN REGULAR ESSAY (gibran only).
+     The non-custom Gibran flow where Opus writes the essay from corpus
+     passages. Routed here when `channels.slug = 'gibran' AND
+     gibran_long_form_style = 'essay'` AND NOT `is_custom_script`.
+
+Aspect is chosen by `target_seconds`:
+  - <= 180s → PORTRAIT (9:16), output format=story_vertical
+  -  > 180s → LANDSCAPE (16:9), output format=story
+
+Invoked by orchestrator's `_run_custom_prompt_pipeline` as a subprocess
 (mirrors the existing story / meditation pipeline pattern). Can also be
 run directly:
 
-    python generate_gibran_essay.py --content-id <uuid>
+    python generate_custom_prompt_essay.py --content-id <uuid>
 """
 import argparse
 import os
@@ -24,19 +37,39 @@ from dotenv import load_dotenv
 load_dotenv("C:/AI/.env")
 sys.path.insert(0, "C:/AI/system/scripts")
 
-from cinematic_pipeline import LANDSCAPE, render_cinematic_essay
+from cinematic_pipeline import LANDSCAPE, PORTRAIT, render_cinematic_essay
 from orchestrator import (
+    EQUALIZER_COLORS,
+    PERSONA_TO_MUSIC_STYLE,
+    CHANNEL_DEFAULT_MUSIC_STYLE,
     _final_video_path,
     _fetch_recent_quotes,
     _resolve_gibran_choice,
     log_step,
     update_supabase,
+    watermark_for_channel,
 )
 from supabase_storage import upload_to_storage
 from thumbnail_generator import generate_thumbnail
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+
+# Channels currently supported end-to-end by this pipeline.
+# Gibran has regular-essay + custom-prompt paths; others are custom-only
+# today — Wisdom/NA/AA do not yet have channel-specific cinematic writers.
+SUPPORTED_CHANNELS = ("gibran", "wisdom", "na", "aa")
+
+# Fallback display names for non-Gibran channels when the row doesn't set
+# `philosopher`. Wisdom's `philosopher` is usually set by the dashboard
+# (Marcus, Seneca, etc.); for NA/AA the row should carry the archetype.
+# This only kicks in if the insert path forgot to set it — safety net.
+CHANNEL_DEFAULT_PHILOSOPHER = {
+    "gibran": "Gibran",
+    "wisdom": "Marcus Aurelius",
+    "na":     "The Old-Timer",
+    "aa":     "The Old-Timer",
+}
 
 
 def _fetch(content_id: str) -> dict:
@@ -108,6 +141,33 @@ def _build_script_from_custom_prompt(
     }
 
 
+def _resolve_target_seconds(row: dict) -> int:
+    """Target duration — `gibran_target_seconds` (Gibran-only column) first,
+    then `generation_params.target_seconds` (written by Custom Prompts
+    server action for all channels).
+    """
+    s = row.get("gibran_target_seconds")
+    if isinstance(s, int) and s > 0:
+        return s
+    gp = row.get("generation_params") or {}
+    s = gp.get("target_seconds")
+    if isinstance(s, int) and s > 0:
+        return s
+    return None
+
+
+def _resolve_equalizer_color(philosopher: str, channel_slug: str) -> str:
+    """Pick the equalizer color from the same mapping the shorts pipeline
+    uses. Falls back to the Gibran terracotta if the channel's music style
+    isn't in the EQ table.
+    """
+    music_style = (PERSONA_TO_MUSIC_STYLE.get(philosopher)
+                   or CHANNEL_DEFAULT_MUSIC_STYLE.get(channel_slug)
+                   or "stoic_classical")
+    # #C2603C is the render_cinematic_essay default (Gibran terracotta).
+    return EQUALIZER_COLORS.get(music_style, "#C2603C")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--content-id", required=True)
@@ -117,56 +177,88 @@ def main():
     cid = row["id"]
 
     slug = (row.get("channels") or {}).get("slug")
-    if slug != "gibran":
-        raise SystemExit(f"Refusing — Gibran-only by design, got channel='{slug}'")
+    if slug not in SUPPORTED_CHANNELS:
+        raise SystemExit(
+            f"Refusing — channel='{slug}' not supported by cinematic essay "
+            f"pipeline. Supported: {SUPPORTED_CHANNELS}"
+        )
 
-    # Re-validate the format gate (orchestrator already checked, but a
-    # direct CLI call should fail here too rather than hit Opus and find
-    # out at write time).
-    style, target_seconds, err = _resolve_gibran_choice(row)
-    if err:
-        raise SystemExit(f"Format gate: {err}")
-    if style != "essay":
-        raise SystemExit(f"Refusing — this script handles 'essay' only, got '{style}'")
+    gp = row.get("generation_params") or {}
+    is_custom_script = bool(gp.get("is_custom_script")
+                             or gp.get("custom_prompt_source"))
+    custom_prompt = gp.get("custom_prompt_source")
 
+    # ---- Gate by mode ----
+    if is_custom_script:
+        # Custom Prompts — any supported channel. Duration comes from the
+        # dashboard's preset; aspect is inferred below.
+        target_seconds = _resolve_target_seconds(row)
+        if not target_seconds:
+            raise SystemExit(
+                "Custom script row missing target_seconds in both "
+                "gibran_target_seconds and generation_params.target_seconds"
+            )
+        essay_voice = None  # unused — prose is verbatim from the paste
+    elif slug == "gibran":
+        # Gibran regular essay — re-validate the format gate (orchestrator
+        # already checked, but a direct CLI call should fail here too).
+        style, target_seconds, err = _resolve_gibran_choice(row)
+        if err:
+            raise SystemExit(f"Format gate: {err}")
+        if style != "essay":
+            raise SystemExit(
+                f"Refusing — Gibran non-custom path handles 'essay' only, got '{style}'"
+            )
+        # Writing style (new column) takes precedence; fall back to legacy
+        # gibran_essay_voice. Mapping:
+        #   writing_style       gibran_essay_voice
+        #   ──────────────      ──────────────────
+        #   narrator       <->  narrator
+        #   in_character   <->  prophet_voice
+        # The Gibran writer still takes the legacy vocabulary.
+        new_style = row.get("writing_style")
+        if new_style == "narrator":
+            essay_voice = "narrator"
+        elif new_style == "in_character":
+            essay_voice = "prophet_voice"
+        else:
+            essay_voice = row.get("gibran_essay_voice") or "narrator"
+        if essay_voice not in ("narrator", "prophet_voice"):
+            raise SystemExit(
+                f"Invalid essay voice='{essay_voice}'; "
+                f"must be 'narrator' or 'prophet_voice'"
+            )
+    else:
+        raise SystemExit(
+            f"Refusing — channel='{slug}' requires is_custom_script=true "
+            f"or custom_prompt_source (no channel-specific cinematic writer "
+            f"exists for non-Gibran non-custom rows yet)."
+        )
+
+    # ---- Resolve channel/persona/philosopher ----
+    philosopher = (row.get("philosopher")
+                   or CHANNEL_DEFAULT_PHILOSOPHER.get(slug, "Gibran"))
     topic = row.get("topic") or row.get("title") or "life"
     queued_title = row.get("title")
 
-    # Prose voice: 'narrator' (ChatGPT-style meta-interpretive, the primary
-    # Format A) or 'prophet_voice' (corpus-faithful Prophet emulation, the
-    # hidden Format B). NULL on the row defaults to narrator so migrations
-    # don't need to run before this code does — pre-migration rows get the
-    # primary format automatically.
-    # Prefer the new generalized writing_style column over the legacy
-    # gibran_essay_voice. They're parallel vocabularies:
-    #   writing_style       gibran_essay_voice
-    #   ──────────────      ──────────────────
-    #   narrator       <->  narrator
-    #   in_character   <->  prophet_voice
-    # The Gibran writer (generate_gibran_essay_script) still takes the
-    # legacy 'narrator' | 'prophet_voice' vocabulary, so we map back when
-    # the row carries the new column.
-    new_style = row.get("writing_style")
-    if new_style == "narrator":
-        essay_voice = "narrator"
-    elif new_style == "in_character":
-        essay_voice = "prophet_voice"
-    else:
-        # Fall back to legacy column or Gibran's narrator default
-        essay_voice = row.get("gibran_essay_voice") or "narrator"
-
-    if essay_voice not in ("narrator", "prophet_voice"):
-        raise SystemExit(
-            f"Invalid essay voice='{essay_voice}'; "
-            f"must be 'narrator' or 'prophet_voice'"
-        )
+    # ---- Aspect-by-duration ----
+    # 2-3 min presets → PORTRAIT (9:16) for phone-native consumption
+    # 10-20 min presets → LANDSCAPE (16:9) for YouTube long-form
+    # The 180s boundary matches the Custom Prompts modal's presets.
+    is_portrait = target_seconds <= 180
+    art_aspect = PORTRAIT if is_portrait else LANDSCAPE
+    render_format = "story_vertical" if is_portrait else "story"
 
     print(f"\n{'='*70}")
-    print(f"  Gibran cinematic essay")
+    print(f"  Cinematic essay — {slug}/{render_format}")
     print(f"  content_id   : {cid}")
+    print(f"  philosopher  : {philosopher}")
     print(f"  topic        : {topic}")
     print(f"  target       : {target_seconds}s ({target_seconds/60:.1f} min)")
-    print(f"  essay voice  : {essay_voice}")
+    print(f"  aspect       : {'9:16 PORTRAIT' if is_portrait else '16:9 LANDSCAPE'}")
+    print(f"  mode         : {'custom_script' if is_custom_script else 'gibran_essay'}")
+    if essay_voice:
+        print(f"  essay voice  : {essay_voice}")
     if queued_title:
         print(f"  queued title : {queued_title}")
     print(f"{'='*70}\n")
@@ -178,12 +270,7 @@ def main():
     # pipeline's writer step.
     log_step(cid, "quote", 1, "running")
 
-    # Bypass path: Custom Prompts dashboard tile stashes a pasted LLM essay
-    # in generation_params.custom_prompt_source. When present, skip Opus
-    # and feed the user's prose through verbatim via the format adapter.
-    custom_prompt = (row.get("generation_params") or {}).get("custom_prompt_source")
-
-    if custom_prompt:
+    if is_custom_script:
         print(f"  [custom-prompt] bypassing LLM — {len(custom_prompt)} chars verbatim")
         try:
             script = _build_script_from_custom_prompt(
@@ -197,15 +284,13 @@ def main():
             log_step(cid, "quote", 1, "failed", str(e))
             raise
     else:
-        # 1) Pick source passages from the corpus + write
+        # Gibran regular essay — Opus writes from corpus passages
         try:
             from ai_writer import (
                 fetch_gibran_sources,
                 generate_gibran_essay_script,
             )
             previous = _fetch_recent_quotes("Gibran")
-            # Fetch explicitly so we can log which passages anchored this essay,
-            # then pass them through (writer would auto-fetch otherwise).
             sources = fetch_gibran_sources(topic, n=4)
             print(f"  [sources] grounding in {len(sources)} passage(s):")
             for s in sources:
@@ -217,8 +302,6 @@ def main():
                 source_passages=sources,
                 style=essay_voice,
             )
-            # Stash for traceability — `generation_params.source_passages`
-            # tells future-me which Gibran chunks the essay was rooted in.
             script["_source_passages"] = [
                 {"book": s["book"], "title": s["title"]} for s in sources
             ]
@@ -227,7 +310,7 @@ def main():
             log_step(cid, "quote", 1, "failed", str(e))
             raise
 
-    title = queued_title or script.get("title") or f"Khalil Gibran: {topic[:40]}"
+    title = queued_title or script.get("title") or f"{philosopher}: {topic[:40]}"
     print(f"  [script] {len(script['scenes'])} scenes, "
           f"{sum(len(s['narration'].split()) for s in script['scenes'])} words")
 
@@ -235,48 +318,50 @@ def main():
     log_step(cid, "video", 4, "running")
     try:
         work = Path("C:/AI/system/pipeline_work") / cid / "essay"
-        output_path = _final_video_path("gibran", "story", title, cid)
+        output_path = _final_video_path(slug, render_format, title, cid)
         out = render_cinematic_essay(
             title=title,
-            philosopher="Gibran",
-            channel_slug="gibran",
+            philosopher=philosopher,
+            channel_slug=slug,
             scenes=script["scenes"],
             output_path=str(output_path),
             work_dir=work,
             reuse=False,
-            art_aspect=LANDSCAPE,
+            art_aspect=art_aspect,
             closing_attribution=script.get("closing_attribution"),
+            equalizer_color=_resolve_equalizer_color(philosopher, slug),
         )
         log_step(cid, "video", 4, "success")
     except Exception as e:
         log_step(cid, "video", 4, "failed", str(e))
         raise
 
-    # 3) Thumbnail (first scene art + title)
+    # 3) Thumbnail — aspect-matched so the dashboard review card isn't letterboxed
     thumb_path = work / "thumbnail.jpg"
+    thumb_w, thumb_h = (1080, 1920) if is_portrait else (1920, 1080)
     try:
         generate_thumbnail(
             image_path=out["art_paths"][0],
             title=title,
             output_path=str(thumb_path),
-            width=1920, height=1080,
+            width=thumb_w, height=thumb_h,
         )
     except Exception as e:
         print(f"  [thumb] WARN: thumbnail generation failed ({e})")
         thumb_path = None
 
-    # 4) Upload to Supabase Storage
+    # 4) Upload to Supabase Storage (per-channel folder)
     log_step(cid, "upload", 5, "running")
     try:
         video_storage_path = upload_to_storage(
             str(output_path), bucket="wisdom-videos",
-            channel_slug="gibran", format_name="story",
+            channel_slug=slug, format_name=render_format,
         )
         thumb_storage_path = None
         if thumb_path and Path(thumb_path).exists():
             thumb_storage_path = upload_to_storage(
                 str(thumb_path), bucket="wisdom-thumbnails",
-                channel_slug="gibran", format_name="story",
+                channel_slug=slug, format_name=render_format,
             )
         log_step(cid, "upload", 5, "success")
     except Exception as e:
@@ -289,18 +374,23 @@ def main():
         "scenes": [s["direction"] for s in script["scenes"]],
         "num_scenes": len(script["scenes"]),
         "target_seconds": target_seconds,
+        "aspect": "9:16" if is_portrait else "16:9",
         "tags": script.get("tags", []),
-        "voice_settings": {"provider": "chatterbox"},
+        "voice_settings": {"provider": "chatterbox" if slug != "wisdom" else "elevenlabs"},
         "music_track": Path(out["music_path"]).name,
         "renderer": "remotion",
-        "format_pipeline": "gibran_essay_v1",
-        "essay_voice": essay_voice,
+        "format_pipeline": "custom_prompt_v1" if is_custom_script else "gibran_essay_v1",
         "source_passages": script.get("_source_passages", []),
     }
-    # Preserve custom_prompt_source so the row stays auditable —
-    # otherwise the original LLM paste is lost on the final write.
-    if custom_prompt:
-        new_params["custom_prompt_source"] = custom_prompt
+    if essay_voice:
+        new_params["essay_voice"] = essay_voice
+    # Preserve custom_prompt_source + is_custom_script so the row stays
+    # auditable AND the column-routing flag survives the final write
+    # (otherwise the planning grid would lose its routing key on re-render).
+    if is_custom_script:
+        new_params["is_custom_script"] = True
+        if custom_prompt:
+            new_params["custom_prompt_source"] = custom_prompt
     updates = {
         "status": "ready",
         "quote_text": full_quote,

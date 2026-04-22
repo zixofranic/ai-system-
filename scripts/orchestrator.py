@@ -2784,21 +2784,25 @@ def _batch_process(items: list):
 # ---------------------------------------------------------------------------
 # Story pipeline delegation
 # ---------------------------------------------------------------------------
-def _run_gibran_essay_pipeline(content: dict):
-    """Delegate Gibran cinematic essay format to generate_gibran_essay.py
-    as a subprocess (mirrors the story / meditation delegation pattern).
-    Long essays can run 10-20 min of voice + 20-40 SDXL renders, so we
-    isolate from the poller process and keep a per-run log file."""
+def _run_custom_prompt_pipeline(content: dict):
+    """Delegate cinematic-essay rendering (Custom Prompts on any channel +
+    Gibran regular essays) to generate_custom_prompt_essay.py as a
+    subprocess. Mirrors the story / meditation delegation pattern. Long
+    essays can run 10-20 min of voice + 20-40 SDXL renders, so we isolate
+    from the poller process and keep a per-run log file.
+
+    Renamed from _run_gibran_essay_pipeline (2026-04-22) when the file
+    became channel-agnostic."""
     cid = content["id"]
-    if _bail_if_deleted(cid, "_run_gibran_essay_pipeline"):
+    if _bail_if_deleted(cid, "_run_custom_prompt_pipeline"):
         return
-    print(f"\n--- Gibran Essay Pipeline: {content.get('title', '?')[:60]} ---")
+    print(f"\n--- Cinematic Essay Pipeline: {content.get('title', '?')[:60]} ---")
     update_supabase(cid, {"status": "generating"})
     log_step(cid, "video", 0, "running")  # step_order=0 marks outer-pipeline wrapper
 
     cmd = [
         sys.executable,
-        str(Path(__file__).parent / "generate_gibran_essay.py"),
+        str(Path(__file__).parent / "generate_custom_prompt_essay.py"),
         "--content-id", cid,
     ]
     logs_dir = Path(__file__).parent / "logs"
@@ -2830,10 +2834,10 @@ def _run_gibran_essay_pipeline(content: dict):
             except Exception:
                 pass
             raise RuntimeError(
-                f"Gibran essay pipeline failed (exit {returncode}). Tail:\n{tail}"
+                f"Cinematic essay pipeline failed (exit {returncode}). Tail:\n{tail}"
             )
         log_step(cid, "video", 0, "success")
-        print(f"  Gibran essay completed for {cid}")
+        print(f"  Cinematic essay completed for {cid}")
     except subprocess.TimeoutExpired:
         log_step(cid, "video", 0, "failed", f"Timeout (log: {log_file})")
         mark_failed(cid, f"essay pipeline: timeout (log: {log_file})")
@@ -2842,6 +2846,11 @@ def _run_gibran_essay_pipeline(content: dict):
         log_step(cid, "video", 0, "failed", str(e))
         mark_failed(cid, f"essay pipeline: {e}")
         raise
+
+
+# Backwards-compat alias — any caller still using the old name keeps working.
+# Drop after grep confirms no external references in 30 days.
+_run_gibran_essay_pipeline = _run_custom_prompt_pipeline
 
 
 def _run_meditation_pipeline(content: dict):
@@ -3062,6 +3071,19 @@ def main():
                 # StoryVerticalVideo composition renders the 9:16 output.
                 # NO parent story required — works straight from the queue.
                 # 2026-04-18 fix.
+                # Custom Prompts short-circuit — pasted-script rows for
+                # ANY channel (Gibran, Wisdom, NA, AA) bypass the format
+                # dispatch and route to the cinematic essay pipeline. The
+                # `is_custom_script` flag in generation_params is the
+                # routing key; format is purely a length/aspect signal.
+                # Must run BEFORE story_vertical/format dispatch — a
+                # Custom Prompt with format='story_vertical' would
+                # otherwise be intercepted by _run_meditation_pipeline
+                # (wrong renderer; meditation expects an Opus script).
+                if (content.get("generation_params") or {}).get("is_custom_script"):
+                    _run_custom_prompt_pipeline(content)
+                    print(f"  Done (custom-script): {content['id']}")
+                    continue
                 if content_type == "story_vertical":
                     _run_meditation_pipeline(content)
                     print(f"  Done: {content['id']}")
@@ -3073,7 +3095,7 @@ def main():
                 # column is now a length category; style is the renderer.
                 slug = (content.get("channels") or {}).get("slug")
                 if slug == "gibran" and content.get("gibran_long_form_style") == "essay":
-                    _run_gibran_essay_pipeline(content)
+                    _run_custom_prompt_pipeline(content)
                     print(f"  Done: {content['id']}")
                     continue
                 if content_type == "story":
@@ -3117,32 +3139,53 @@ def main():
             except Exception:
                 pass
 
+        # Custom Prompts — pasted-script rows for any channel. Pulled out
+        # FIRST because they share the cinematic-essay subprocess and
+        # shouldn't get intercepted by format-based routing below.
+        custom_scripts = [
+            c for c in queued
+            if (c.get("generation_params") or {}).get("is_custom_script")
+        ]
+        for content in custom_scripts:
+            try:
+                _run_custom_prompt_pipeline(content)
+                print(f"  Done (custom-script): {content['id']}")
+            except Exception as e:
+                print(f"  FAILED (custom-script): {content['id']} - {e}")
+                traceback.print_exc()
+                mark_failed(content["id"], f"custom script: {e}")
+        custom_script_ids = {c["id"] for c in custom_scripts}
+
         # Gibran cinematic essays — own subprocess pipeline (mirrors story).
         # Pulled out before the batched path because they run 10-20 min of
         # voice + many SDXL renders; batching with shorts wastes the
-        # VRAM-aware optimization.
+        # VRAM-aware optimization. Excludes anything already handled as a
+        # custom-script row (defense in depth — Gibran custom prompts
+        # would also satisfy the gibran/essay predicate).
         gibran_essays = [
             c for c in queued
             if (c.get("channels") or {}).get("slug") == "gibran"
             and c.get("gibran_long_form_style") == "essay"
             and c.get("format") != "short"
+            and c["id"] not in custom_script_ids
         ]
         for content in gibran_essays:
             try:
-                _run_gibran_essay_pipeline(content)
+                _run_custom_prompt_pipeline(content)
                 print(f"  Done (gibran-essay): {content['id']}")
             except Exception as e:
                 print(f"  FAILED (gibran-essay): {content['id']} - {e}")
                 traceback.print_exc()
                 mark_failed(content["id"], f"gibran essay: {e}")
         gibran_essay_ids = {c["id"] for c in gibran_essays}
+        skip_ids = custom_script_ids | gibran_essay_ids
 
         # Midform (treated as longform — up to 20 min). Gibran essays already
         # handled above; anything else routes to process_midform.
         non_essay_midforms = [
             c for c in queued
             if c.get("format") == "midform"
-            and c["id"] not in gibran_essay_ids
+            and c["id"] not in skip_ids
         ]
         for content in non_essay_midforms:
             try:
@@ -3153,14 +3196,15 @@ def main():
                 traceback.print_exc()
                 mark_failed(content["id"], f"midform: {e}")
 
-        # Stories run separately (own pipeline), rest go through batch
+        # Stories run separately (own pipeline), rest go through batch.
+        # Exclude both gibran-essays AND custom-scripts already handled.
         stories = [c for c in queued
                    if c.get("format") == "story"
-                   and c["id"] not in gibran_essay_ids]
+                   and c["id"] not in skip_ids]
         non_stories = [
             c for c in queued
             if c.get("format") not in ("story", "midform", "story_vertical")
-            and c["id"] not in gibran_essay_ids
+            and c["id"] not in skip_ids
         ]
         for content in stories:
             try:
