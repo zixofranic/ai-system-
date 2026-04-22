@@ -2201,6 +2201,15 @@ def process_short(content: dict):
             generate_thumbnail(art_path, title, thumb_path, 1080, 1920)  # portrait for shorts
         else:
             generate_thumbnail_from_video(video_path, title, thumb_path, 1080, 1920)
+        # Verify the file actually landed before trying to upload it.
+        # generate_thumbnail can throw silently (caught one frame up) and
+        # generate_thumbnail_from_video returns None on ffmpeg failure
+        # without raising — both leave the path missing on disk, and
+        # upload_to_storage would then raise FileNotFoundError, getting
+        # caught + logged as "Storage upload failed", row flips to ready
+        # with thumbnail_storage_path=NULL → "No thumbnail" on dashboard.
+        if not Path(thumb_path).exists():
+            raise RuntimeError(f"thumbnail file not on disk after generation: {thumb_path}")
         try:
             from supabase_storage import upload_to_storage as upload_thumb
             thumb_storage_path = upload_thumb(thumb_path, "wisdom-thumbnails", channel_slug, "short")
@@ -2350,20 +2359,85 @@ def process_midform(content: dict):
     try:
         midform_title = script.get("title", f"{philosopher} on {topic}")
         video_path = str(_final_video_path(channel_slug, "midform", midform_title, content_id))
-        render_remotion_video(
-            quotes=quotes,
-            philosopher=philosopher,
-            art_paths=art_paths,
-            voice_paths=voice_paths,
-            music_path=music_path,
-            output_path=video_path,
-            format="midform",
-            channel_slug=channel_slug,
-            title=midform_title,
-            narration_segments=narration_segments,
-            equalizer_color=eq_color,
-            watermark=watermark_for_channel(channel_slug),
-        )
+
+        # NA/AA landscape midforms route through cinematic_pipeline so the
+        # captions render word-by-word (ProgressiveSubtitle) like Gibran
+        # essays — instead of MidformQuote's single-block italic dump that
+        # turned a 60s monologue into a wall of text covering the frame
+        # (user reported this 2026-04-22). Wisdom midform stays on
+        # render_remotion_video for now.
+        if channel_slug in ("na", "aa"):
+            import shutil
+            from cinematic_pipeline import LANDSCAPE, render_cinematic_essay
+
+            cine_work = work / "cinematic"
+            cine_work.mkdir(parents=True, exist_ok=True)
+
+            # Stage existing art so cinematic skips SDXL regeneration.
+            # Naming: cinematic expects art_1.png .. art_N.png.
+            for i, src_art in enumerate(art_paths):
+                dst = cine_work / f"art_{i+1}.png"
+                if not dst.exists():
+                    shutil.copy(src_art, dst)
+
+            # Concat per-section voice WAVs into one voice.wav so
+            # cinematic skips voice regeneration. ffmpeg concat demuxer
+            # needs an absolute-path file list with `file '<path>'` lines.
+            concat_list = cine_work / "voice_concat.txt"
+            concat_list.write_text(
+                "\n".join(f"file '{Path(p).resolve().as_posix()}'" for p in voice_paths),
+                encoding="utf-8",
+            )
+            unified_voice_wav = cine_work / "voice.wav"
+            unified_voice_mp3 = cine_work / "voice.mp3"
+            subprocess.run(
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                 "-i", str(concat_list), "-c", "copy", str(unified_voice_wav)],
+                check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(unified_voice_wav),
+                 "-codec:a", "libmp3lame", "-b:a", "192k", str(unified_voice_mp3)],
+                check=True, capture_output=True,
+            )
+
+            # Build scenes — narration + quote concatenated per section so
+            # cinematic's full_narration matches the audio we staged.
+            scenes = []
+            for i, q in enumerate(quotes):
+                narr = (narration_segments[i].strip() if i < len(narration_segments)
+                        and narration_segments[i] else "")
+                narration = (narr + " " + q).strip() if narr else q
+                direction = (art_prompts[i] if i < len(art_prompts) and art_prompts[i]
+                             else f"cinematic scene illustrating: {q[:80]}")
+                scenes.append({"narration": narration, "direction": direction})
+
+            render_cinematic_essay(
+                title=midform_title,
+                philosopher=philosopher,
+                channel_slug=channel_slug,
+                scenes=scenes,
+                output_path=video_path,
+                work_dir=cine_work,
+                reuse=True,  # use the staged art + voice we just placed
+                art_aspect=LANDSCAPE,
+                equalizer_color=eq_color,
+            )
+        else:
+            render_remotion_video(
+                quotes=quotes,
+                philosopher=philosopher,
+                art_paths=art_paths,
+                voice_paths=voice_paths,
+                music_path=music_path,
+                output_path=video_path,
+                format="midform",
+                channel_slug=channel_slug,
+                title=midform_title,
+                narration_segments=narration_segments,
+                equalizer_color=eq_color,
+                watermark=watermark_for_channel(channel_slug),
+            )
         log_step(content_id, "video", 4, "success")
     except Exception as e:
         log_step(content_id, "video", 4, "failed", str(e))
@@ -2652,20 +2726,81 @@ def _batch_process(items: list):
             vid_format = "short" if content_type == "short" else "midform"
             batch_title = content.get("title", f"{philosopher} on {topic}")
             video_path = str(_final_video_path(channel_slug, vid_format, batch_title, cid))
-            render_remotion_video(
-                quotes=quotes,
-                philosopher=philosopher,
-                art_paths=data["art_paths"],
-                voice_paths=data["voice_paths"],
-                music_path=music_path,
-                output_path=video_path,
-                format=vid_format,
-                channel_slug=channel_slug,
-                title=batch_title,
-                narration_segments=data.get("narration_segments"),
-                equalizer_color=eq_color,
-                watermark=watermark_for_channel(channel_slug),
-            )
+
+            # NA/AA midform/longform → cinematic_pipeline (word-by-word
+            # ProgressiveSubtitle like Gibran essays). Shorts keep the
+            # render_remotion_video path (MonologueOverlay for NA/AA
+            # shorts already handles the scrolling caption style
+            # correctly at 9:16).
+            if vid_format == "midform" and channel_slug in ("na", "aa"):
+                import shutil
+                from cinematic_pipeline import LANDSCAPE, render_cinematic_essay
+
+                cine_work = work / "cinematic"
+                cine_work.mkdir(parents=True, exist_ok=True)
+
+                src_art = data["art_paths"]
+                src_voice = data["voice_paths"]
+                src_narr = data.get("narration_segments") or []
+                src_prompts = data.get("art_prompts") or []
+
+                for i, a in enumerate(src_art):
+                    dst = cine_work / f"art_{i+1}.png"
+                    if not dst.exists():
+                        shutil.copy(a, dst)
+
+                concat_list = cine_work / "voice_concat.txt"
+                concat_list.write_text(
+                    "\n".join(f"file '{Path(p).resolve().as_posix()}'" for p in src_voice),
+                    encoding="utf-8",
+                )
+                unified_wav = cine_work / "voice.wav"
+                unified_mp3 = cine_work / "voice.mp3"
+                subprocess.run(
+                    ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                     "-i", str(concat_list), "-c", "copy", str(unified_wav)],
+                    check=True, capture_output=True,
+                )
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", str(unified_wav),
+                     "-codec:a", "libmp3lame", "-b:a", "192k", str(unified_mp3)],
+                    check=True, capture_output=True,
+                )
+
+                scenes = []
+                for i, q in enumerate(quotes):
+                    narr = (src_narr[i].strip() if i < len(src_narr) and src_narr[i] else "")
+                    narration = (narr + " " + q).strip() if narr else q
+                    direction = (src_prompts[i] if i < len(src_prompts) and src_prompts[i]
+                                 else f"cinematic scene illustrating: {q[:80]}")
+                    scenes.append({"narration": narration, "direction": direction})
+
+                render_cinematic_essay(
+                    title=batch_title,
+                    philosopher=philosopher,
+                    channel_slug=channel_slug,
+                    scenes=scenes,
+                    output_path=video_path,
+                    work_dir=cine_work,
+                    reuse=True,
+                    art_aspect=LANDSCAPE,
+                    equalizer_color=eq_color,
+                )
+            else:
+                render_remotion_video(
+                    quotes=quotes,
+                    philosopher=philosopher,
+                    art_paths=data["art_paths"],
+                    voice_paths=data["voice_paths"],
+                    music_path=music_path,
+                    output_path=video_path,
+                    format=vid_format,
+                    channel_slug=channel_slug,
+                    title=batch_title,
+                    narration_segments=data.get("narration_segments"),
+                    equalizer_color=eq_color,
+                    watermark=watermark_for_channel(channel_slug),
+                )
             log_step(cid, "video", 4, "success")
 
             # Upload to Supabase Storage (primary) + Drive (fallback).
@@ -2736,6 +2871,13 @@ def _batch_process(items: list):
                     generate_thumbnail(first_art, title, thumb_path, tw, th)
                 else:
                     generate_thumbnail_from_video(video_path, title, thumb_path, 1080, 1920)
+                # Verify the file actually landed before uploading. PIL
+                # can throw + be caught upstream and the video-frame
+                # fallback returns None on ffmpeg failure — both leave
+                # disk empty and upload would 404. Without this guard,
+                # the row goes to ready with NULL thumbnail_storage_path.
+                if not Path(thumb_path).exists():
+                    raise RuntimeError(f"thumbnail file not on disk: {thumb_path}")
                 try:
                     from supabase_storage import upload_to_storage as upload_thumb
                     thumb_storage_path = upload_thumb(thumb_path, "wisdom-thumbnails", channel_slug, vid_format)
