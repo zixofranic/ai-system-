@@ -328,6 +328,38 @@ def _resolve_tts_provider(channel_slug: str) -> str:
             or "elevenlabs")
 
 
+# ---------------------------------------------------------------------------
+# Writing style resolver (in_character vs narrator)
+# ---------------------------------------------------------------------------
+# The new `content.writing_style` column (added 2026-04-22) holds the LLM
+# perspective for written content. Independent of TTS voice: a piece can
+# be in narrator-style PROSE read by the philosopher's CLONED VOICE.
+#
+# Legacy column `content.gibran_essay_voice` predates this and used a
+# different vocab ('narrator' | 'prophet_voice'). prophet_voice maps to
+# in_character because it speaks AS Gibran. Pre-migration Gibran rows
+# still have only the legacy column set; this resolver bridges both.
+def _resolve_writing_style(content: dict, channel_default: str = "in_character") -> str:
+    """Pick the writing style for an LLM-written piece.
+
+    Order of precedence:
+      1. content.writing_style (new column, post-2026-04-22)
+      2. content.gibran_essay_voice (legacy Gibran-only, mapped)
+      3. channel_default (caller-supplied — usually 'in_character', but
+         Gibran's _run_custom_prompt_pipeline passes 'narrator' to preserve
+         pre-existing default behavior)
+    """
+    style = content.get("writing_style")
+    if style in ("in_character", "narrator"):
+        return style
+    legacy = content.get("gibran_essay_voice")
+    if legacy == "narrator":
+        return "narrator"
+    if legacy == "prophet_voice":
+        return "in_character"
+    return channel_default
+
+
 def _chatterbox_pause_hints(text: str) -> str:
     """Pre-process text for Chatterbox to maximize honored pauses.
 
@@ -2040,6 +2072,7 @@ def process_short(content: dict):
             script = generate_recovery_short_script(
                 philosopher, topic, channel_slug,
                 target_seconds=60, previous_quotes=previous,
+                style=_resolve_writing_style(content),
             )
             quote = sanitize_quote(script.get("quote", ""))
             title = script.get("title") or f"{philosopher}: {topic[:40]}"
@@ -2241,7 +2274,8 @@ def process_midform(content: dict):
         else:
             from ai_writer import generate_midform_script
             script = generate_midform_script(philosopher, topic, num_quotes=num_quotes,
-                                             previous_quotes=previous)
+                                             previous_quotes=previous,
+                                             style=_resolve_writing_style(content))
         quotes = script.get("quotes", [])
         narration_segments = script.get("narration_segments", [])
         if not quotes:
@@ -2435,6 +2469,7 @@ def _batch_process(items: list):
                     recovery_script = generate_recovery_short_script(
                         philosopher, topic, _slug,
                         target_seconds=60, previous_quotes=previous,
+                        style=_resolve_writing_style(content),
                     )
                     quote = sanitize_quote(recovery_script.get("quote", ""))
                     print(f"  [{cid[:8]}] [quote] Opus {_slug} short: {len(quote.split())} words")
@@ -2465,7 +2500,8 @@ def _batch_process(items: list):
                 else:
                     from ai_writer import generate_midform_script
                     script = generate_midform_script(philosopher, topic,
-                                                     previous_quotes=previous)
+                                                     previous_quotes=previous,
+                                                     style=_resolve_writing_style(content))
                 quotes = script.get("quotes", [])
                 narration_segments = script.get("narration_segments", [])
                 art_prompts = script.get("art_prompts", [])
