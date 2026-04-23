@@ -247,15 +247,15 @@ CHANNEL_VOICE = {
             "atempo": 0.85,           # less aggressive than Gibran (0.80)
             "reverb": None,
             # "calmer, not slower" tuning (2026-04-22):
-            #   - exaggeration 0.25 (was default 0.5) — less upbeat, more
-            #     settled delivery. The archetypes read livelier than the
-            #     recovery-rooms tone calls for at 0.5.
-            #   - pitch_ratio 0.97 — drops the whole voice ~-0.5 semitone
-            #     for a grounded, centered quality. Duration unchanged
-            #     (asetrate → aresample → compensating atempo; see filter
-            #     chain in _generate_voice_chatterbox).
+            #   - exaggeration 0.25 (was default 0.5) — Chatterbox-native
+            #     dial; lower = less upbeat, more settled delivery without
+            #     touching pitch.
+            #   - pitch_ratio: tried 0.97 same day, math was inverted and
+            #     produced chipmunks. Filter math fixed (see comment in
+            #     _generate_voice_chatterbox); leaving pitch_ratio
+            #     disabled until we explicitly want a pitch shift again.
             "exaggeration": 0.25,
-            "pitch_ratio": 0.97,
+            # "pitch_ratio": 0.97,
             # Smaller pitch drop (0.96 ~ -0.7 semitones) than Gibran — the
             # recovery voice is already conversational; too much drop reads
             # as melodramatic. Volume tapers slightly to 0.75.
@@ -275,7 +275,7 @@ CHANNEL_VOICE = {
             "atempo": 0.85,
             "reverb": None,
             "exaggeration": 0.25,        # calmer delivery — see NA comment
-            "pitch_ratio": 0.97,         # -0.5 semitone, grounded feel
+            # "pitch_ratio": 0.97,       # disabled — see NA comment
             "tail_fade": {"duration": 1.2, "pitch_factor": 0.96, "volume_target": 0.75},
             "ref": "na_old_timer_5min.wav",
             "persona_refs": {  # AA shares NA's voice clones
@@ -1288,18 +1288,26 @@ def _generate_voice_chatterbox(text: str, output_path: str,
     silence_cap_keep    = cb_cfg.get("silence_cap_keep", 1.0)
     silence_cap_threshold = cb_cfg.get("silence_cap_threshold", "-30dB")
     filter_parts = []
-    # Optional global pitch drop — asetrate lowers the sample rate which
-    # drops pitch AND shortens duration; aresample back to 44100 then an
-    # atempo compensating bump restores duration with the pitch change
-    # preserved. Use a tiny ratio (0.97 ≈ -0.5 semitones) to deepen the
-    # voice slightly → reads "calmer" without changing speed. Set per
-    # channel via cb_cfg.pitch_ratio; skip when 1.0 or missing.
+    # Optional global pitch shift, no tempo change. Convention:
+    #   pitch_ratio < 1.0 = LOWER pitch (deeper / calmer)
+    #   pitch_ratio > 1.0 = HIGHER pitch
+    # Recipe (do NOT change without testing — easy to invert):
+    #   asetrate=44100/RATIO  → relabel sample rate. RATIO<1 means a
+    #     LARGER asetrate value, which makes ffmpeg interpret the audio
+    #     as faster-than-input. The next aresample stretches it back to
+    #     44100 → audio plays SLOWER + LOWER pitch (duration grows by
+    #     1/RATIO).
+    #   aresample=44100      → restore output sample rate; NOT a no-op,
+    #     this is the step that actually applies the pitch change.
+    #   atempo=1/RATIO       → speed back up by 1/RATIO so total duration
+    #     matches the input. Pitch shift is preserved; tempo is canceled.
+    # Net: pure pitch shift, identical duration.
+    # First attempt 2026-04-22 had `asetrate=44100*RATIO` which was
+    # inverted (RATIO=0.97 produced chipmunks). Disabled per channel
+    # for now via pitch_ratio=None until we want to use it again.
     pitch_ratio = cb_cfg.get("pitch_ratio")
     if pitch_ratio and pitch_ratio != 1.0:
-        # asetrate drops pitch + duration; aresample restores sample rate;
-        # atempo=1/pitch_ratio restores the original duration. Net effect:
-        # pure pitch shift, no tempo change.
-        filter_parts.append(f"asetrate=44100*{pitch_ratio}")
+        filter_parts.append(f"asetrate=44100/{pitch_ratio}")
         filter_parts.append("aresample=44100")
         filter_parts.append(f"atempo={1.0/pitch_ratio:.6f}")
     if atempo and atempo != 1.0:
