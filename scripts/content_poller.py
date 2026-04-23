@@ -183,6 +183,62 @@ def run_analytics_fetcher():
     return result.returncode
 
 
+def notify_ready_rows():
+    """Send a Web Push for any row that just flipped to status='ready'
+    and hasn't been pushed yet.
+
+    Uses generation_params.push_sent as the dedup flag so a row that
+    gets set to ready→approved→ready via retry doesn't re-notify.
+    No-op if VAPID not configured or pywebpush not installed.
+    """
+    try:
+        # Find rows at status=ready where push hasn't been sent.
+        # Supabase JSONB filter: `->push_sent=is.null` catches rows
+        # without the flag (never pushed). Include channel expand for
+        # the payload builder.
+        url = f"{SUPABASE_URL}/rest/v1/content"
+        params = {
+            "select": "id,title,philosopher,topic,format,channel_id,generation_params,channels:channel_id(slug,name)",
+            "status": "eq.ready",
+            "generation_params->push_sent": "is.null",
+            "deleted_at": "is.null",
+            "limit": "20",
+        }
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        if resp.status_code != 200:
+            return
+        rows = resp.json() or []
+        if not rows:
+            return
+
+        try:
+            from push_notifier import notify_ready
+        except ImportError:
+            return
+
+        for row in rows:
+            result = notify_ready(row)
+            if result is None:
+                # VAPID not configured — stop trying this tick.
+                return
+            # Mark as pushed so we don't notify again on the next tick.
+            # Merge the flag into existing generation_params so we don't
+            # clobber other fields.
+            gp = row.get("generation_params") or {}
+            gp["push_sent"] = True
+            try:
+                requests.patch(
+                    f"{url}?id=eq.{row['id']}",
+                    headers=HEADERS,
+                    json={"generation_params": gp},
+                    timeout=10,
+                )
+            except Exception as e:
+                print(f"  [push] WARN: couldn't mark push_sent on {row['id'][:8]}: {e}")
+    except Exception as e:
+        print(f"  [push] WARN: notify_ready_rows loop failed: {e}")
+
+
 def promote_scheduled_content():
     """Promote scheduled content whose publish time has arrived to approved."""
     try:
@@ -566,6 +622,12 @@ def main():
 
             # --- Reap stale `scheduled` rows from missed promotions ---
             reap_stale_scheduled()
+
+            # --- Push notification for any newly-ready row ---
+            # Fires AFTER the generation batch above so rows that just
+            # flipped to ready in this tick get notified on the same
+            # pass. Dedup via generation_params.push_sent.
+            notify_ready_rows()
 
             # --- Check for approved content to publish to YouTube ---
             approved = check_approved_content()
