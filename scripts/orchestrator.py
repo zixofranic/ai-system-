@@ -408,9 +408,15 @@ def _chatterbox_pause_hints(text: str) -> str:
 
 # Channel music pools — multi-style pool drawn from when picking a track.
 # Falls through to CHANNEL_DEFAULT_MUSIC_STYLE if the channel has no pool entry.
+#
+# 2026-04-24: NA/AA repointed to recovery_calm only. The previous
+# stoic_classical + gibran union read as too tense for the recovery-
+# rooms aesthetic per user feedback. recovery_calm starts with the
+# 4 gentlest gibran ambient tracks; user can curate by adding/removing
+# files in C:\AI\system\music\recovery_calm\.
 CHANNEL_MUSIC_POOL = {
-    "na": ["stoic_classical", "gibran"],   # soft mixed pool per user direction 2026-04-16
-    "aa": ["stoic_classical", "gibran"],   # same soft pool — AA tone maps to NA aesthetic
+    "na": ["recovery_calm"],
+    "aa": ["recovery_calm"],
 }
 
 # Per-channel default equalizer/accent colors. The pipeline already maps
@@ -2835,6 +2841,29 @@ def _batch_process(items: list):
                                  else f"cinematic scene illustrating: {q[:80]}")
                     scenes.append({"narration": narration, "direction": direction})
 
+                # NA/AA midform writer (generate_daily_meditation_script)
+                # returns a SINGLE quote of ~320 words — if we passed
+                # that as one scene to cinematic_pipeline, the whole
+                # video plays on one image. Split the single long
+                # narration into 4-6 sentence-group scenes so the
+                # cinematic render has distinct stills to cut between
+                # (matches the Gibran essay feel).
+                if len(scenes) == 1 and len(scenes[0]["narration"].split()) > 80:
+                    import re
+                    full_text = scenes[0]["narration"]
+                    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", full_text) if s.strip()]
+                    target_scene_count = 5  # ~60s of voice per scene at 300-word/2min pace
+                    per = max(1, (len(sentences) + target_scene_count - 1) // target_scene_count)
+                    chunks = [" ".join(sentences[i:i + per]) for i in range(0, len(sentences), per)]
+                    scenes = []
+                    for chunk in chunks:
+                        anchor = " ".join(chunk.split()[:12])
+                        scenes.append({
+                            "narration": chunk,
+                            "direction": f"cinematic scene illustrating: {anchor}",
+                        })
+                    print(f"  [{cid[:8]}] Split 1 meditation → {len(scenes)} scenes for cinematic render")
+
                 cine_out = render_cinematic_essay(
                     title=batch_title,
                     philosopher=philosopher,
@@ -2928,32 +2957,51 @@ def _batch_process(items: list):
             # Thumbnail — same persist-immediately pattern as video upload.
             thumb_drive_url = None
             thumb_storage_path = None
+            thumb_errors = []
             try:
                 from thumbnail_generator import generate_thumbnail, generate_thumbnail_from_video
                 thumb_path = video_path.replace(".mp4", "_thumb.jpg")
-                # Cinematic pipeline already generates a thumbnail with the
-                # right title + aspect — prefer it when available. Avoids
-                # re-running PIL on art_0.png and the silent-failure class
-                # of bugs we hit on NA midform.
+                tw, th = (1080, 1920) if content_type == "short" else (1920, 1080)
+
+                # Resilient cascade (fixed 2026-04-24 after recurring silent
+                # failures on Wisdom midform). Try each source in turn; if
+                # the JPG isn't on disk, try the next. Collect errors so we
+                # can write them back to the row for diagnosis.
+                #   1. Cinematic-produced thumbnail (NA/AA midform path)
+                #   2. First art frame via generate_thumbnail (PIL)
+                #   3. ffmpeg-extracted video frame via generate_thumbnail_from_video
+
+                # 1. Cinematic-produced thumb (NA/AA midform sets this)
                 cine_thumb = data.get("_cinematic_thumb_path")
                 if cine_thumb and Path(cine_thumb).exists():
                     if cine_thumb != thumb_path:
                         import shutil as _shutil
                         _shutil.copy(cine_thumb, thumb_path)
-                else:
+
+                # 2. Generate from first art file
+                if not Path(thumb_path).exists():
                     first_art = data["art_paths"][0] if data.get("art_paths") else None
                     if first_art and Path(first_art).exists():
-                        tw, th = (1080, 1920) if content_type == "short" else (1920, 1080)
-                        generate_thumbnail(first_art, title, thumb_path, tw, th)
-                    else:
-                        generate_thumbnail_from_video(video_path, title, thumb_path, 1080, 1920)
-                # Verify the file actually landed before uploading. PIL
-                # can throw + be caught upstream and the video-frame
-                # fallback returns None on ffmpeg failure — both leave
-                # disk empty and upload would 404. Without this guard,
-                # the row goes to ready with NULL thumbnail_storage_path.
+                        try:
+                            generate_thumbnail(first_art, title, thumb_path, tw, th)
+                        except Exception as e:
+                            thumb_errors.append(f"art-based: {type(e).__name__}: {e}")
+
+                # 3. Fallback to ffmpeg video-frame extraction. Video file
+                # always exists post-render, so this is the reliable last
+                # resort. Previously only ran when first_art was missing;
+                # now runs whenever the art-based step didn't produce output.
                 if not Path(thumb_path).exists():
-                    raise RuntimeError(f"thumbnail file not on disk: {thumb_path}")
+                    try:
+                        generate_thumbnail_from_video(video_path, title, thumb_path, tw, th)
+                    except Exception as e:
+                        thumb_errors.append(f"video-frame: {type(e).__name__}: {e}")
+
+                if not Path(thumb_path).exists():
+                    raise RuntimeError(
+                        f"thumbnail file not on disk after all fallbacks: {thumb_path}. "
+                        f"Errors: {'; '.join(thumb_errors) if thumb_errors else 'unknown'}"
+                    )
                 try:
                     from supabase_storage import upload_to_storage as upload_thumb
                     thumb_storage_path = upload_thumb(thumb_path, "wisdom-thumbnails", channel_slug, vid_format)
@@ -2961,12 +3009,16 @@ def _batch_process(items: list):
                         update_supabase(cid, {"thumbnail_storage_path": thumb_storage_path})
                 except Exception as ts_e:
                     print(f"  [{cid[:8]}] Thumb storage failed: {ts_e}")
-                    if channel.get("google_drive_folder_id") and drive_url:
-                        thumb_drive_url = upload_to_drive(thumb_path, channel)
-                        update_supabase(cid, {"thumbnail_drive_url": thumb_drive_url})
+                    thumb_errors.append(f"upload: {type(ts_e).__name__}: {ts_e}")
                 print(f"  [{cid[:8]}] Thumbnail: {thumb_path}")
             except Exception as thumb_e:
-                print(f"  [{cid[:8]}] Thumbnail warning: {thumb_e}")
+                err_msg = f"{type(thumb_e).__name__}: {thumb_e}"
+                print(f"  [{cid[:8]}] Thumbnail warning: {err_msg}")
+                # Stash on the data dict so the final generation_params
+                # write (~50 lines down) can merge it. Writing directly
+                # to Supabase here would get clobbered by the wholesale
+                # generation_params assignment at the final update_supabase.
+                data["_thumbnail_error"] = err_msg
 
             # Final metadata update — status='ready' signals generation is
             # done; human approves in dashboard → status becomes 'approved'
