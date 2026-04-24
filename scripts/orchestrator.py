@@ -2841,6 +2841,25 @@ def _batch_process(items: list):
                                  else f"cinematic scene illustrating: {q[:80]}")
                     scenes.append({"narration": narration, "direction": direction})
 
+                # Diagnostic log to disk — the poller's subprocess.run
+                # captures orchestrator stdout and only surfaces the
+                # last 5 lines, so print-only diagnostics are invisible.
+                # Appending to a persistent file lets us actually see
+                # whether the split fired when a row doesn't look right.
+                try:
+                    _dbg_path = Path("C:/AI/system/scripts/logs/batch_cinematic_debug.log")
+                    _dbg_path.parent.mkdir(parents=True, exist_ok=True)
+                    _ts = datetime.now(timezone.utc).isoformat()
+                    _total_words = sum(len(s["narration"].split()) for s in scenes)
+                    with open(_dbg_path, "a", encoding="utf-8") as _f:
+                        _f.write(
+                            f"[{_ts}] cid={cid[:8]} slug={channel_slug} "
+                            f"quotes={len(quotes)} initial_scenes={len(scenes)} "
+                            f"total_words={_total_words}\n"
+                        )
+                except Exception:
+                    pass
+
                 # NA/AA midform writer (generate_daily_meditation_script)
                 # returns a SINGLE quote of ~320 words — if we passed
                 # that as one scene to cinematic_pipeline, the whole
@@ -2863,6 +2882,18 @@ def _batch_process(items: list):
                             "direction": f"cinematic scene illustrating: {anchor}",
                         })
                     print(f"  [{cid[:8]}] Split 1 meditation → {len(scenes)} scenes for cinematic render")
+                    try:
+                        with open("C:/AI/system/scripts/logs/batch_cinematic_debug.log", "a", encoding="utf-8") as _f:
+                            _f.write(f"  → split fired, {len(scenes)} scenes\n")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        with open("C:/AI/system/scripts/logs/batch_cinematic_debug.log", "a", encoding="utf-8") as _f:
+                            _f.write(f"  → split SKIPPED (len_scenes={len(scenes)}, "
+                                     f"words_scene0={len(scenes[0]['narration'].split()) if scenes else 0})\n")
+                    except Exception:
+                        pass
 
                 cine_out = render_cinematic_essay(
                     title=batch_title,
@@ -3002,14 +3033,24 @@ def _batch_process(items: list):
                         f"thumbnail file not on disk after all fallbacks: {thumb_path}. "
                         f"Errors: {'; '.join(thumb_errors) if thumb_errors else 'unknown'}"
                     )
-                try:
-                    from supabase_storage import upload_to_storage as upload_thumb
-                    thumb_storage_path = upload_thumb(thumb_path, "wisdom-thumbnails", channel_slug, vid_format)
-                    if thumb_storage_path:
-                        update_supabase(cid, {"thumbnail_storage_path": thumb_storage_path})
-                except Exception as ts_e:
-                    print(f"  [{cid[:8]}] Thumb storage failed: {ts_e}")
-                    thumb_errors.append(f"upload: {type(ts_e).__name__}: {ts_e}")
+                # Upload with retry — observed transient 400s on Supabase
+                # storage that later-uploaded manually without issue.
+                # 3 attempts with 2-4-8s backoff catches the flaky cases.
+                from supabase_storage import upload_to_storage as upload_thumb
+                import time as _time
+                for _attempt in range(3):
+                    try:
+                        thumb_storage_path = upload_thumb(thumb_path, "wisdom-thumbnails", channel_slug, vid_format)
+                        if thumb_storage_path:
+                            update_supabase(cid, {"thumbnail_storage_path": thumb_storage_path})
+                            break
+                    except Exception as ts_e:
+                        last_err = f"{type(ts_e).__name__}: {ts_e}"
+                        print(f"  [{cid[:8]}] Thumb upload attempt {_attempt+1}/3 failed: {last_err}")
+                        if _attempt < 2:
+                            _time.sleep(2 * (2 ** _attempt))
+                        else:
+                            thumb_errors.append(f"upload: {last_err}")
                 print(f"  [{cid[:8]}] Thumbnail: {thumb_path}")
             except Exception as thumb_e:
                 err_msg = f"{type(thumb_e).__name__}: {thumb_e}"
