@@ -15,7 +15,9 @@ Flow
 ----
   1. Query Supabase for content where:
        - status in (approved, published)
-       - format == 'short'  (Meta only accepts 9:16 for Reels)
+       - format in ('short', 'midform')
+         · short  (9:16) → publishes to BOTH FB + IG Reels
+         · midform (16:9) → FB only (IG Reels reject 16:9)
        - generation_params->meta_publish_requested == true
        - meta_fb_post_id and meta_ig_post_id not yet set
        - video_storage_path or video_drive_url is not null
@@ -73,7 +75,7 @@ HEADERS = {
 # member names. Recovery-community language, not medical.
 CHANNEL_HASHTAGS = {
     "wisdom": ["#Philosophy", "#Wisdom", "#DeepEchoesOfWisdom"],
-    "gibran": ["#Gibran", "#KahlilGibran", "#TheProphet"],
+    "gibran": ["#Gibran", "#KhalilGibran", "#TheProphet"],
     "na": ["#Recovery", "#OneDayAtATime", "#SoberLife", "#RecoveryCommunity"],
     "aa": ["#Recovery", "#EasyDoesIt", "#SoberLife", "#RecoveryCommunity"],
 }
@@ -100,8 +102,14 @@ def get_channel(channel_id):
     return channels[0] if channels else None
 
 
-def update_content_meta(content_id, fb_post_id=None, ig_post_id=None):
-    """Merge Meta post IDs + published timestamp into generation_params."""
+def update_content_meta(content_id, fb_post_id=None, ig_post_id=None,
+                        fb_error=None, ig_error=None):
+    """Merge Meta post IDs, errors, and timestamps into generation_params.
+
+    Persists even when both sides failed so `meta_last_error` is visible
+    in the dashboard. `meta_publish_requested` is only cleared once BOTH
+    meta_fb_post_id and meta_ig_post_id are set — a partial success
+    (e.g. IG ok, FB failed) keeps the flag so the next poll retries."""
     current = get_content(content_id)
     if not current:
         return
@@ -113,12 +121,24 @@ def update_content_meta(content_id, fb_post_id=None, ig_post_id=None):
         params["meta_fb_post_id"] = fb_post_id
     if ig_post_id:
         params["meta_ig_post_id"] = ig_post_id
-    params["meta_published_at"] = datetime.now(timezone.utc).isoformat()
-    # Clear the publish request flag so we don't re-upload on next poll
-    params.pop("meta_publish_requested", None)
 
+    if fb_error or ig_error:
+        params["meta_last_error"] = {"fb": fb_error, "ig": ig_error}
+        params["meta_error_at"] = datetime.now(timezone.utc).isoformat()
+    elif fb_post_id or ig_post_id:
+        params.pop("meta_last_error", None)
+        params.pop("meta_error_at", None)
+
+    if fb_post_id or ig_post_id:
+        params["meta_published_at"] = datetime.now(timezone.utc).isoformat()
+
+    if params.get("meta_fb_post_id") and params.get("meta_ig_post_id"):
+        params.pop("meta_publish_requested", None)
+
+    # Soft-delete guard — don't write meta_fb_post_id / meta_ig_post_id
+    # back onto a row that was tombstoned between flag-set and upload.
     requests.patch(
-        f"{SUPABASE_URL}/rest/v1/content?id=eq.{content_id}",
+        f"{SUPABASE_URL}/rest/v1/content?id=eq.{content_id}&deleted_at=is.null",
         headers=HEADERS,
         json={
             "generation_params": params,
@@ -192,16 +212,23 @@ def build_caption(content, channel_slug):
 
 
 def publish_to_facebook_page(page_id, page_token, video_url, caption, thumb_url=None):
-    """POST the video to the FB Page via file_url (Meta fetches it)."""
+    """POST the video to the FB Page via file_url (Meta fetches it).
+
+    NOTE: `thumb_url` is intentionally IGNORED here. The FB Graph
+    /{page-id}/videos endpoint's `thumb` field requires a multipart-uploaded
+    file (`source=@file.jpg`), NOT a URL. Passing a URL fails with:
+        (#100) Invalid image format. It should be an image file data.
+    For IG Reels the analogous `cover_url` field DOES accept a URL — so the
+    parameter still flows in for caller symmetry; FB just won't use it.
+    Without thumb, FB auto-picks a representative frame from the video.
+    Re-add a multipart `source` upload later if a custom cover is needed.
+    """
     url = f"{GRAPH_BASE}/{page_id}/videos"
     payload = {
         "file_url": video_url,
         "description": caption,
         "access_token": page_token,
     }
-    # thumb on FB uses field name "thumb" accepting a public URL.
-    if thumb_url:
-        payload["thumb"] = thumb_url
     resp = requests.post(url, data=payload, timeout=600)
     data = resp.json()
     if "id" not in data:
@@ -289,8 +316,13 @@ def process_content(content, dry_run=False, fb_only=False, ig_only=False):
     title = content.get("title", "")
     print(f"\n  [{content_id[:8]}] {title[:60]}")
 
-    if content.get("format") != "short":
-        print("    Skipping — only shorts publish to Meta (Reels requires 9:16)")
+    content_format = content.get("format") or ""
+    # Shorts → FB + IG Reels. Midform → FB only (IG Reels require 9:16,
+    # 16:9 landscape won't pass IG's validation). Anything else skipped.
+    midform_fb_only = content_format == "midform"
+    if content_format not in ("short", "midform"):
+        print(f"    Skipping — format='{content_format}' not eligible for Meta "
+              f"(shorts + midform only; midform posts to FB only).")
         return False
 
     channel = get_channel(content["channel_id"])
@@ -333,22 +365,36 @@ def process_content(content, dry_run=False, fb_only=False, ig_only=False):
 
     fb_post_id = None
     ig_post_id = None
+    fb_error = None
+    ig_error = None
+
+    existing_params = content.get("generation_params") or {}
+    if isinstance(existing_params, str):
+        existing_params = json.loads(existing_params)
+    existing_fb_id = existing_params.get("meta_fb_post_id")
+    existing_ig_id = existing_params.get("meta_ig_post_id")
 
     # --- Facebook Page ---
     if not ig_only:
-        try:
-            print(f"    Publishing to FB Page {page_id}...")
-            fb_post_id = publish_to_facebook_page(
-                page_id, page_token, video_url, caption, thumb_url=thumb_url
-            )
-            print(f"    FB published: {fb_post_id}")
-        except Exception as e:
-            print(f"    FB error: {e}")
+        if existing_fb_id:
+            print(f"    FB already published: {existing_fb_id} — skipping")
+        else:
+            try:
+                print(f"    Publishing to FB Page {page_id}...")
+                fb_post_id = publish_to_facebook_page(
+                    page_id, page_token, video_url, caption, thumb_url=thumb_url
+                )
+                print(f"    FB published: {fb_post_id}")
+            except Exception as e:
+                fb_error = str(e)[:500]
+                print(f"    FB error: {e}")
 
     # --- Instagram Reel ---
-    if not fb_only:
+    if not fb_only and not midform_fb_only:
         if not ig_user_id:
             print("    No IG account linked — skipping IG")
+        elif existing_ig_id:
+            print(f"    IG already published: {existing_ig_id} — skipping")
         else:
             try:
                 print(f"    Publishing to IG {ig_user_id}...")
@@ -357,12 +403,15 @@ def process_content(content, dry_run=False, fb_only=False, ig_only=False):
                 )
                 print(f"    IG Reel published: {ig_post_id}")
             except Exception as e:
+                ig_error = str(e)[:500]
                 print(f"    IG error: {e}")
 
-    if fb_post_id or ig_post_id:
-        update_content_meta(content_id, fb_post_id=fb_post_id, ig_post_id=ig_post_id)
-        return True
-    return False
+    update_content_meta(
+        content_id,
+        fb_post_id=fb_post_id, ig_post_id=ig_post_id,
+        fb_error=fb_error, ig_error=ig_error,
+    )
+    return bool(fb_post_id or ig_post_id)
 
 
 # --- Entrypoint ---------------------------------------------------------
@@ -391,11 +440,16 @@ def fetch_items():
         timeout=10,
     )
     items = resp.json() if resp.status_code == 200 else []
-    # Still exclude rows that have already been published (fb or ig id set).
+    # Only exclude rows where BOTH ids are set (fully published). Rows with
+    # a partial result — e.g. IG ok, FB failed — stay eligible so the next
+    # tick retries the missing side. process_content short-circuits the
+    # already-posted side so IG won't be re-posted.
     return [
         i for i in items
-        if not (i.get("generation_params") or {}).get("meta_fb_post_id")
-           and not (i.get("generation_params") or {}).get("meta_ig_post_id")
+        if not (
+            (i.get("generation_params") or {}).get("meta_fb_post_id")
+            and (i.get("generation_params") or {}).get("meta_ig_post_id")
+        )
     ]
 
 

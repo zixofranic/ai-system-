@@ -113,14 +113,19 @@ def run_tiktok_uploader():
 
 
 def check_meta_content():
-    """Find approved/published shorts flagged for Meta publish with no
-    existing fb/ig post IDs."""
+    """Find approved/published short/midform rows flagged for Meta publish
+    with no existing fb/ig post IDs.
+
+    Midform (16:9 landscape) is supported 2026-04-24 — uploader posts to
+    Facebook only (skips IG Reels which requires 9:16). Shorts continue
+    to post to both FB + IG.
+    """
     try:
         url = f"{SUPABASE_URL}/rest/v1/content"
         params = {
             "select": "id,philosopher,topic,channel_id,format",
             "status": "in.(approved,published)",
-            "format": "eq.short",
+            "format": "in.(short,midform)",
             "or": "(video_drive_url.not.is.null,video_storage_path.not.is.null)",
             "generation_params->meta_publish_requested": "eq.true",
             "deleted_at": "is.null",
