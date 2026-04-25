@@ -241,11 +241,18 @@ def main():
     topic = row.get("topic") or row.get("title") or "life"
     queued_title = row.get("title")
 
-    # ---- Aspect-by-duration ----
-    # 2-3 min presets → PORTRAIT (9:16) for phone-native consumption
-    # 10-20 min presets → LANDSCAPE (16:9) for YouTube long-form
-    # The 180s boundary matches the Custom Prompts modal's presets.
-    is_portrait = target_seconds <= 180
+    # ---- Aspect ----
+    # Default: infer from duration (2-3 min → PORTRAIT, 10-20 min → LANDSCAPE).
+    # Override: generation_params.force_aspect ('landscape'|'portrait')
+    # is set by the Gibran Generate modal so the user can lock a 2-3 min
+    # midform to landscape (cinematic intro + per-scene art look).
+    forced = (gp.get("force_aspect") or "").strip().lower()
+    if forced == "landscape":
+        is_portrait = False
+    elif forced == "portrait":
+        is_portrait = True
+    else:
+        is_portrait = target_seconds <= 180
     art_aspect = PORTRAIT if is_portrait else LANDSCAPE
     render_format = "story_vertical" if is_portrait else "story"
 
