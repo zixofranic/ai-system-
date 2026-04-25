@@ -199,7 +199,20 @@ PERSONA_TO_VOICE_ID = {
 #     switch_gibran_tts.py (writes GIBRAN_TTS_PROVIDER env var to .env)
 CHANNEL_VOICE = {
     "wisdom": {
+        # Default stays ElevenLabs (James Burton voice identity). The
+        # Chatterbox profile below is DORMANT by default — only kicks in
+        # when WISDOM_TTS_PROVIDER=chatterbox is set in env. Added 2026-04-25
+        # as a fallback path when EL credit floor blocks renders mid-month.
         "provider_default": "elevenlabs",
+        "chatterbox": {
+            # Cloned from a 4:54 clean EL Burton sample (mp3 → 44.1k WAV).
+            # Mirrors the Gibran A_v2_slow recipe that won the blind test:
+            # atempo 0.80 + small reverb + soft tail-fade.
+            "ref":    "wisdom_burton_long_ref.wav",
+            "atempo": 0.80,
+            "reverb": "aecho=0.85:0.85:40|60:0.18|0.10",
+            "tail_fade": {"duration": 1.5, "pitch_factor": 0.94, "volume_target": 0.7},
+        },
     },
     "gibran": {
         "provider_default": "chatterbox",  # 2026-04-21: Gibran moved off ElevenLabs entirely
