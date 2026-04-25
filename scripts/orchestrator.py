@@ -2443,9 +2443,9 @@ def process_midform(content: dict):
         # captions render word-by-word (ProgressiveSubtitle) like Gibran
         # essays — instead of MidformQuote's single-block italic dump that
         # turned a 60s monologue into a wall of text covering the frame
-        # (user reported this 2026-04-22). Wisdom midform stays on
-        # render_remotion_video for now.
-        if channel_slug in ("na", "aa"):
+        # (user reported this 2026-04-22; extended to all channels
+        # 2026-04-25 after Wisdom Sun Tzu midform showed the same wall).
+        if True:  # all channels: route midform through cinematic_pipeline
             import shutil
             from cinematic_pipeline import LANDSCAPE, render_cinematic_essay
 
@@ -2806,12 +2806,14 @@ def _batch_process(items: list):
             batch_title = content.get("title", f"{philosopher} on {topic}")
             video_path = str(_final_video_path(channel_slug, vid_format, batch_title, cid))
 
-            # NA/AA midform/longform → cinematic_pipeline (word-by-word
-            # ProgressiveSubtitle like Gibran essays). Shorts keep the
-            # render_remotion_video path (MonologueOverlay for NA/AA
-            # shorts already handles the scrolling caption style
-            # correctly at 9:16).
-            if vid_format == "midform" and channel_slug in ("na", "aa"):
+            # All midforms → cinematic_pipeline (word-by-word
+            # ProgressiveSubtitle like Gibran essays). Was scoped to
+            # NA/AA only until 2026-04-25; user reported the same
+            # wall-of-text bug on a Wisdom midform (Sun Tzu Iran).
+            # Shorts keep render_remotion_video — MonologueOverlay
+            # handles NA/AA scrolling captions; AphorismOverlay
+            # handles Wisdom 1-3 sentence shorts.
+            if vid_format == "midform":
                 import shutil
                 from cinematic_pipeline import LANDSCAPE, render_cinematic_essay
 
