@@ -224,6 +224,12 @@ def render_cinematic_essay(
         "watermark": watermark_for_channel(channel_slug),
         "closing_attribution": closing_attribution or f"Inspired by {philosopher}",
         "equalizerColor": eq_color,
+        # Force cinematic styling for ALL channels going through this
+        # pipeline — EBGaramond italic, aged-paper, equalizer band. Without
+        # this, convert-story.js defaults non-Gibran channels to the old
+        # Hormozi look (uppercase BreeSerif white-on-stroke). User flagged
+        # the difference 2026-04-25 on a Wisdom Sun Tzu midform.
+        "theme": {"cinematic": True},
     }, indent=2), encoding="utf-8")
     timestamps_path = work_dir / "timestamps.json"
     timestamps_path.write_text(json.dumps(words, indent=2), encoding="utf-8")
