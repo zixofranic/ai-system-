@@ -279,6 +279,11 @@ export const AIVideo: React.FC<z.infer<typeof aiVideoSchema>> = ({
           >
             <Audio
               src={staticFile(getAudioPath(id, element.audioUrl))}
+              // Loop music so a 2:46 track covers a 5:50 video — without
+              // this the back half of long midforms played silent. Voice
+              // tracks never need looping (their duration drives scene
+              // length to begin with).
+              loop={isMusic}
               volume={
                 isMusic
                   ? (f: number) => {

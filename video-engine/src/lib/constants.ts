@@ -3,11 +3,13 @@ export const INTRO_DURATION = 2 * FPS; // 2s intro
 export const IMAGE_WIDTH = 1920;
 export const IMAGE_HEIGHT = 1080;
 
-// Background music volume (0-1). Lowered from 0.35 → 0.22 on 2026-04-08,
-// then 0.22 → 0.16 on 2026-04-17 to lift perceived voice volume on NA/AA
-// monologue shorts. Voice already sits at 1.0 (Remotion's max), so the
-// only way to make narration feel louder is to drop the music floor.
-export const MUSIC_VOLUME = 0.16;
+// Background music volume (0-1). Lowered from 0.35 → 0.22 (2026-04-08),
+// 0.22 → 0.16 (2026-04-17), and 0.16 → 0.10 (2026-04-25) — user
+// reported music was too loud on the Wisdom Sun Tzu midform after
+// extending cinematic to all channels. Voice sits at 1.0 (Remotion
+// max), so dropping the music floor is the only lever for "louder
+// voice" perception.
+export const MUSIC_VOLUME = 0.10;
 // How many frames to fade music in at start and out at end
 export const MUSIC_FADE_FRAMES = 2 * FPS; // 2 seconds
 
