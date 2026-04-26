@@ -52,19 +52,38 @@ export const ShortVideo: React.FC<z.infer<typeof shortVideoSchema>> = ({
   const philosopher = timeline.metadata?.philosopher || "";
 
   // Two rendering modes:
-  //   - "monologue"  (NA/AA) — 60s+ character narration, scrolling text with
-  //                  dual alpha mask, top + bottom dark gradients for the
-  //                  fade bands.
-  //   - "aphorism"   (Wisdom/Gibran) — 15-20s short quote, static centered
-  //                  text in a solid dark box over the art, NO dark gradients
-  //                  (the box itself provides contrast).
+  //   - "monologue"  — long narration, scrolling text inside a fixed-height
+  //                  dark box with top + bottom dark gradients for fade bands.
+  //                  Originally NA/AA-only, now also used for any channel
+  //                  whose quote text exceeds AphorismOverlay's safe length
+  //                  (Wisdom Dostoevsky quotes commonly hit 60-80 words and
+  //                  overflow the centered box otherwise).
+  //   - "aphorism"   — 15-30 word short quote, static centered text in a
+  //                  solid dark box over the art, NO dark gradients (the box
+  //                  itself provides contrast). Wisdom/Gibran's signature
+  //                  short look, preserved for normal-length quotes.
   const channel = (timeline.metadata?.channel || "").toLowerCase();
-  const isMonologue = channel === "na" || channel === "aa";
 
   // Separate text elements by role
   const quotes = timeline.text.filter(
     (t) => t.role === "quote" || !t.role,
   );
+
+  // Length-based gate: if ANY quote exceeds 30 words, route ALL quotes through
+  // MonologueOverlay so the visual treatment stays consistent across the short.
+  // 30 words ≈ 2-3 lines at AphorismOverlay's 64px / 88px line-height — past
+  // that, the unbounded box grows tall enough to spill into the equalizer or
+  // off-frame. NA/AA always hit this threshold (60-90s monologues = 130+ words);
+  // Wisdom/Gibran usually don't, but long Dostoevsky/Nietzsche quotes do.
+  const APHORISM_MAX_WORDS = 30;
+  const longestQuoteWords = quotes.reduce(
+    (max, q) => Math.max(max, q.text.split(/\s+/).filter(Boolean).length),
+    0,
+  );
+  const isMonologue =
+    channel === "na" ||
+    channel === "aa" ||
+    longestQuoteWords > APHORISM_MAX_WORDS;
   const attributions = timeline.text.filter(
     (t) => t.role === "attribution",
   );
@@ -398,13 +417,32 @@ const AphorismOverlay: React.FC<{ text: string }> = ({ text }) => {
 //
 // Line estimate is word-count-based because fitText-based estimation
 // undercounts wrap and produced an overflow on the first AA render.
-const QUOTE_FONT = 54;
-const QUOTE_LINE_RATIO = 1.45;
-const QUOTE_BOX_HEIGHT = 1180;
-const QUOTE_V_PAD = 48;
+// Tuned 2026-04-18. Originally 54px / 1180px caused wall-of-text overflow.
+// Then 42px / 1240px went too small AND the centered box bottom touched
+// the attribution. Now: 50px font, 1340px box, top-anchored at y=160 so
+// the bottom edge clears the attribution by ~120px.
+const QUOTE_FONT = 50;
+const QUOTE_LINE_RATIO = 1.4;
+const QUOTE_BOX_HEIGHT = 1340;
+// Side padding (left/right) for the inner text. Top/bottom padding is
+// handled separately (see below) because the alpha-fade mask eats the
+// first ~50px of the box on the top edge — without extra top inset the
+// first line of text reads as half-transparent.
+const QUOTE_H_PAD = 52;
+// Top inset for the inner scrolling text. Sits BELOW the alpha-mask fade
+// zone (4% of box height = ~54px) plus a 30px buffer so the first line of
+// readable text lands at full opacity, not in the gradient.
+const QUOTE_TOP_PAD = 90;
+// Bottom inset is smaller — text scrolls THROUGH the bottom fade band on
+// purpose (that's the whole point of the scroll), so we want the natural
+// fade-out to work at the box bottom edge.
+const QUOTE_BOTTOM_PAD = 60;
+// Distance from canvas top to the box top. Picks up just below the
+// watermark zone (y=60 paddingTop + ~50px text + breathing room).
+const QUOTE_BOX_TOP_OFFSET = 160;
 const QUOTE_SCROLL_START_PCT = 0.08;
 const QUOTE_SCROLL_END_PCT = 0.92;
-const WORDS_PER_LINE = 4.5;
+const WORDS_PER_LINE = 6;
 const LINE_PAD_EXTRA = 1;
 
 const MonologueOverlay: React.FC<{ text: string }> = ({ text }) => {
@@ -436,7 +474,7 @@ const MonologueOverlay: React.FC<{ text: string }> = ({ text }) => {
   const estimatedLines = Math.ceil(wordCount / WORDS_PER_LINE) + LINE_PAD_EXTRA;
   const textHeight = estimatedLines * QUOTE_FONT * QUOTE_LINE_RATIO;
 
-  const visibleHeight = QUOTE_BOX_HEIGHT - 2 * QUOTE_V_PAD;
+  const visibleHeight = QUOTE_BOX_HEIGHT - QUOTE_TOP_PAD - QUOTE_BOTTOM_PAD;
   const scrollDistance = Math.max(0, textHeight - visibleHeight);
 
   // Scroll ramp — hold the first lines for ~8% of duration, scroll across
@@ -450,26 +488,34 @@ const MonologueOverlay: React.FC<{ text: string }> = ({ text }) => {
     { extrapolateLeft: "clamp", extrapolateRight: "clamp" },
   );
 
-  // Dual alpha mask — always applied. For short text that fits, the fade
-  // bands happen above/below where the text actually sits, so the text
-  // still renders crisp (no visible fade).
-  const maskImage =
-    "linear-gradient(180deg, transparent 0%, #000 9%, #000 91%, transparent 100%)";
+  // Mask removed 2026-04-18. The previous dual alpha-fade gradient meant
+  // any line scrolling in/out of view was rendered at partial opacity, which
+  // read as "broken text" on the dashboard preview rather than as a soft
+  // edge. The dark backing box + overflow:hidden gives a clean hard clip:
+  // text is either fully readable inside the box or clipped at the edge,
+  // no in-between. The translateY scroll handles the motion; we don't need
+  // the mask to "soften" the boundaries.
+  const maskImage = "none";
 
   return (
     <AbsoluteFill
       style={{
         zIndex: 15,
-        justifyContent: "center",
+        justifyContent: "flex-start",
         alignItems: "center",
-        padding: "0 50px",
+        paddingTop: QUOTE_BOX_TOP_OFFSET,
+        paddingLeft: 50,
+        paddingRight: 50,
       }}
     >
       <div
         style={{
           backgroundColor: "rgba(0, 0, 0, 0.5)",
           borderRadius: 16,
-          padding: `${QUOTE_V_PAD}px 52px`,
+          paddingTop: QUOTE_TOP_PAD,
+          paddingBottom: QUOTE_BOTTOM_PAD,
+          paddingLeft: QUOTE_H_PAD,
+          paddingRight: QUOTE_H_PAD,
           maxWidth: "95%",
           height: QUOTE_BOX_HEIGHT,
           overflow: "hidden",
