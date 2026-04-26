@@ -3066,7 +3066,17 @@ def _batch_process(items: list):
                             _time.sleep(2 * (2 ** _attempt))
                         else:
                             thumb_errors.append(f"upload: {last_err}")
-                print(f"  [{cid[:8]}] Thumbnail: {thumb_path}")
+                # CTO root-cause fix 2026-04-25: the retry loop's terminal
+                # failure used to be silently downgraded to a success-looking
+                # log line. Raise here so the outer except below stashes the
+                # error into data["_thumbnail_error"] AND it gets merged
+                # into the final generation_params write.
+                if not thumb_storage_path:
+                    raise RuntimeError(
+                        f"thumb upload failed after 3 attempts: "
+                        f"{thumb_errors[-1] if thumb_errors else 'unknown'}"
+                    )
+                print(f"  [{cid[:8]}] Thumbnail: {thumb_storage_path}")
             except Exception as thumb_e:
                 err_msg = f"{type(thumb_e).__name__}: {thumb_e}"
                 print(f"  [{cid[:8]}] Thumbnail warning: {err_msg}")
@@ -3075,6 +3085,20 @@ def _batch_process(items: list):
                 # to Supabase here would get clobbered by the wholesale
                 # generation_params assignment at the final update_supabase.
                 data["_thumbnail_error"] = err_msg
+                # Disk-log so we have evidence even when poller stdout
+                # is dropped. Same pattern as batch_cinematic_debug.log.
+                try:
+                    _err_path = Path("C:/AI/system/scripts/logs/thumbnail_failures.log")
+                    _err_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(_err_path, "a", encoding="utf-8") as _f:
+                        _f.write(
+                            f"[{datetime.now(timezone.utc).isoformat()}] "
+                            f"cid={cid[:8]} slug={channel_slug} fmt={vid_format} "
+                            f"thumb_path={thumb_path} "
+                            f"errors={'; '.join(thumb_errors) if thumb_errors else err_msg}\n"
+                        )
+                except Exception:
+                    pass
 
             # Final metadata update — status='ready' signals generation is
             # done; human approves in dashboard → status becomes 'approved'
@@ -3102,6 +3126,12 @@ def _batch_process(items: list):
                     "music_track": Path(music_path).name,
                     "renderer": "remotion",
                     "tags": tags,
+                    # CTO fix 2026-04-25: surface thumbnail upload failures
+                    # to the dashboard. Set above in the thumbnail except
+                    # block when the 3-attempt retry exhausts. Without this
+                    # the row looks ready but has thumbnail_storage_path=NULL
+                    # and no diagnostic explaining why.
+                    "thumbnail_error": data.get("_thumbnail_error"),
                 },
             }
             update_supabase(cid, updates)
