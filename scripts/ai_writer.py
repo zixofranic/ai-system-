@@ -579,6 +579,31 @@ def generate_midform_script(philosopher: str, topic: str,
         trimmed = [q[:120] for q in previous_quotes[:15]]
         dedup_line = "\n\nDo NOT repeat or closely paraphrase any of these previously published quotes:\n" + "\n".join(f"- {q}" for q in trimmed) + "\n\nEnsure all quotes are genuinely original."
 
+    # Universal anti-naming guardrail. Wisdom/Gibran channels reach a
+    # diverse audience that will dispute named takes on geopolitical
+    # actors (e.g. naming Iran/Israel/USA invites partisan debate that
+    # drowns the philosophical point). User feedback 2026-04-25 after a
+    # Sun Tzu midform on the Middle East named all three. The instruction
+    # is "be inspired by the event, abstract the actors": same rules
+    # the Timely Wisdom flow already applies, now applied to ALL midform
+    # writes so the Manual Add path is also safe.
+    NEUTRALITY_RULES = (
+        "\n\nNEUTRALITY — strict:\n"
+        "- NEVER name specific countries, leaders, political parties, ethnicities, "
+        "religions, or active conflicts. No 'Iran', 'Israel', 'United States', "
+        "'Putin', 'Trump', 'Hamas', 'Hezbollah', 'Republican', 'Democrat', etc.\n"
+        "- If the topic mentions any of those, treat them as PROMPT context only. "
+        "Translate them into universal dynamics: 'a great power and its proxies', "
+        "'a coalition that mistakes force for strategy', 'an ancient grievance', "
+        "'two civilizations bound by their wounds'.\n"
+        "- The principle has to be timeless — a viewer in another decade with no "
+        "knowledge of this week's news should find the line just as cutting.\n"
+        "- A sophisticated viewer who DOES know the news should be able to tell "
+        "what you're pointing at without you ever pointing directly. That's the craft.\n"
+        "- Test: if you can't read the script aloud at a public dinner of mixed "
+        "political beliefs without anyone bristling, rewrite it."
+    )
+
     if style == "narrator":
         system = (
             "You are a thoughtful contemporary narrator introducing a philosopher's ideas "
@@ -587,6 +612,7 @@ def generate_midform_script(philosopher: str, topic: str,
             "as citations. The narration_segments carry the narrator's unfolding voice; "
             "the 'quotes' field holds short paraphrased positions the narrator can pivot "
             "to, NOT verbatim quotes from real texts. Output valid JSON only."
+            + NEUTRALITY_RULES
         )
         perspective_directive = (
             f"\n\nPERSPECTIVE: NARRATOR. Speak ABOUT {philosopher}, not AS him. "
@@ -600,6 +626,7 @@ def generate_midform_script(philosopher: str, topic: str,
             "You are a philosophical writer creating connected video scripts. "
             "Each quote should build on the previous, creating a narrative arc. "
             "Write in the authentic voice of the philosopher. Output valid JSON only."
+            + NEUTRALITY_RULES
         )
         perspective_directive = ""
 
