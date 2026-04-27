@@ -51,17 +51,21 @@ export const ShortVideo: React.FC<z.infer<typeof shortVideoSchema>> = ({
     timeline.metadata?.watermark || "Deep Echoes of Wisdom";
   const philosopher = timeline.metadata?.philosopher || "";
 
-  // Two rendering modes:
-  //   - "monologue"  — long narration, scrolling text inside a fixed-height
-  //                  dark box with top + bottom dark gradients for fade bands.
-  //                  Originally NA/AA-only, now also used for any channel
-  //                  whose quote text exceeds AphorismOverlay's safe length
-  //                  (Wisdom Dostoevsky quotes commonly hit 60-80 words and
-  //                  overflow the centered box otherwise).
-  //   - "aphorism"   — 15-30 word short quote, static centered text in a
-  //                  solid dark box over the art, NO dark gradients (the box
-  //                  itself provides contrast). Wisdom/Gibran's signature
-  //                  short look, preserved for normal-length quotes.
+  // Two rendering modes — channel-gated, no length fallback:
+  //   - "monologue"  — NA/AA only. Long character narrations (60-90s, 130+
+  //                  words) scroll inside a fixed-height dark box with top
+  //                  + bottom dark fade gradients.
+  //   - "aphorism"   — Wisdom/Gibran ALWAYS. Short quotes get the signature
+  //                  large centered text in a solid dark box. Long quotes
+  //                  (the rare Dostoevsky / Gibran-Prophet exception) don't
+  //                  fall back to MonologueOverlay anymore — that produced
+  //                  unreadably small text. Instead, AphorismOverlay
+  //                  auto-shrinks the font to fit (see component for the
+  //                  exact taper).
+  // History: 2026-04-26 added a length-based fallback that routed long
+  // Wisdom/Gibran quotes through MonologueOverlay. Reverted 2026-04-27 —
+  // user reported text became "barely legible". Replaced with auto-shrink
+  // inside AphorismOverlay (see fitText logic in the component).
   const channel = (timeline.metadata?.channel || "").toLowerCase();
 
   // Separate text elements by role
@@ -69,21 +73,7 @@ export const ShortVideo: React.FC<z.infer<typeof shortVideoSchema>> = ({
     (t) => t.role === "quote" || !t.role,
   );
 
-  // Length-based gate: if ANY quote exceeds 30 words, route ALL quotes through
-  // MonologueOverlay so the visual treatment stays consistent across the short.
-  // 30 words ≈ 2-3 lines at AphorismOverlay's 64px / 88px line-height — past
-  // that, the unbounded box grows tall enough to spill into the equalizer or
-  // off-frame. NA/AA always hit this threshold (60-90s monologues = 130+ words);
-  // Wisdom/Gibran usually don't, but long Dostoevsky/Nietzsche quotes do.
-  const APHORISM_MAX_WORDS = 30;
-  const longestQuoteWords = quotes.reduce(
-    (max, q) => Math.max(max, q.text.split(/\s+/).filter(Boolean).length),
-    0,
-  );
-  const isMonologue =
-    channel === "na" ||
-    channel === "aa" ||
-    longestQuoteWords > APHORISM_MAX_WORDS;
+  const isMonologue = channel === "na" || channel === "aa";
   const attributions = timeline.text.filter(
     (t) => t.role === "attribution",
   );
@@ -344,9 +334,25 @@ const ShortBackground: React.FC<{
 //
 // Short 1-3 sentence quotes (15-40 words, ~15-20s videos). Static text,
 // centered in a solid dark rounded box over the art. No scroll, no alpha
-// mask, no top/bottom gradients. This is the original pre-2026-04-17
-// rendering — restored after the monologue scroll/mask work was
-// accidentally applied to short quotes too.
+// mask, no top/bottom gradients.
+//
+// Auto-shrink font for long quotes (added 2026-04-27). Wisdom/Gibran
+// occasionally produce 50-80 word quotes (Dostoevsky paragraphs, full
+// Gibran-Prophet passages). Previous fix routed those through
+// MonologueOverlay's scrolling box, which used 50px text and felt
+// "barely legible" per user. Now the Aphorism box stays the signature
+// look but the font tapers down with length so the quote fits without
+// scroll. Word-count-based taper is more predictable than fitText for
+// our quote distribution.
+function aphorismFontSize(words: number): number {
+  if (words <= 25) return 64;   // signature look — most Wisdom/Gibran shorts
+  if (words <= 40) return 56;
+  if (words <= 60) return 48;
+  if (words <= 80) return 42;   // Dostoevsky / long Gibran range
+  return 38;                    // hard floor — anything longer should
+                                // probably be a story, not a short
+}
+
 const AphorismOverlay: React.FC<{ text: string }> = ({ text }) => {
   const frame = useCurrentFrame();
   const { fps, durationInFrames } = useVideoConfig();
@@ -369,6 +375,10 @@ const AphorismOverlay: React.FC<{ text: string }> = ({ text }) => {
   const opacity = Math.min(interpolate(enter, [0, 1], [0, 1]), fadeOut);
   const translateY = interpolate(enter, [0, 1], [40, 0]);
 
+  const wordCount = text.split(/\s+/).filter(Boolean).length;
+  const fontSize = aphorismFontSize(wordCount);
+  const lineHeight = Math.round(fontSize * 1.375);
+
   return (
     <AbsoluteFill
       style={{
@@ -390,8 +400,8 @@ const AphorismOverlay: React.FC<{ text: string }> = ({ text }) => {
       >
         <div
           style={{
-            fontSize: 64,
-            lineHeight: "88px",
+            fontSize,
+            lineHeight: `${lineHeight}px`,
             color: "white",
             fontFamily: "Georgia, serif",
             fontWeight: "bold",
