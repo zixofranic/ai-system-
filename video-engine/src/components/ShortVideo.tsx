@@ -390,7 +390,14 @@ const AphorismOverlay: React.FC<{ text: string }> = ({ text }) => {
     >
       <div
         style={{
-          backgroundColor: "rgba(10, 14, 22, 0.88)",
+          // Restored 2026-04-28 from 0.88 → 0.5. The Apr 17 split commit
+          // (6ed43fa) bumped this to 0.88 by accident while splitting
+          // Aphorism vs Monologue overlays — its message claimed it
+          // restored the original look but the original was rgba(0,0,0,0.5)
+          // (commit 0d7eaa4 from Mar 29). User noticed: "had a little
+          // bit of nice transparency, not much but a hint" — that's the
+          // 0.5 feel, where the art shows through subtly behind the box.
+          backgroundColor: "rgba(0, 0, 0, 0.5)",
           borderRadius: 16,
           padding: "48px 52px",
           maxWidth: "95%",
