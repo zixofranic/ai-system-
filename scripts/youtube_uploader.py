@@ -121,8 +121,11 @@ def _fetch_approved_content() -> list:
 
 
 def _update_content(content_id: str, updates: dict):
-    """PATCH a content row in Supabase."""
-    url = f"{SUPABASE_URL}/rest/v1/content?id=eq.{content_id}"
+    """PATCH a content row in Supabase. Skips soft-deleted rows so a
+    YouTube upload that completes after the user tombstones the row
+    can't write youtube_video_id back onto a deleted record (zombie-row
+    prevention — see orchestrator.update_supabase)."""
+    url = f"{SUPABASE_URL}/rest/v1/content?id=eq.{content_id}&deleted_at=is.null"
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
     resp = requests.patch(url, headers=_supabase_headers(), json=updates, timeout=15)
     resp.raise_for_status()
@@ -327,6 +330,52 @@ def _build_video_metadata(content: dict) -> dict:
             "madeForKids": False,
         },
     }
+
+
+def _youtube_set_thumbnail(access_token: str, video_id: str,
+                           thumb_path: str) -> bool:
+    """Upload a custom thumbnail to YouTube via the thumbnails.set endpoint.
+
+    Without this, YouTube auto-grabs a frame from the video — which for NA/AA
+    MonologueOverlay shorts means dark scrolling-text walls (every thumbnail
+    looks identical and unreadable). User flagged 2026-04-30 with screenshot
+    of the @OneDayAtATime channel grid.
+
+    Custom thumbnails on Shorts CAN be restricted to verified channels, so
+    we wrap this in try/except at the call site and don't fail the publish
+    when thumbnail upload fails — the video is up, that's the win.
+
+    YouTube API: POST upload/youtube/v3/thumbnails/set?videoId={id} with
+    image bytes. Max 2MB, JPEG or PNG, 16:9 ratio recommended for Standard
+    but Shorts are 9:16 — YouTube accepts either and pillars/letterboxes
+    as needed.
+
+    Returns True on success.
+    """
+    file_size = Path(thumb_path).stat().st_size
+    print(f"  [yt] Uploading custom thumbnail ({file_size // 1024} KB)...")
+
+    with open(thumb_path, "rb") as f:
+        thumb_bytes = f.read()
+
+    url = (f"https://www.googleapis.com/upload/youtube/v3/thumbnails/set"
+           f"?videoId={video_id}&uploadType=media")
+    resp = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "image/jpeg",
+            "Content-Length": str(file_size),
+        },
+        data=thumb_bytes,
+        timeout=60,
+    )
+    if resp.status_code in (200, 201):
+        print(f"  [yt] Thumbnail set successfully.")
+        return True
+    raise RuntimeError(
+        f"thumbnails.set failed ({resp.status_code}): {resp.text[:300]}"
+    )
 
 
 def _youtube_resumable_upload(
@@ -562,6 +611,34 @@ def upload_to_youtube(content_id: str, dry_run: bool = False) -> str:
         except Exception:
             pass
         raise RuntimeError(err)
+
+    # --- 5b. Upload custom thumbnail (best-effort) ---
+    # The orchestrator already generates a PIL thumbnail (scene art + dark
+    # bottom gradient + Georgia bold title overlay) and uploads it to the
+    # wisdom-thumbnails Supabase bucket. Without sending it to YouTube
+    # explicitly, YT auto-generates from a video frame — for NA/AA shorts
+    # that means dark scrolling-text walls (every thumbnail looks identical
+    # and unscannable in the channel grid).
+    #
+    # Wrapped in try/except: custom thumbnails on Shorts can be limited by
+    # channel verification status, and a thumbnail failure should not
+    # invalidate a successful video publish. Logged for follow-up.
+    thumb_storage_path = content.get("thumbnail_storage_path")
+    if thumb_storage_path:
+        try:
+            from supabase_storage import download_from_storage as dl_thumb
+            tmp_thumb = str(tmp_dir / f"{content_id[:8]}_thumb.jpg")
+            dl_thumb("wisdom-thumbnails", thumb_storage_path, tmp_thumb)
+            _youtube_set_thumbnail(yt_access_token, video_id, tmp_thumb)
+            try:
+                Path(tmp_thumb).unlink(missing_ok=True)
+            except Exception:
+                pass
+        except Exception as thumb_e:
+            print(f"  [yt] WARN: thumbnail upload failed ({thumb_e}); "
+                  f"video published anyway, YT will auto-generate from frame")
+    else:
+        print(f"  [yt] No thumbnail_storage_path on row; YT will auto-generate")
 
     # --- 6. Update Supabase ---
     youtube_url = f"https://www.youtube.com/watch?v={video_id}"
