@@ -131,6 +131,34 @@ def _update_content(content_id: str, updates: dict):
     resp.raise_for_status()
 
 
+def _halt_youtube_retry(content_id: str, error: str):
+    """Park `youtube_publish_requested` after a hard failure so the poller
+    stops retrying every 5 min. Mirrors `update_content_meta(halt_auto_retry=True)`
+    in meta_uploader and the tiktok halt-marker convention.
+
+    Without this, a row that fails (no refresh_token, video download error,
+    YouTube API rejection) keeps `youtube_publish_requested=true`, matches
+    the poller's query forever, and re-fails every tick. The dashboard
+    surfaces `youtube_retry_halted=true` so the operator can clear it,
+    fix the underlying issue, and re-flag publish.
+
+    Reads the row first so we merge into existing generation_params instead
+    of clobbering it."""
+    try:
+        row = _fetch_content(content_id)
+    except Exception:
+        return
+    params = row.get("generation_params") or {}
+    if isinstance(params, str):
+        params = json.loads(params)
+    params.pop("youtube_publish_requested", None)
+    params["youtube_retry_halted"] = True
+    params["youtube_retry_halted_at"] = datetime.now(timezone.utc).isoformat()
+    params["youtube_last_error"] = error
+    params["youtube_error_at"] = datetime.now(timezone.utc).isoformat()
+    _update_content(content_id, {"generation_params": params})
+
+
 # ---------------------------------------------------------------------------
 # Google OAuth helpers
 # ---------------------------------------------------------------------------
@@ -538,6 +566,7 @@ def upload_to_youtube(content_id: str, dry_run: bool = False) -> str:
         err = "No video source — neither video_storage_path nor video_drive_url is set"
         _update_content(content_id, {"status": "failed",
                                      "rejection_reason": err})
+        _halt_youtube_retry(content_id, err)
         raise ValueError(err)
 
     settings = channel.get("settings", {}) or {}
@@ -548,6 +577,7 @@ def upload_to_youtube(content_id: str, dry_run: bool = False) -> str:
         )
         _update_content(content_id, {"status": "failed",
                                      "rejection_reason": err})
+        _halt_youtube_retry(content_id, err)
         raise ValueError(err)
 
     if dry_run:
@@ -563,6 +593,7 @@ def upload_to_youtube(content_id: str, dry_run: bool = False) -> str:
     except Exception as e:
         _update_content(content_id, {"status": "failed",
                                      "rejection_reason": str(e)})
+        _halt_youtube_retry(content_id, str(e))
         raise
 
     # Drive download uses google_refresh_token (personal account that owns the Drive files)
@@ -591,6 +622,7 @@ def upload_to_youtube(content_id: str, dry_run: bool = False) -> str:
         err = f"Video download failed: {e}"
         _update_content(content_id, {"status": "failed",
                                      "rejection_reason": err})
+        _halt_youtube_retry(content_id, err)
         raise RuntimeError(err)
 
     # --- 5. Upload to YouTube ---
@@ -605,6 +637,7 @@ def upload_to_youtube(content_id: str, dry_run: bool = False) -> str:
         err = f"YouTube upload failed: {e}"
         _update_content(content_id, {"status": "failed",
                                      "rejection_reason": err})
+        _halt_youtube_retry(content_id, err)
         # Clean up temp file even on failure
         try:
             Path(tmp_video).unlink(missing_ok=True)

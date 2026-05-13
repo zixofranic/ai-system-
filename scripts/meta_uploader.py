@@ -103,13 +103,17 @@ def get_channel(channel_id):
 
 
 def update_content_meta(content_id, fb_post_id=None, ig_post_id=None,
-                        fb_error=None, ig_error=None):
+                        fb_error=None, ig_error=None,
+                        halt_auto_retry=False):
     """Merge Meta post IDs, errors, and timestamps into generation_params.
 
     Persists even when both sides failed so `meta_last_error` is visible
-    in the dashboard. `meta_publish_requested` is only cleared once BOTH
-    meta_fb_post_id and meta_ig_post_id are set — a partial success
-    (e.g. IG ok, FB failed) keeps the flag so the next poll retries."""
+    in the dashboard. `meta_publish_requested` is cleared when BOTH
+    meta_fb_post_id and meta_ig_post_id are set, OR when halt_auto_retry
+    is True (e.g. an FB attempt that didn't return a post_id — could have
+    posted server-side; retry would duplicate). A partial success that
+    is safe to retry (e.g. FB ok, IG container failed) leaves the flag in
+    place."""
     current = get_content(content_id)
     if not current:
         return
@@ -134,6 +138,10 @@ def update_content_meta(content_id, fb_post_id=None, ig_post_id=None,
 
     if params.get("meta_fb_post_id") and params.get("meta_ig_post_id"):
         params.pop("meta_publish_requested", None)
+    elif halt_auto_retry:
+        params.pop("meta_publish_requested", None)
+        params["meta_retry_halted"] = True
+        params["meta_retry_halted_at"] = datetime.now(timezone.utc).isoformat()
 
     # Soft-delete guard — don't write meta_fb_post_id / meta_ig_post_id
     # back onto a row that was tombstoned between flag-set and upload.
@@ -230,10 +238,21 @@ def publish_to_facebook_page(page_id, page_token, video_url, caption, thumb_url=
         "access_token": page_token,
     }
     resp = requests.post(url, data=payload, timeout=600)
-    data = resp.json()
-    if "id" not in data:
-        raise RuntimeError(f"FB Page video upload failed: {json.dumps(data)[:400]}")
-    return data["id"]
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {}
+    # Capture an id under either key BEFORE deciding the call failed: an
+    # FB response that returned a 2xx with a parseable id but missing
+    # secondary fields was previously treated as a failure, triggering a
+    # retry that posted the same Reel a second time.
+    fb_id = data.get("id") or data.get("post_id")
+    if fb_id:
+        return fb_id
+    raise RuntimeError(
+        f"FB Page video upload returned no id "
+        f"(status={resp.status_code}): {json.dumps(data)[:400] if data else resp.text[:400]}"
+    )
 
 
 # --- Instagram Reels upload ----------------------------------------------
@@ -332,7 +351,16 @@ def process_content(content, dry_run=False, fb_only=False, ig_only=False):
 
     settings = channel.get("settings") or {}
     if not settings.get("meta_connected"):
-        print("    Meta not connected for this channel")
+        # Channel isn't connected — clearing the flag is required, otherwise
+        # the row matches the poller's query every 5 min FOREVER (observed
+        # 2026-05-09: row 988f4333 reappeared every tick for hours). Park
+        # the flag with a halted marker so the dashboard surfaces it.
+        print("    Meta not connected for this channel — halting flag")
+        update_content_meta(
+            content_id, halt_auto_retry=True,
+            fb_error="Meta not connected for this channel "
+                     "(connect Meta on /settings, then re-flag publish).",
+        )
         return False
 
     page_id = settings.get("meta_page_id")
@@ -340,7 +368,12 @@ def process_content(content, dry_run=False, fb_only=False, ig_only=False):
     ig_user_id = settings.get("meta_ig_user_id")
 
     if not page_id or not page_token:
-        print("    Missing meta_page_id or meta_page_access_token")
+        print("    Missing meta_page_id or meta_page_access_token — halting flag")
+        update_content_meta(
+            content_id, halt_auto_retry=True,
+            fb_error="Missing meta_page_id or meta_page_access_token "
+                     "for this channel.",
+        )
         return False
 
     try:
@@ -375,10 +408,12 @@ def process_content(content, dry_run=False, fb_only=False, ig_only=False):
     existing_ig_id = existing_params.get("meta_ig_post_id")
 
     # --- Facebook Page ---
+    fb_attempted = False
     if not ig_only:
         if existing_fb_id:
             print(f"    FB already published: {existing_fb_id} — skipping")
         else:
+            fb_attempted = True
             try:
                 print(f"    Publishing to FB Page {page_id}...")
                 fb_post_id = publish_to_facebook_page(
@@ -406,11 +441,23 @@ def process_content(content, dry_run=False, fb_only=False, ig_only=False):
                 ig_error = str(e)[:500]
                 print(f"    IG error: {e}")
 
+    # If we attempted FB and didn't get a post_id back, halt auto-retry.
+    # The upload may have succeeded server-side (FB sometimes returns 200
+    # with parseable id but the request still appeared to fail client-side
+    # — e.g. timeout after server commit). Retrying would create a duplicate
+    # Reel. Surface to the dashboard for manual confirmation instead.
+    halt_auto_retry = fb_attempted and not fb_post_id
+
     update_content_meta(
         content_id,
         fb_post_id=fb_post_id, ig_post_id=ig_post_id,
         fb_error=fb_error, ig_error=ig_error,
+        halt_auto_retry=halt_auto_retry,
     )
+    if halt_auto_retry:
+        print("    Auto-retry halted — FB attempt didn't return a post_id. "
+              "Verify on the FB Page; clear meta_retry_halted and re-flag "
+              "meta_publish_requested if a manual repost is needed.")
     return bool(fb_post_id or ig_post_id)
 
 
@@ -430,7 +477,7 @@ def fetch_items():
                       "video_drive_url,video_storage_path,thumbnail_storage_path,"
                       "generation_params",
             "status": "in.(approved,published)",
-            "format": "eq.short",
+            "format": "in.(short,midform)",
             "or": "(video_drive_url.not.is.null,video_storage_path.not.is.null)",
             "generation_params->meta_publish_requested": "eq.true",
             "deleted_at": "is.null",
