@@ -511,7 +511,7 @@ def generate_short_script(philosopher: str, topic: str, ollama_model: str,
 
 Requirements:
 - Must sound authentically like {philosopher}
-- 1-3 sentences, 40-60 WORDS — short and quotable wins
+- 2-3 sentences, 50-65 WORDS — give the idea room to land
 - Deep insight, not surface-level advice
 - Do NOT include attribution or quotation marks
 

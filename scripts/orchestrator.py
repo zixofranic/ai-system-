@@ -31,6 +31,7 @@ import uuid
 import random
 import argparse
 import traceback
+import shutil
 import subprocess
 import requests
 from pathlib import Path
@@ -61,6 +62,13 @@ COMFYUI_URL = "http://localhost:8188"
 CHATTERBOX_URL = "http://localhost:8004"  # kept for future Chatterbox option
 MUSIC_ROOT = Path("C:/AI/system/music")
 WORK_DIR = Path("C:/AI/system/pipeline_work")
+
+# Channels whose generated SDXL art is too risky for YouTube's automated
+# thumbnail moderation — they get text-only thumbnails. The in-video art
+# is unaffected. Gibran flagged 2026-05-07 ("sex and nudity" on a marriage
+# video; the LoRA produces classical-figural illuminated-manuscript art
+# that the auto-moderator can't distinguish from prohibited imagery).
+TEXT_ONLY_THUMBNAIL_CHANNELS = {"gibran"}
 
 # ---------------------------------------------------------------------------
 # Philosopher -> Style mappings
@@ -278,6 +286,12 @@ CHANNEL_VOICE = {
                 "The Old-Timer":          "na_old_timer_5min.wav",
                 "The Sponsor":            "na_sponsor_5min.wav",
                 "The Voice of the Rooms": "na_rooms_5min.wav",
+                # Ziad — channel owner's cloned voice. Reference extracted
+                # from the year-one anniversary VO (2026-05-12). Use when
+                # philosopher='Ziad' on a content row, which the dashboard
+                # exposes as a 4th option per PHILOSOPHERS in
+                # wisdom-dashboard/src/lib/constants.ts.
+                "Ziad":                   "ziad_anniversary_25sec.wav",
             },
         },
     },
@@ -291,10 +305,11 @@ CHANNEL_VOICE = {
             # "pitch_ratio": 0.97,       # disabled — see NA comment
             "tail_fade": {"duration": 1.2, "pitch_factor": 0.96, "volume_target": 0.75},
             "ref": "na_old_timer_5min.wav",
-            "persona_refs": {  # AA shares NA's voice clones
+            "persona_refs": {  # AA shares NA's voice clones + Ziad
                 "The Old-Timer":          "na_old_timer_5min.wav",
                 "The Sponsor":            "na_sponsor_5min.wav",
                 "The Voice of the Rooms": "na_rooms_5min.wav",
+                "Ziad":                   "ziad_anniversary_25sec.wav",
             },
         },
     },
@@ -842,6 +857,52 @@ def mark_failed(content_id: str, reason) -> None:
         print(f"  [{content_id[:8]}] Failed to mark failed: {e}")
 
 
+def _try_claim_for_generation(content_id: str) -> bool:
+    """Atomically flip status='queued' -> 'generating' for ONE row.
+
+    Returns True iff this caller successfully claimed the row. Returns
+    False if the row was already taken (another orchestrator/rerender
+    flipped it first) — caller should skip silently to avoid the
+    double-generation race that produced today's `cd247173` anomaly
+    (same row went through quote/voice/render THREE separate times
+    starting at 11:51, 14:22, 14:24 UTC; voice step hit a WinError 32
+    file lock from two parallel tail-fade renames on `voice_0.wav`).
+
+    The bulletproof primitive is a conditional PATCH: PostgREST will
+    only update rows matching `status=eq.queued`. If another process
+    raced ahead and already set status=generating (or anything else),
+    the PATCH matches zero rows and we know we lost. Soft-deleted rows
+    are also skipped — never resurrect a tombstone.
+    """
+    url = (
+        f"{SUPABASE_URL}/rest/v1/content"
+        f"?id=eq.{content_id}"
+        f"&status=eq.queued"
+        f"&deleted_at=is.null"
+    )
+    headers = _supabase_headers()
+    headers["Prefer"] = "return=representation"
+    body = {
+        "status": "generating",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        resp = requests.patch(url, headers=headers, json=body, timeout=15)
+        resp.raise_for_status()
+        rows = resp.json()
+        claimed = isinstance(rows, list) and len(rows) > 0
+        if not claimed:
+            print(f"  [{content_id[:8]}] CLAIM FAILED — row not in 'queued' "
+                  f"state (already claimed or status changed). Skipping.")
+        return claimed
+    except Exception as e:
+        # Network/Supabase blip. Better to skip this tick than
+        # double-generate. Reaper will rescue stuck rows after 45 min.
+        print(f"  [{content_id[:8]}] CLAIM ERROR ({e}); skipping to avoid "
+              f"a possible double-generation race")
+        return False
+
+
 def log_step(content_id: str, step: str, step_order: int, status: str,
              error: str = None, gpu_stats: dict = None):
     """Insert or update a generation_log row for a pipeline step."""
@@ -893,6 +954,64 @@ def _fetch_recent_quotes(philosopher: str, limit: int = 20) -> list:
     return []
 
 
+def _fetch_top_hit_titles(channel_slug: str, top_n: int = 8,
+                          min_views: int = 60) -> list:
+    """Closed-loop title learning: pull the channel's recent top-performing
+    titles (by YouTube views from analytics_fetcher) for use as positive
+    few-shot examples in title generation. Empty list if nothing qualifies
+    or on any error — closed-loop is a quality boost, not a hard dep."""
+    try:
+        # Look up the channel row by slug to get the id
+        ch_resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/channels?slug=eq.{channel_slug}&select=id",
+            headers=_supabase_headers(), timeout=10,
+        )
+        if ch_resp.status_code != 200:
+            return []
+        rows = ch_resp.json()
+        if not rows:
+            return []
+        channel_id = rows[0]["id"]
+
+        # Pull published shorts on this channel with platform_stats populated
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/content",
+            params={
+                "channel_id": f"eq.{channel_id}",
+                "status": "eq.published",
+                "format": "eq.short",
+                "deleted_at": "is.null",
+                "select": "title,generation_params",
+                "order": "created_at.desc",
+                "limit": "60",
+            },
+            headers=_supabase_headers(), timeout=10,
+        )
+        if resp.status_code != 200:
+            return []
+
+        scored = []
+        for row in resp.json():
+            title = row.get("title")
+            if not title:
+                continue
+            params = row.get("generation_params") or {}
+            stats = params.get("platform_stats") or {}
+            views = ((stats.get("youtube") or {}).get("views") or 0)
+            if isinstance(views, str):
+                try:
+                    views = int(views)
+                except ValueError:
+                    views = 0
+            if views >= min_views:
+                scored.append((int(views), title))
+
+        scored.sort(reverse=True)
+        return [t for _, t in scored[:top_n]]
+    except Exception:
+        return []
+
+
 def _build_dedup_context(previous_quotes: list) -> str:
     """Build a prompt section listing previous quotes to avoid."""
     if not previous_quotes:
@@ -922,7 +1041,7 @@ def generate_quote(philosopher: str, topic: str) -> str:
         f"and voice of {philosopher}, on the topic of \"{topic}\".\n\n"
         f"Requirements:\n"
         f"- Must sound authentically like {philosopher}\n"
-        f"- 1-3 sentences, poetic and quotable\n"
+        f"- 2-3 sentences, 50-65 words — give the idea room to land\n"
         f"- Deep insight, not surface-level advice\n"
         f"- Do NOT include attribution or quotation marks\n\n"
         f"Return ONLY the quote text, nothing else."
@@ -1424,8 +1543,21 @@ def generate_voice(text: str, output_path: str,
     if tts_provider is None:
         tts_provider = voice_cfg["provider"]
         ref_for_log = (voice_cfg.get("chatterbox") or {}).get("ref", "-")
-        print(f"  [voice] resolved tts_provider={tts_provider} "
-              f"channel={channel_slug} persona={philosopher!r} ref={ref_for_log}")
+        # Persona is only load-bearing for channels with persona-keyed
+        # CB refs (NA / AA's Old-Timer / Sponsor / Voice of the Rooms).
+        # Gibran/Wisdom render the same single voice regardless of
+        # `philosopher`, so logging it here was misleading — that's how
+        # the May 2026 leak was first spotted ("persona='Marcus Aurelius'"
+        # showed up in a Gibran render log even though the field was
+        # ignored). Print persona only when it actually drives the ref.
+        cb_cfg = voice_cfg.get("chatterbox") or {}
+        uses_persona_ref = bool(cb_cfg.get("persona_refs"))
+        if uses_persona_ref:
+            print(f"  [voice] resolved tts_provider={tts_provider} "
+                  f"channel={channel_slug} persona={philosopher!r} ref={ref_for_log}")
+        else:
+            print(f"  [voice] resolved tts_provider={tts_provider} "
+                  f"channel={channel_slug} ref={ref_for_log}")
 
     # Chatterbox path — only enabled when the channel has a CB profile in
     # CHANNEL_VOICE. If CB is requested but the channel isn't qualified,
@@ -2080,9 +2212,18 @@ def _build_art_prompt(philosopher: str, quote: str, topic: str,
 # ---------------------------------------------------------------------------
 # Working directory management
 # ---------------------------------------------------------------------------
-def _content_work_dir(content_id: str) -> Path:
-    """Create and return a working directory for a content item."""
+def _content_work_dir(content_id: str, clean: bool = False) -> Path:
+    """Create and return a working directory for a content item.
+
+    Pass clean=True at the start of a fresh generation cycle to wipe stale
+    artifacts from a prior run. Without this, a regenerate that produces a
+    new quote can leave a stale voice.wav from the prior quote in place,
+    so the rendered video carries audio v1 + captions v2 — same idea,
+    different words. Documented bug, 2026-05-06 → 2026-05-09.
+    """
     work = WORK_DIR / content_id
+    if clean and work.exists():
+        shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
     return work
 
@@ -2137,7 +2278,9 @@ def process_short(content: dict):
     channel_name = channel["name"]
     channel_slug = channel["slug"]
 
-    work = _content_work_dir(content_id)
+    if not _try_claim_for_generation(content_id):
+        return
+    work = _content_work_dir(content_id, clean=True)
     print(f"\n  Processing short: {philosopher} / {topic} [channel={channel_slug}]")
 
     # --- Step 1: Quote (+ metadata for recovery channels) ---
@@ -2151,12 +2294,14 @@ def process_short(content: dict):
         if channel_slug in ("na", "aa"):
             from ai_writer import generate_recovery_short_script
             previous = _fetch_recent_quotes(philosopher)
+            recent_hits = _fetch_top_hit_titles(channel_slug)
             # 60s target -> ~130-175 words. The ShortVideo QuoteOverlay
             # scrolls long text, so we lean into a monologue-length piece
             # that gives the scroll + fade animation something to do.
             script = generate_recovery_short_script(
                 philosopher, topic, channel_slug,
                 target_seconds=60, previous_quotes=previous,
+                recent_hits=recent_hits,
                 style=_resolve_writing_style(content),
             )
             quote = sanitize_quote(script.get("quote", ""))
@@ -2274,9 +2419,13 @@ def process_short(content: dict):
     thumb_drive_url = None
     thumb_storage_path = None
     try:
-        from thumbnail_generator import generate_thumbnail, generate_thumbnail_from_video
+        from thumbnail_generator import (generate_thumbnail,
+                                          generate_thumbnail_from_video,
+                                          generate_text_only_thumbnail)
         thumb_path = video_path.replace(".mp4", "_thumb.jpg")
-        if art_path:
+        if channel_slug in TEXT_ONLY_THUMBNAIL_CHANNELS:
+            generate_text_only_thumbnail(title, thumb_path, 1080, 1920, channel_slug)
+        elif art_path:
             generate_thumbnail(art_path, title, thumb_path, 1080, 1920)  # portrait for shorts
         else:
             generate_thumbnail_from_video(video_path, title, thumb_path, 1080, 1920)
@@ -2350,7 +2499,9 @@ def process_midform(content: dict):
     channel_name = channel["name"]
     channel_slug = channel["slug"]
 
-    work = _content_work_dir(content_id)
+    if not _try_claim_for_generation(content_id):
+        return
+    work = _content_work_dir(content_id, clean=True)
     num_quotes = 4
     print(f"\n  Processing midform: {philosopher} / {topic} ({num_quotes} quotes) [channel={channel_slug}]")
 
@@ -2599,6 +2750,26 @@ def _batch_process(items: list):
     results = {}  # content_id -> {art_paths, voice_paths, quote, ...}
 
     # ---------------------------------------------------------------
+    # Phase 0: Atomic claim (status queued -> generating) per row
+    # ---------------------------------------------------------------
+    # Drop any row we cannot claim BEFORE wiping its work-dir or doing
+    # any other work. Two parallel runs on one row produced today's
+    # cd247173 voice file-lock race (WinError 32 on .pre_tailfade.wav)
+    # and ai_writer rewrote quote_text 3x. The conditional PATCH below
+    # is the single source of truth for "this row belongs to me now."
+    claimed_items = []
+    for content in items:
+        cid = content["id"]
+        if _try_claim_for_generation(cid):
+            claimed_items.append(content)
+        # else: the FAILED log in _try_claim_for_generation already
+        # printed why; nothing more to do for this row in this run.
+    items = claimed_items
+    if not items:
+        print("\n=== Nothing to process — all rows already claimed by another run ===")
+        return
+
+    # ---------------------------------------------------------------
     # Phase 1: Quotes + Metadata (CPU/network, no GPU)
     # ---------------------------------------------------------------
     print("\n=== PHASE 1: Quote & Metadata Generation ===")
@@ -2607,7 +2778,7 @@ def _batch_process(items: list):
         philosopher = content["philosopher"]
         topic = content.get("topic", "life and wisdom")
         content_type = content.get("format", "short")
-        work = _content_work_dir(cid)
+        work = _content_work_dir(cid, clean=True)
 
         try:
             content = _ensure_channel_data(content)
@@ -2628,6 +2799,7 @@ def _batch_process(items: list):
                     recovery_script = generate_recovery_short_script(
                         philosopher, topic, _slug,
                         target_seconds=60, previous_quotes=previous,
+                        recent_hits=_fetch_top_hit_titles(_slug),
                         style=_resolve_writing_style(content),
                     )
                     quote = sanitize_quote(recovery_script.get("quote", ""))
@@ -3005,43 +3177,61 @@ def _batch_process(items: list):
             thumb_storage_path = None
             thumb_errors = []
             try:
-                from thumbnail_generator import generate_thumbnail, generate_thumbnail_from_video
+                from thumbnail_generator import (generate_thumbnail,
+                                                  generate_thumbnail_from_video,
+                                                  generate_text_only_thumbnail)
                 thumb_path = video_path.replace(".mp4", "_thumb.jpg")
                 tw, th = (1080, 1920) if content_type == "short" else (1920, 1080)
 
-                # Resilient cascade (fixed 2026-04-24 after recurring silent
-                # failures on Wisdom midform). Try each source in turn; if
-                # the JPG isn't on disk, try the next. Collect errors so we
-                # can write them back to the row for diagnosis.
-                #   1. Cinematic-produced thumbnail (NA/AA midform path)
-                #   2. First art frame via generate_thumbnail (PIL)
-                #   3. ffmpeg-extracted video frame via generate_thumbnail_from_video
-
-                # 1. Cinematic-produced thumb (NA/AA midform sets this)
-                cine_thumb = data.get("_cinematic_thumb_path")
-                if cine_thumb and Path(cine_thumb).exists():
-                    if cine_thumb != thumb_path:
-                        import shutil as _shutil
-                        _shutil.copy(cine_thumb, thumb_path)
-
-                # 2. Generate from first art file
-                if not Path(thumb_path).exists():
-                    first_art = data["art_paths"][0] if data.get("art_paths") else None
-                    if first_art and Path(first_art).exists():
-                        try:
-                            generate_thumbnail(first_art, title, thumb_path, tw, th)
-                        except Exception as e:
-                            thumb_errors.append(f"art-based: {type(e).__name__}: {e}")
-
-                # 3. Fallback to ffmpeg video-frame extraction. Video file
-                # always exists post-render, so this is the reliable last
-                # resort. Previously only ran when first_art was missing;
-                # now runs whenever the art-based step didn't produce output.
-                if not Path(thumb_path).exists():
+                if channel_slug in TEXT_ONLY_THUMBNAIL_CHANNELS:
+                    # No fallback to art / video frames — those are the
+                    # exact source of the YouTube auto-moderation flag.
                     try:
-                        generate_thumbnail_from_video(video_path, title, thumb_path, tw, th)
+                        generate_text_only_thumbnail(title, thumb_path, tw, th, channel_slug)
                     except Exception as e:
-                        thumb_errors.append(f"video-frame: {type(e).__name__}: {e}")
+                        thumb_errors.append(f"text-only: {type(e).__name__}: {e}")
+                else:
+                    # Resilient cascade (fixed 2026-04-24 after recurring silent
+                    # failures on Wisdom midform). Try each source in turn; if
+                    # the JPG isn't on disk, try the next. Collect errors so we
+                    # can write them back to the row for diagnosis.
+                    #   1. Cinematic-produced thumbnail (NA/AA midform path)
+                    #   2. First art frame via generate_thumbnail (PIL)
+                    #   3. ffmpeg-extracted video frame via generate_thumbnail_from_video
+
+                    # 1. Cinematic-produced thumb (NA/AA midform sets this)
+                    cine_thumb = data.get("_cinematic_thumb_path")
+                    if cine_thumb and Path(cine_thumb).exists():
+                        if cine_thumb != thumb_path:
+                            import shutil as _shutil
+                            _shutil.copy(cine_thumb, thumb_path)
+                    elif Path(thumb_path).exists():
+                        # Stale thumb from a prior run on the same row.
+                        # The local video output dir is not wiped (only
+                        # WORK_DIR is), so a leftover thumb_path here
+                        # would skip steps 2/3 and upload the stale
+                        # file. Delete to force fresh regen consistent
+                        # with the current art + title. 2026-05-09.
+                        Path(thumb_path).unlink()
+
+                    # 2. Generate from first art file
+                    if not Path(thumb_path).exists():
+                        first_art = data["art_paths"][0] if data.get("art_paths") else None
+                        if first_art and Path(first_art).exists():
+                            try:
+                                generate_thumbnail(first_art, title, thumb_path, tw, th)
+                            except Exception as e:
+                                thumb_errors.append(f"art-based: {type(e).__name__}: {e}")
+
+                    # 3. Fallback to ffmpeg video-frame extraction. Video file
+                    # always exists post-render, so this is the reliable last
+                    # resort. Previously only ran when first_art was missing;
+                    # now runs whenever the art-based step didn't produce output.
+                    if not Path(thumb_path).exists():
+                        try:
+                            generate_thumbnail_from_video(video_path, title, thumb_path, tw, th)
+                        except Exception as e:
+                            thumb_errors.append(f"video-frame: {type(e).__name__}: {e}")
 
                 if not Path(thumb_path).exists():
                     raise RuntimeError(
@@ -3159,7 +3349,8 @@ def _run_custom_prompt_pipeline(content: dict):
     if _bail_if_deleted(cid, "_run_custom_prompt_pipeline"):
         return
     print(f"\n--- Cinematic Essay Pipeline: {content.get('title', '?')[:60]} ---")
-    update_supabase(cid, {"status": "generating"})
+    if not _try_claim_for_generation(cid):
+        return
     log_step(cid, "video", 0, "running")  # step_order=0 marks outer-pipeline wrapper
 
     cmd = [
@@ -3233,7 +3424,8 @@ def _run_meditation_pipeline(content: dict):
     channel_slug = content["channels"]["slug"]
 
     print(f"\n--- Meditation Pipeline: {philosopher} on {topic} [channel={channel_slug}] ---")
-    update_supabase(cid, {"status": "generating"})
+    if not _try_claim_for_generation(cid):
+        return
     log_step(cid, "video", 0, "running")  # step_order=0 marks outer-pipeline wrapper
 
     cmd = [
@@ -3300,7 +3492,8 @@ def _run_story_pipeline(content: dict):
     channel_slug = content["channels"]["slug"]
 
     print(f"\n--- Story Pipeline: {philosopher} on {topic} [channel={channel_slug}] ---")
-    update_supabase(cid, {"status": "generating"})
+    if not _try_claim_for_generation(cid):
+        return
     log_step(cid, "story", 1, "running")
 
     # Pass --content-id and --channel-slug so the child updates the correct
@@ -3406,6 +3599,44 @@ def main():
     if not queued:
         print("Nothing to process. Exiting.")
         return
+
+    # ------------------------------------------------------------------
+    # One-channel-at-a-time gate (Ziad's request, 2026-05-09).
+    # ------------------------------------------------------------------
+    # Pick the channel of the OLDEST queued row and process ONLY that
+    # channel this tick. The other channels' queued rows wait until the
+    # next 5-min tick. Two reasons:
+    #
+    #  1. Cross-channel collision on shared destinations. NA, AA and
+    #     Gibran all post to the same FB Page (1135278099658735) and IG
+    #     account (@recoveryfellows). When their rows generate in one
+    #     batch and the user clicks publish on all three, the meta
+    #     uploader publishes back-to-back to the same surface within
+    #     ~60-120s — looks like "duplicate posting" on the @recoveryfellows
+    #     feed even though they are three different videos. Spreading
+    #     channels across ticks gives the publish step a natural cadence.
+    #
+    #  2. The orchestrator's voice phase calls ElevenLabs serially for
+    #     all rows in the batch. A 4-channel batch can blow past the EL
+    #     credit gate's per-call check and blow up mid-render. One
+    #     channel per tick keeps voice spend bounded and predictable.
+    #
+    # Channel order is determined by the oldest created_at. The "STAY
+    # OUT OF WISDOM" memory feedback is honored automatically: we never
+    # silently default — we pick whatever channel has the oldest row.
+    queued.sort(key=lambda r: r.get("created_at") or "")
+    primary_slug = (queued[0].get("channels") or {}).get("slug") if queued else None
+    if primary_slug:
+        _all_slugs = sorted({(r.get("channels") or {}).get("slug") for r in queued
+                             if (r.get("channels") or {}).get("slug")})
+        deferred = [r for r in queued
+                    if (r.get("channels") or {}).get("slug") != primary_slug]
+        queued = [r for r in queued
+                  if (r.get("channels") or {}).get("slug") == primary_slug]
+        print(f"  one-channel-per-tick: processing slug={primary_slug!r} "
+              f"({len(queued)} row(s)); deferring {len(deferred)} row(s) "
+              f"on other channels {sorted(set((r.get('channels') or {}).get('slug') for r in deferred))} "
+              f"to next tick")
 
     # Dry run: just print the queue
     if args.dry_run:
