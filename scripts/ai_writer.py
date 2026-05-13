@@ -311,10 +311,15 @@ def push_weekly_plan_to_supabase(plan: list, channel_map: dict = None) -> str:
         }
         if tp_id:
             content_payload["plan_topic_id"] = tp_id
-        requests.post(
+        content_resp = requests.post(
             f"{SUPABASE_URL}/rest/v1/content",
             headers=headers, json=content_payload, timeout=30,
         )
+        # Surface insert failures instead of silently dropping rows.
+        # A 4xx here (e.g. RLS denial, schema mismatch) was the smoking gun
+        # behind the empty-week regression: writes were rejected by Supabase
+        # but the planner reported success because the response was discarded.
+        content_resp.raise_for_status()
 
     print(f"[ai_writer] Weekly plan {weekly_plan_id} pushed to Supabase "
           f"(week of {monday.isoformat()}, {len(plan)} items)")
@@ -506,7 +511,7 @@ def generate_short_script(philosopher: str, topic: str, ollama_model: str,
 
 Requirements:
 - Must sound authentically like {philosopher}
-- 1-3 sentences, poetic and quotable
+- 1-3 sentences, 40-60 WORDS — short and quotable wins
 - Deep insight, not surface-level advice
 - Do NOT include attribution or quotation marks
 
@@ -697,6 +702,17 @@ _RECOVERY_PERSONA_VOICES = {
         "hope without insisting on it. Racially, gender, and generationally "
         "diverse in who you channel."
     ),
+    "Ziad": (
+        "Ziad — the voice of the channel owner, around one year clean. "
+        "First-person, present tense. Plain language, honest, slightly "
+        "weathered. Speaks from lived experience of THE FIRST YEAR "
+        "specifically — what each part felt like, what changed, what "
+        "didn't. Names his own moments (not other real members). Not an "
+        "archetype giving wisdom from a great height — a fellow who just "
+        "walked through and remembers exactly. Use 'I' freely. Concrete "
+        "scenes (Tuesday mornings, kitchen tables, phone calls) over "
+        "abstract ideas. Hopeful but never promising outcomes."
+    ),
 }
 
 _RECOVERY_COMPLIANCE_BLOCK = """COMPLIANCE — hard rules, no exceptions:
@@ -710,8 +726,46 @@ _RECOVERY_COMPLIANCE_BLOCK = """COMPLIANCE — hard rules, no exceptions:
 - SAFE: public-domain slogans ("one day at a time", "keep coming back", "easy does it", "progress not perfection", "this too shall pass"), Serenity Prayer short form, generic spiritual language ("higher power", "god as we understood")."""
 
 
+_RECOVERY_TITLE_SHAPE_BLOCK = """TITLE SHAPE — non-negotiable, derived from 14-day channel data:
+
+Open-loop titles win. Declarative titles die. The data is unambiguous.
+
+DO USE — open-loop framings that withhold the answer so the viewer has to watch to find it:
+  - "What I [verb] when [moment]" — e.g. "What I Tell Someone Calling at 2am" (82 views)
+  - "Why [moment/year] feels [unexpected adjective]" — e.g. "Why Year One Feels Safer Than Day 365" (257 views)
+  - "The [noun] [verb phrase]" — e.g. "The Hardest Phone Call" (121), "The Silence Before Truth" (115)
+  - "When [specific situation]" — e.g. "When You Almost Didn't Make It" (80)
+  - "Why [paradoxical claim]" — e.g. "Why Isolation Feels Like Kindness" (75)
+
+DO NOT USE — declaratives that resolve the lesson in the title and kill the click:
+  - "X isn't Y" — e.g. "Asking for Help Isn't Weakness" (3 views)
+  - "Why X Matters" — e.g. "Slip vs Relapse — Why Day One Matters" (1 view)
+  - "Stop X, Start Y" — e.g. "Stop Counting Days, Start Counting Changes" (23 views)
+  - "[Number] Years at [Place] Changed Everything" — closes the loop in the title (3 views)
+  - Any title that states the lesson rather than naming a moment
+
+SELF-CHECK before committing: would a stranger scrolling Shorts want to find out what comes next? If the title already tells them what comes next, rewrite. The title's job is to open a loop the narration closes."""
+
+
+def _build_recent_hits_block(recent_hit_titles: list) -> str:
+    """Closed-loop title learning: feed the channel's actual recent hits in
+    as positive few-shot examples. The orchestrator pulls these from
+    analytics_fetcher data via _fetch_top_hit_titles before calling
+    generate_recovery_short_script. Empty list -> empty string (no-op)."""
+    if not recent_hit_titles:
+        return ""
+    bullets = "\n".join(f'  - "{t[:90]}"' for t in recent_hit_titles[:8])
+    return f"""
+
+RECENT HITS FROM THIS EXACT CHANNEL (real view counts, recently distributed by the algorithm):
+{bullets}
+
+These titles are working. Match the shape, rhythm, and openness. The next title should belong on this list."""
+
+
 def _recovery_short_in_character_system(persona, persona_voice, channel_cue,
-                                        low, high, center, target_seconds, dedup):
+                                        low, high, center, target_seconds, dedup,
+                                        recent_hits_block=""):
     """In-character recovery monologue — speaks AS the archetype (first-person testimony)."""
     return f"""You are writing a single short-form narration for a YouTube Short on a recovery-adjacent channel.
 
@@ -730,10 +784,13 @@ Write for the ear, not the eye. Use sentence fragments where they land. Rhythm m
 
 {_RECOVERY_COMPLIANCE_BLOCK}
 
+{_RECOVERY_TITLE_SHAPE_BLOCK}
+{recent_hits_block}
+
 Output JSON ONLY, no preamble, no code fences:
 {{
   "quote": "the full {target_seconds}-second narration as a single string. Natural pauses via punctuation. No stage directions. No attribution.",
-  "title": "YouTube Short title, under 60 chars, evocative not clickbait",
+  "title": "YouTube Short title under 60 chars. MUST follow TITLE SHAPE above — open-loop, never declarative. If your candidate could end in a period and a shrug, rewrite it.",
   "description": "2-3 line YouTube description; can mention the Fellows app in the last line",
   "tags": ["8-12 recovery-relevant tags, lowercase, no hashtags"],
   "thumbnail_text": "short text for thumbnail overlay, under 5 words",
@@ -744,7 +801,8 @@ Output JSON ONLY, no preamble, no code fences:
 
 
 def _recovery_short_narrator_system(persona, persona_voice, channel_cue,
-                                    low, high, center, target_seconds, dedup):
+                                    low, high, center, target_seconds, dedup,
+                                    recent_hits_block=""):
     """Narrator recovery reflection — third-person voice ABOUT recovery, not from inside the rooms.
 
     The narrator observes; the persona testifies. Same compliance rules apply because
@@ -775,10 +833,13 @@ Write for the ear. Calm, measured pace. Avoid clinical detachment — the narrat
 
 {_RECOVERY_COMPLIANCE_BLOCK}
 
+{_RECOVERY_TITLE_SHAPE_BLOCK}
+{recent_hits_block}
+
 Output JSON ONLY, no preamble, no code fences:
 {{
   "quote": "the full {target_seconds}-second narration as a single string. Third-person throughout. Natural pauses via punctuation. No stage directions. No attribution.",
-  "title": "YouTube Short title, under 60 chars, evocative not clickbait",
+  "title": "YouTube Short title under 60 chars. MUST follow TITLE SHAPE above — open-loop, never declarative. If your candidate could end in a period and a shrug, rewrite it.",
   "description": "2-3 line YouTube description; can mention the Fellows app in the last line",
   "tags": ["8-12 recovery-relevant tags, lowercase, no hashtags"],
   "thumbnail_text": "short text for thumbnail overlay, under 5 words",
@@ -792,6 +853,7 @@ def generate_recovery_short_script(persona: str, topic: str,
                                    channel_slug: str,
                                    target_seconds: int = 40,
                                    previous_quotes: list = None,
+                                   recent_hits: list = None,
                                    style: str = "in_character") -> dict:
     """Write a ~40-second Opus-grade short for NA/AA channels.
 
@@ -837,20 +899,51 @@ def generate_recovery_short_script(persona: str, topic: str,
         recent = [str(q)[:120] for q in previous_quotes[:15]]
         dedup = "\n\nDo NOT retread these recently-used angles:\n" + "\n".join(f"- {q}" for q in recent)
 
+    recent_hits_block = _build_recent_hits_block(recent_hits or [])
+
+    # Detail-rich topics (long, story-arc, named people/dates/scenes) deserve
+    # preservation. Short theme phrases keep the older "treat as direction"
+    # behavior so the planner's one-line topics still work.
+    topic_is_detailed = len((topic or "").split()) >= 12 or "\n" in (topic or "")
+
+    preserve_clause = (
+        "Treat the TOPIC above as the actual story material. Preserve every "
+        "specific moment, name, date, scene, and emotional beat present in "
+        "it — do not paraphrase concrete details into generic theme. The "
+        "output should read as faithful to what's written there, not as "
+        "Opus's interpretation of the gist."
+        if topic_is_detailed
+        else
+        "The TOPIC above is short and directional — treat it as guidance and "
+        "let the piece earn its own specifics. Concrete moments and beats "
+        "should come from the persona's voice and the situation, not from a "
+        "verbatim transcription of the topic phrase."
+    )
+
     if style == "narrator":
         system = _recovery_short_narrator_system(
             persona, persona_voice, channel_cue, low, high, center,
-            target_seconds, dedup,
+            target_seconds, dedup, recent_hits_block=recent_hits_block,
         )
-        user = f"""Write a narrator-style short-form reflection ABOUT recovery on: {topic}
+        user = f"""Write a narrator-style short-form reflection ABOUT recovery.
 
-The {persona} archetype is your reference point but NOT your voice — describe what such a person tends to know, never speak AS them."""
+TOPIC:
+{topic}
+
+{preserve_clause}
+
+The {persona} archetype is your reference point but NOT your voice — describe what such a person tends to know, never speak AS them. Keep the topic's specific details intact while observing from third-person."""
     else:
         system = _recovery_short_in_character_system(
             persona, persona_voice, channel_cue, low, high, center,
-            target_seconds, dedup,
+            target_seconds, dedup, recent_hits_block=recent_hits_block,
         )
-        user = f"""Write a short-form narration in the voice of "{persona}" on: {topic}"""
+        user = f"""Write a short-form narration in the voice of "{persona}".
+
+TOPIC:
+{topic}
+
+{preserve_clause}"""
 
     response = _call_anthropic(OPUS_MODEL, system, user, max_tokens=2000)
     parsed = _parse_json_response(response)
@@ -1064,7 +1157,7 @@ CADENCE EXEMPLAR — match this voice and rhythm
 There are voices in history that don't just speak.
 They echo through time.
 
-Kahlil Gibran was one of those voices.
+Khalil Gibran was one of those voices.
 
 In his book, The Prophet,
 he didn't try to complicate life.
@@ -1111,7 +1204,7 @@ And together.
 WRITING RULES — do these
 =========================================================
 
-1. THIRD-PERSON NARRATOR. Open by naming him: "Kahlil Gibran was one of those voices." Or: "In his book, The Prophet, he wrote…" The narrator is a guide pointing at Gibran, never pretending to be him.
+1. THIRD-PERSON NARRATOR. Open by naming him: "Khalil Gibran was one of those voices." Or: "In his book, The Prophet, he wrote…" The narrator is a guide pointing at Gibran, never pretending to be him.
 
 2. META-INTERPRETIVE, NOT IMPERSONATION. Paraphrase what Gibran meant; do not write AS him. Lines like "He reminded us that joy and sorrow are not opposites" are RIGHT. Lines like "Almustafa stood upon the deck…" are WRONG for this format.
 
