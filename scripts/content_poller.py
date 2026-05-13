@@ -119,11 +119,22 @@ def check_meta_content():
     Midform (16:9 landscape) is supported 2026-04-24 — uploader posts to
     Facebook only (skips IG Reels which requires 9:16). Shorts continue
     to post to both FB + IG.
+
+    Skips rows with FRESH in-flight markers (Hole A defense, <15min old)
+    so a crashed or in-progress upload can't be re-fired by the next
+    poller tick. Stale markers (>15min) are logged as warnings and the
+    row is also skipped — Ziad must verify on FB/IG and clear the marker
+    keys manually before the row will be picked up again.
     """
+    # Stale window must match meta_uploader.IN_FLIGHT_STALE_MIN. Hardcoded
+    # rather than imported because content_poller.py runs in its own python
+    # env and we don't want the poller to crash if meta_uploader.py is
+    # mid-edit. Keep these in sync.
+    IN_FLIGHT_STALE_MIN = 15
     try:
         url = f"{SUPABASE_URL}/rest/v1/content"
         params = {
-            "select": "id,philosopher,topic,channel_id,format",
+            "select": "id,philosopher,topic,channel_id,format,generation_params",
             "status": "in.(approved,published)",
             "format": "in.(short,midform)",
             "or": "(video_drive_url.not.is.null,video_storage_path.not.is.null)",
@@ -134,14 +145,54 @@ def check_meta_content():
         }
         resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
         items = resp.json() if resp.status_code == 200 else []
-        # Filter out rows that already have a meta_fb_post_id / meta_ig_post_id
-        # (generation_params is JSONB, so do it in Python to keep the query
-        # simple — matches how tiktok does it too).
-        return [
-            i for i in items
-            if not (i.get("generation_params") or {}).get("meta_fb_post_id")
-               and not (i.get("generation_params") or {}).get("meta_ig_post_id")
-        ]
+
+        from datetime import timedelta, timezone
+        now = datetime.now(timezone.utc)
+
+        def _marker_age_min(ts):
+            if not ts:
+                return None
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            except (ValueError, AttributeError):
+                return None
+            return (now - dt).total_seconds() / 60.0
+
+        eligible = []
+        for i in items:
+            gp = i.get("generation_params") or {}
+            fb_id = gp.get("meta_fb_post_id")
+            ig_id = gp.get("meta_ig_post_id")
+            # Fully-published rows (BOTH ids set) — drop. Partial rows fall
+            # through; meta_uploader's process_content short-circuits the
+            # already-posted side.
+            if fb_id and ig_id:
+                continue
+
+            fb_in_flight = gp.get("meta_fb_publish_in_flight")
+            ig_in_flight = gp.get("meta_ig_publish_in_flight")
+            fb_age = _marker_age_min(gp.get("meta_fb_publish_in_flight_at")) if fb_in_flight else None
+            ig_age = _marker_age_min(gp.get("meta_ig_publish_in_flight_at")) if ig_in_flight else None
+
+            fb_fresh = fb_in_flight and fb_age is not None and fb_age < IN_FLIGHT_STALE_MIN
+            ig_fresh = ig_in_flight and ig_age is not None and ig_age < IN_FLIGHT_STALE_MIN
+            if fb_fresh or ig_fresh:
+                print(f"  [meta] [{i['id'][:8]}] in-flight (fb={fb_fresh} "
+                      f"ig={ig_fresh}) — skipping until cleared")
+                continue
+
+            fb_stale = fb_in_flight and not fb_fresh
+            ig_stale = ig_in_flight and not ig_fresh
+            if fb_stale or ig_stale:
+                print(f"  [meta] [{i['id'][:8]}] WARN stale in-flight marker "
+                      f"(fb_age={fb_age} ig_age={ig_age} min) — verify on "
+                      f"FB/IG, clear meta_*_publish_in_flight* keys to retry")
+                continue
+
+            eligible.append(i)
+        return eligible
     except Exception as e:
         print(f"  Error checking Meta: {e}")
         return []

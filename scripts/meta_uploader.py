@@ -45,7 +45,7 @@ import os
 import sys
 import time
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 load_dotenv("C:/AI/.env")
@@ -69,6 +69,71 @@ HEADERS = {
     "Content-Type": "application/json",
     "Prefer": "return=representation",
 }
+
+# --- In-flight markers (Hole A defense) ----------------------------------
+# Each Graph POST is bracketed by writing a marker to generation_params
+# BEFORE the POST and clearing it AFTER (success or fail). If the process
+# crashes between POST and the post_id write, the marker survives — the
+# next poller tick sees it and SKIPS the row instead of double-posting.
+# After IN_FLIGHT_STALE_MIN minutes the marker is treated as halted (the
+# uploader stops auto-retrying; Ziad must verify on FB/IG and clear it
+# manually, same pattern as meta_retry_halted).
+IN_FLIGHT_STALE_MIN = 15
+IN_FLIGHT_FB_FLAG = "meta_fb_publish_in_flight"
+IN_FLIGHT_FB_AT = "meta_fb_publish_in_flight_at"
+IN_FLIGHT_IG_FLAG = "meta_ig_publish_in_flight"
+IN_FLIGHT_IG_AT = "meta_ig_publish_in_flight_at"
+
+
+def _is_marker_fresh(params, flag_key, ts_key):
+    """True if the in-flight flag is set and its timestamp is within the
+    stale window. Missing keys / unparseable timestamps return False so a
+    half-written marker doesn't pin the row forever."""
+    if not (params or {}).get(flag_key):
+        return False
+    ts = (params or {}).get(ts_key)
+    if not ts:
+        return False
+    try:
+        # tolerate trailing Z and naive ISO
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except (ValueError, AttributeError):
+        return False
+    return (datetime.now(timezone.utc) - dt) < timedelta(minutes=IN_FLIGHT_STALE_MIN)
+
+
+def set_publish_in_flight(content_id, side):
+    """Write a fresh in-flight marker for the given side ('fb' or 'ig')
+    via a tiny merge PATCH. Done as its own request so the marker hits
+    Supabase BEFORE the Graph POST is dispatched; if the network/process
+    dies between this PATCH and the POST, the next tick sees the marker
+    and skips the row.
+
+    Failure to set the marker is logged but does NOT abort the upload —
+    the existing halt-on-no-post-id pattern is still the primary defense.
+    """
+    flag_key = IN_FLIGHT_FB_FLAG if side == "fb" else IN_FLIGHT_IG_FLAG
+    ts_key = IN_FLIGHT_FB_AT if side == "fb" else IN_FLIGHT_IG_AT
+    current = get_content(content_id)
+    if not current:
+        return
+    params = current.get("generation_params") or {}
+    if isinstance(params, str):
+        params = json.loads(params)
+    params[flag_key] = True
+    params[ts_key] = datetime.now(timezone.utc).isoformat()
+    try:
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/content?id=eq.{content_id}&deleted_at=is.null",
+            headers=HEADERS,
+            json={"generation_params": params},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"    WARN: failed to set {side} in-flight marker: {e}")
+
 
 # Per-channel caption / hashtag config. Keep copy compliant with the memory
 # rules: no NA/AA endorsement claims, no trademarked logos, no identifiable
@@ -104,16 +169,31 @@ def get_channel(channel_id):
 
 def update_content_meta(content_id, fb_post_id=None, ig_post_id=None,
                         fb_error=None, ig_error=None,
-                        halt_auto_retry=False):
+                        halt_auto_retry=False,
+                        clear_fb_in_flight=False,
+                        clear_ig_in_flight=False,
+                        is_midform_fb_only=False):
     """Merge Meta post IDs, errors, and timestamps into generation_params.
 
     Persists even when both sides failed so `meta_last_error` is visible
-    in the dashboard. `meta_publish_requested` is cleared when BOTH
-    meta_fb_post_id and meta_ig_post_id are set, OR when halt_auto_retry
-    is True (e.g. an FB attempt that didn't return a post_id — could have
-    posted server-side; retry would duplicate). A partial success that
-    is safe to retry (e.g. FB ok, IG container failed) leaves the flag in
-    place."""
+    in the dashboard.
+
+    `meta_publish_requested` is cleared when:
+      - BOTH meta_fb_post_id and meta_ig_post_id are set, OR
+      - is_midform_fb_only AND meta_fb_post_id is set (Hole B: midform
+        intentionally skips IG so the BOTH-required gate would never
+        fire and the row would re-flag every tick), OR
+      - halt_auto_retry is True (e.g. an FB attempt that didn't return
+        a post_id — could have posted server-side; retry would duplicate).
+
+    A partial success that is safe to retry (e.g. FB ok, IG container
+    failed, on a SHORT) leaves the flag in place.
+
+    `clear_fb_in_flight` / `clear_ig_in_flight` null the corresponding
+    in-flight markers in the SAME PATCH that writes the post_id — this
+    keeps the marker-clear and post_id-write atomic so a partial result
+    can't leave both a marker and a post_id pinned together.
+    """
     current = get_content(content_id)
     if not current:
         return
@@ -126,6 +206,13 @@ def update_content_meta(content_id, fb_post_id=None, ig_post_id=None,
     if ig_post_id:
         params["meta_ig_post_id"] = ig_post_id
 
+    if clear_fb_in_flight:
+        params.pop(IN_FLIGHT_FB_FLAG, None)
+        params.pop(IN_FLIGHT_FB_AT, None)
+    if clear_ig_in_flight:
+        params.pop(IN_FLIGHT_IG_FLAG, None)
+        params.pop(IN_FLIGHT_IG_AT, None)
+
     if fb_error or ig_error:
         params["meta_last_error"] = {"fb": fb_error, "ig": ig_error}
         params["meta_error_at"] = datetime.now(timezone.utc).isoformat()
@@ -136,7 +223,11 @@ def update_content_meta(content_id, fb_post_id=None, ig_post_id=None,
     if fb_post_id or ig_post_id:
         params["meta_published_at"] = datetime.now(timezone.utc).isoformat()
 
-    if params.get("meta_fb_post_id") and params.get("meta_ig_post_id"):
+    fb_done = bool(params.get("meta_fb_post_id"))
+    ig_done = bool(params.get("meta_ig_post_id"))
+    fully_published = fb_done and (ig_done or is_midform_fb_only)
+
+    if fully_published:
         params.pop("meta_publish_requested", None)
     elif halt_auto_retry:
         params.pop("meta_publish_requested", None)
@@ -414,6 +505,10 @@ def process_content(content, dry_run=False, fb_only=False, ig_only=False):
             print(f"    FB already published: {existing_fb_id} — skipping")
         else:
             fb_attempted = True
+            # Set the in-flight marker BEFORE the POST so a crash between
+            # POST and the post_id PATCH leaves a survivable signal that
+            # blocks the next tick from re-posting (Hole A).
+            set_publish_in_flight(content_id, "fb")
             try:
                 print(f"    Publishing to FB Page {page_id}...")
                 fb_post_id = publish_to_facebook_page(
@@ -425,12 +520,19 @@ def process_content(content, dry_run=False, fb_only=False, ig_only=False):
                 print(f"    FB error: {e}")
 
     # --- Instagram Reel ---
+    ig_attempted = False
     if not fb_only and not midform_fb_only:
         if not ig_user_id:
             print("    No IG account linked — skipping IG")
         elif existing_ig_id:
             print(f"    IG already published: {existing_ig_id} — skipping")
         else:
+            ig_attempted = True
+            # Same in-flight pattern as FB. The IG flow is two-step
+            # (container -> publish) so a crash in the middle is even
+            # more likely to leave Meta with a posted Reel and Supabase
+            # with no record (Hole A applies to both sides).
+            set_publish_in_flight(content_id, "ig")
             try:
                 print(f"    Publishing to IG {ig_user_id}...")
                 ig_post_id = publish_to_instagram_reel(
@@ -453,6 +555,13 @@ def process_content(content, dry_run=False, fb_only=False, ig_only=False):
         fb_post_id=fb_post_id, ig_post_id=ig_post_id,
         fb_error=fb_error, ig_error=ig_error,
         halt_auto_retry=halt_auto_retry,
+        # Always clear markers for sides we attempted this tick. Whether
+        # we got an id or hit an error, the POST cycle is complete — the
+        # marker has done its job. (If we crashed between POST and here,
+        # the marker survives untouched, which is what we want.)
+        clear_fb_in_flight=fb_attempted,
+        clear_ig_in_flight=ig_attempted,
+        is_midform_fb_only=midform_fb_only,
     )
     if halt_auto_retry:
         print("    Auto-retry halted — FB attempt didn't return a post_id. "
@@ -487,17 +596,39 @@ def fetch_items():
         timeout=10,
     )
     items = resp.json() if resp.status_code == 200 else []
-    # Only exclude rows where BOTH ids are set (fully published). Rows with
-    # a partial result — e.g. IG ok, FB failed — stay eligible so the next
-    # tick retries the missing side. process_content short-circuits the
-    # already-posted side so IG won't be re-posted.
-    return [
-        i for i in items
-        if not (
-            (i.get("generation_params") or {}).get("meta_fb_post_id")
-            and (i.get("generation_params") or {}).get("meta_ig_post_id")
-        )
-    ]
+    # Filter pass — keep rows that still need work, drop rows where:
+    #   1. BOTH post_ids are set (fully published — same as before)
+    #   2. EITHER side has a fresh in-flight marker (<15min old). A fresh
+    #      marker means another POST cycle is mid-flight or just crashed
+    #      and we don't know whether Meta accepted the post — re-posting
+    #      would duplicate. Stale markers (>15min) are LEFT in place and
+    #      logged as a warning; Ziad must verify on FB/IG manually and
+    #      clear the marker before the row will publish again. (Same
+    #      design as meta_retry_halted.)
+    eligible = []
+    for i in items:
+        gp = i.get("generation_params") or {}
+        fb_done = bool(gp.get("meta_fb_post_id"))
+        ig_done = bool(gp.get("meta_ig_post_id"))
+        if fb_done and ig_done:
+            continue
+        fb_fresh = _is_marker_fresh(gp, IN_FLIGHT_FB_FLAG, IN_FLIGHT_FB_AT)
+        ig_fresh = _is_marker_fresh(gp, IN_FLIGHT_IG_FLAG, IN_FLIGHT_IG_AT)
+        if fb_fresh or ig_fresh:
+            print(f"  [{i['id'][:8]}] in-flight marker fresh "
+                  f"(fb={fb_fresh} ig={ig_fresh}) — skipping this tick")
+            continue
+        # Stale markers — surface them so they don't sit silent forever.
+        fb_stale = bool(gp.get(IN_FLIGHT_FB_FLAG)) and not fb_fresh
+        ig_stale = bool(gp.get(IN_FLIGHT_IG_FLAG)) and not ig_fresh
+        if fb_stale or ig_stale:
+            print(f"  [{i['id'][:8]}] WARN: stale in-flight marker "
+                  f"(fb={fb_stale} ig={ig_stale}) — verify on FB/IG, "
+                  f"then clear marker keys in generation_params to retry. "
+                  f"Skipping to avoid duplicate post.")
+            continue
+        eligible.append(i)
+    return eligible
 
 
 def main():
