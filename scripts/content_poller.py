@@ -13,7 +13,7 @@ import time
 import subprocess
 import signal
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -44,6 +44,31 @@ HEADERS = {
 }
 
 comfyui_process = None
+
+# Subprocesses that exceed this run inside one 5-min tick (300s) and cause
+# the next tick to overlap. Warn (don't kill) at 240s so Ziad sees pressure
+# building before the system actually starts overlapping.
+SUBPROCESS_SLOW_WARN_SEC = 240
+
+
+def _timed_run(name, *args, **kwargs):
+    """subprocess.run with wall-clock logging.
+
+    Logs `[poller] <name> ran in <Xs>` on completion and an additional
+    `[poller] WARN <name> exceeded {SUBPROCESS_SLOW_WARN_SEC}s` line if the
+    subprocess overran the 4-min headroom inside the 5-min poll tick. We
+    do NOT kill the subprocess — the configured `timeout=` on the call is
+    still authoritative; this is observability only.
+    """
+    start = time.monotonic()
+    try:
+        return subprocess.run(*args, **kwargs)
+    finally:
+        elapsed = time.monotonic() - start
+        print(f"  [poller] {name} ran in {elapsed:.1f}s")
+        if elapsed > SUBPROCESS_SLOW_WARN_SEC:
+            print(f"  [poller] WARN {name} exceeded {SUBPROCESS_SLOW_WARN_SEC}s "
+                  f"(took {elapsed:.1f}s) — risks overlapping the next 5-min tick")
 
 
 def check_queued_content():
@@ -95,7 +120,8 @@ def check_tiktok_content():
 def run_tiktok_uploader():
     """Run tiktok_uploader.py to publish flagged content."""
     print("  Running TikTok uploader...")
-    result = subprocess.run(
+    result = _timed_run(
+        "tiktok_uploader",
         [PYTHON_CHATTERBOX, str(TIKTOK_UPLOADER)],
         env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         capture_output=True, text=True, timeout=3600,
@@ -201,7 +227,8 @@ def check_meta_content():
 def run_meta_uploader():
     """Run meta_uploader.py to publish flagged content to FB Page + IG Reels."""
     print("  Running Meta uploader...")
-    result = subprocess.run(
+    result = _timed_run(
+        "meta_uploader",
         [PYTHON_CHATTERBOX, str(META_UPLOADER)],
         env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         capture_output=True, text=True, timeout=3600,
@@ -298,7 +325,7 @@ def notify_ready_rows():
 def promote_scheduled_content():
     """Promote scheduled content whose publish time has arrived to approved."""
     try:
-        now_iso = datetime.utcnow().isoformat() + "Z"
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         url = f"{SUPABASE_URL}/rest/v1/content"
         params = {
             "select": "id,title",
@@ -338,7 +365,7 @@ def reap_stale_scheduled():
     """
     try:
         from datetime import timedelta
-        cutoff = (datetime.utcnow() - timedelta(days=STALE_SCHEDULED_DAYS)).isoformat() + "Z"
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=STALE_SCHEDULED_DAYS)).isoformat().replace("+00:00", "Z")
         url = f"{SUPABASE_URL}/rest/v1/content"
         params = {
             "select": "id,title,scheduled_at",
@@ -369,7 +396,7 @@ def reap_stale_generating():
     # shows up instead of a spinner that never finishes.
     try:
         from datetime import timedelta
-        cutoff = (datetime.utcnow() - timedelta(minutes=STALE_GENERATING_MINUTES)).isoformat() + "Z"
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=STALE_GENERATING_MINUTES)).isoformat().replace("+00:00", "Z")
         url = f"{SUPABASE_URL}/rest/v1/content"
         params = {
             "select": "id,title,updated_at",
@@ -422,7 +449,7 @@ def is_chatterbox_running():
     try:
         resp = requests.get("http://localhost:8004/", timeout=3)
         return resp.status_code in (200, 404, 405)
-    except:
+    except Exception:
         return False
 
 
@@ -462,7 +489,7 @@ def is_comfyui_running():
     try:
         resp = requests.get(f"http://localhost:{COMFYUI_PORT}/system_stats", timeout=3)
         return resp.status_code == 200
-    except:
+    except Exception:
         return False
 
 
@@ -518,7 +545,8 @@ def stop_comfyui():
 def run_orchestrator():
     """Run the orchestrator to process queued content."""
     print("  Running orchestrator...")
-    result = subprocess.run(
+    result = _timed_run(
+        "orchestrator",
         [PYTHON_CHATTERBOX, str(ORCHESTRATOR)],
         env={**os.environ, "PYTHONIOENCODING": "utf-8",
              "IMAGEMAGICK_BINARY": r"C:\Program Files\ImageMagick-7.1.2-Q16-HDRI\magick.exe"},
@@ -559,7 +587,8 @@ def run_youtube_uploader():
     Uses the lora_train env which has google-api-python-client / requests.
     """
     print("  Running YouTube uploader...")
-    result = subprocess.run(
+    result = _timed_run(
+        "youtube_uploader",
         [PYTHON_LORA, str(YOUTUBE_UPLOADER)],
         env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         capture_output=True,

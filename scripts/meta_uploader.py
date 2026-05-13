@@ -295,8 +295,14 @@ def build_caption(content, channel_slug):
 
     hashtags = []
     for tag in tags[:8]:
-        ht = "#" + tag.replace(" ", "").replace("-", "").replace("'", "")
-        if ht and ht not in hashtags:
+        # IG/FB hashtags only render when alphanumeric (underscore allowed).
+        # Strip everything else — `/`, `.`, `'`, `@`, `#`, dashes, spaces — so
+        # `"AI/ML"` → `#AIML` rather than the broken `#AI/ML`.
+        cleaned = "".join(ch for ch in tag if ch.isalnum() or ch == "_")
+        if not cleaned:
+            continue
+        ht = "#" + cleaned
+        if ht not in hashtags:
             hashtags.append(ht)
     for ht in CHANNEL_HASHTAGS.get(channel_slug, []):
         if ht not in hashtags:
