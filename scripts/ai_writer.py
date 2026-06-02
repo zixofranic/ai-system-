@@ -849,12 +849,80 @@ Output JSON ONLY, no preamble, no code fences:
 }}{dedup}"""
 
 
+def _recovery_short_shortcut_system(persona, persona_voice, channel_cue,
+                                    low, high, center, target_seconds, dedup,
+                                    recent_hits_block="", source_script=None):
+    """Short Cut — a hook-first, retention-optimized recovery short.
+
+    Built 2026-06-01 for the NA/AA retention problem: 90-120s monologues
+    were dropping viewers at ~6s. This produces a 30-45s piece that leads
+    with the single strongest line (the HOOK / payoff) said FIRST, then a
+    compressed body that earns it. The hook plays as the opening narration
+    AND renders as a large on-screen card in the first ~3 seconds.
+
+    Returns a `hook` field in addition to the body `quote`. The body does
+    NOT repeat the hook — narration is voiced as hook + body in one pass.
+    """
+    compress_clause = ""
+    if source_script:
+        compress_clause = f"""
+SOURCE TO COMPRESS:
+You are given an existing longer narration below. Distill it to its single
+most powerful idea. Keep its specific concrete details and emotional truth,
+but cut it to the Short Cut length. Find the line already inside it (or
+forge a sharper one from it) that is the real payoff — that becomes the HOOK.
+
+EXISTING NARRATION:
+{source_script}
+"""
+
+    return f"""You are writing a HOOK-FIRST short-form narration for a YouTube Short on a recovery-adjacent channel. This is the "Short Cut" format — built for retention. The channel has tiny reach and every viewer starts cold; the first 3 seconds decide whether they stay.
+
+PERSONA: {persona_voice}
+
+CHANNEL SCOPE: {channel_cue}
+{compress_clause}
+THE HOOK (most important part):
+  - The single strongest, most arresting line of the whole piece. The payoff. The line a viewer would screenshot.
+  - It goes FIRST — said in the opening seconds, not saved for the end.
+  - <= 14 words. Concrete, specific, a little provocative or quietly devastating. Never abstract, never a setup ("Let me tell you about..."). It IS the point.
+  - It must stand alone AND set up the body.
+
+THE BODY:
+  - HARD WORD LIMIT: the body MUST be {high} words or fewer. This is a strict ceiling, not a target. Count your words. A body over {high} words breaks the format and will be rejected — a too-long short is the entire problem this format exists to fix.
+  - Aim for {center} words. Floor {low}. Shorter is better than longer.
+  - Pays off and deepens the hook. Does NOT repeat the hook verbatim.
+  - OPEN right into the substance (the hook already happened). TURN to the earned truth. CLOSE on a line they carry.
+  - Cut ruthlessly. Every sentence must earn its place. When in doubt, delete.
+
+Write for the ear. Fragments where they land. Rhythm. Trust silence. Do not explain your metaphors. No throat-clearing, no "in recovery we..." preamble — the hook already grabbed them, keep the momentum.
+
+{_RECOVERY_COMPLIANCE_BLOCK}
+
+{_RECOVERY_TITLE_SHAPE_BLOCK}
+{recent_hits_block}
+
+Output JSON ONLY, no preamble, no code fences:
+{{
+  "hook": "the single strongest line, <= 14 words, said FIRST. The payoff, not a setup.",
+  "quote": "the BODY narration, {low}-{high} words. Pays off the hook. Does NOT repeat the hook line. Natural pauses via punctuation. No stage directions. No attribution.",
+  "title": "YouTube Short title under 60 chars. MUST follow TITLE SHAPE above — open-loop, never declarative.",
+  "description": "2-3 line YouTube description; can mention the Fellows app in the last line",
+  "tags": ["8-12 recovery-relevant tags, lowercase, no hashtags"],
+  "thumbnail_text": "short text for thumbnail overlay, under 5 words",
+  "music_mood": "one word for background music mood",
+  "suno_prompt": "short ambient music generation prompt, under 40 words",
+  "art_scene": "one concrete Hopper/Wyeth scene for the short's background art"
+}}{dedup}"""
+
+
 def generate_recovery_short_script(persona: str, topic: str,
                                    channel_slug: str,
                                    target_seconds: int = 40,
                                    previous_quotes: list = None,
                                    recent_hits: list = None,
-                                   style: str = "in_character") -> dict:
+                                   style: str = "in_character",
+                                   source_script: str = None) -> dict:
     """Write a ~40-second Opus-grade short for NA/AA channels.
 
     Unlike the Ollama one-liner used for Wisdom/Gibran shorts, this produces
@@ -868,16 +936,24 @@ def generate_recovery_short_script(persona: str, topic: str,
         channel_slug: "na" or "aa"
         target_seconds: target narration duration; drives word count target
         previous_quotes: recent outputs to dedupe against
-        style: 'in_character' (default — first-person archetype monologue) or
-            'narrator' (third-person reflective voice ABOUT recovery, not from inside).
+        style: 'in_character' (default — first-person archetype monologue),
+            'narrator' (third-person reflective voice ABOUT recovery), or
+            'short_cut' (hook-first 30-45s retention format — returns an
+            extra `hook` field; see _recovery_short_shortcut_system).
+        source_script: only used by style='short_cut'. If provided, the
+            piece is COMPRESSED from this existing longer narration rather
+            than generated fresh from the topic — used for before/after
+            dry-runs on an already-published short.
 
     Returns a dict shaped like generate_short_script's output:
       { quote, title, description, tags, thumbnail_text, music_mood,
         suno_prompt, art_scene, theme, philosopher, topic }
+    For style='short_cut', also includes `hook` (the payoff line) and
+    `is_short_cut: True`.
     """
-    if style not in ("in_character", "narrator"):
+    if style not in ("in_character", "narrator", "short_cut"):
         raise ValueError(
-            f"style='{style}' invalid; must be 'in_character' or 'narrator'"
+            f"style='{style}' invalid; must be 'in_character', 'narrator', or 'short_cut'"
         )
 
     persona_voice = _RECOVERY_PERSONA_VOICES.get(
@@ -889,9 +965,20 @@ def generate_recovery_short_script(persona: str, topic: str,
         "aa": "Recovery from alcohol, broadly. Avoid language that implies a specific 12-step program.",
     }.get(channel_slug, "General recovery.")
 
-    # Word targets: ~150 wpm conversational; allow headroom on both sides
-    low = int(target_seconds * 2.2)   # 40s -> ~88 words floor
-    high = int(target_seconds * 2.9)  # 40s -> ~116 words ceiling
+    # Word targets: ~150 wpm conversational; allow headroom on both sides.
+    # For short_cut, the body target is the TOTAL (hook + body) budget, so
+    # the body floor/ceiling are pulled in tighter to leave room for the hook.
+    if style == "short_cut":
+        # Chatterbox NA voice measured at ~156 wpm (2026-06-01 dry-run).
+        # Body budget is deliberately tight so that even a heavy Opus
+        # overshoot stays under the 45s content ceiling once the hook
+        # (~11 words) + 2.5s endcard are added. 38s -> body 52-72 words
+        # (~62 center) -> ~73-word narration -> ~30s voice -> ~34s file.
+        low = int(target_seconds * 1.4)   # 38s -> ~52 words
+        high = int(target_seconds * 1.9)  # 38s -> ~72 words
+    else:
+        low = int(target_seconds * 2.2)   # 40s -> ~88 words floor
+        high = int(target_seconds * 2.9)  # 40s -> ~116 words ceiling
     center = (low + high) // 2
 
     dedup = ""
@@ -920,7 +1007,25 @@ def generate_recovery_short_script(persona: str, topic: str,
         "verbatim transcription of the topic phrase."
     )
 
-    if style == "narrator":
+    if style == "short_cut":
+        system = _recovery_short_shortcut_system(
+            persona, persona_voice, channel_cue, low, high, center,
+            target_seconds, dedup, recent_hits_block=recent_hits_block,
+            source_script=source_script,
+        )
+        if source_script:
+            user = f"""Compress the SOURCE narration (in the system prompt) into a hook-first Short Cut in the voice of "{persona}". Lead with its single strongest line as the HOOK. The topic for reference is:
+
+TOPIC:
+{topic}"""
+        else:
+            user = f"""Write a hook-first Short Cut narration in the voice of "{persona}".
+
+TOPIC:
+{topic}
+
+{preserve_clause}"""
+    elif style == "narrator":
         system = _recovery_short_narrator_system(
             persona, persona_voice, channel_cue, low, high, center,
             target_seconds, dedup, recent_hits_block=recent_hits_block,
@@ -952,12 +1057,18 @@ TOPIC:
     if not quote:
         raise ValueError(f"Opus returned empty quote for {persona}/{topic}")
 
+    hook = (parsed.get("hook") or "").strip()
+    if style == "short_cut" and not hook:
+        raise ValueError(f"short_cut style returned no hook for {persona}/{topic}")
+
     # Normalise to the shape process_short expects: it reads `quote` + metadata,
     # then builds title/description from a SEPARATE Haiku call. We want to skip
     # that here (Opus already wrote them), so return the full dict and let the
     # orchestrator short-circuit the metadata step for na/aa.
     return {
         "quote": quote,
+        "hook": hook,                       # short_cut only; "" for other styles
+        "is_short_cut": style == "short_cut",
         "title": parsed.get("title") or f"{persona}: {topic[:40]}",
         "description": parsed.get("description", ""),
         "tags": parsed.get("tags", ["recovery", "daily meditation", topic]),
@@ -1850,6 +1961,138 @@ THE STORY ARC:
     return result
 
 
+def generate_recovery_story_script(topic: str, channel_slug: str,
+                                   theme: str = "",
+                                   setting: str = None,
+                                   mood: str = None,
+                                   notes: str = None,
+                                   queued_title: str = None) -> dict:
+    """
+    Write an original 4-5 min recovery testimony story for NA/AA channels.
+
+    Voice is locked to "The Voice of the Rooms" — collective anonymous testimony
+    drawn from the rooms. The writer style is locked to recovery testimony
+    regardless of the dashboard `mood` arg (same lock pattern as Gibran's
+    PHILOSOPHER_STYLE_OVERRIDE in generate_story_script).
+
+    Anonymous protagonist: never named (no "Marco", "Sarah", "David"). The
+    `character` field deliberately tells the art prompter that appearance
+    varies scene to scene — different ages, races, genders, builds — because
+    recovery is collective, not one person's biography.
+
+    Returns the same shape as generate_story_script so downstream Whisper
+    chunking, art prompt gen, and Remotion render are unchanged.
+    """
+    if channel_slug not in ("na", "aa"):
+        raise ValueError(
+            f"generate_recovery_story_script called with channel_slug={channel_slug!r}; "
+            "must be 'na' or 'aa'"
+        )
+
+    persona = "The Voice of the Rooms"
+    persona_voice = _RECOVERY_PERSONA_VOICES[persona]
+
+    channel_cue = {
+        "na": ("Recovery from addiction, broadly. Avoid language that implies a "
+               "specific 12-step program or names Narcotics Anonymous."),
+        "aa": ("Recovery from alcohol, broadly. Avoid language that implies a "
+               "specific 12-step program or names Alcoholics Anonymous."),
+    }[channel_slug]
+
+    setting_line = (
+        f"Setting hint: {setting}" if setting
+        else ("Setting hint: choose an ordinary recovery-adjacent setting — "
+              "a kitchen at dawn, a porch in winter, a parking lot after a "
+              "meeting, a phone call at midnight, a Tuesday lunch break. "
+              "Avoid clinical settings (rehab, hospital, therapy office) "
+              "unless the topic explicitly calls for them.")
+    )
+    notes_line = f"Creative direction: {notes}" if notes else ""
+    mood_line = (
+        f"Atmospheric mood (lighting and pace only — does NOT change writer style): {mood}"
+        if mood else ""
+    )
+
+    title_directive = (
+        f'\nPROMISED TITLE: "{queued_title}"\n'
+        f"This row was planned in the dashboard under this exact title. Your story\n"
+        f"MUST deliver on the emotional beat this title promises. Use this title\n"
+        f"verbatim as the `title` field — do NOT invent a new one.\n"
+        if queued_title else ""
+    )
+
+    title_field_directive = (
+        "Use the PROMISED TITLE above verbatim"
+        if queued_title
+        else "YouTube title under 60 chars. MUST follow TITLE SHAPE — open-loop, never declarative."
+    )
+
+    system = f"""You are writing an original 4-5 minute recovery testimony story for a YouTube long-form video on a recovery-adjacent channel. The piece is narrated in the voice of "{persona}".
+
+VOICE — "{persona}":
+{persona_voice}
+
+CHANNEL SCOPE: {channel_cue}
+
+THIS IS RECOVERY TESTIMONY, NOT LITERARY FICTION. The writer style is locked. Do not write Cormac McCarthy iceberg prose, Ocean Vuong lyricism, Carver minimalism, or any "literary" style. Write the way someone speaks at a meeting after they have settled into the chair — plainly, honestly, slowly. Sentences are short and clear. Metaphors come from ordinary life: coffee, mornings, porches, phone calls, traffic, Tuesday afternoons, the weight of a doorknob. Never from poetry, never from nature-as-symbol, never from "the body remembers what the mind forgets."
+
+ANONYMITY — non-negotiable:
+- The protagonist is ANONYMOUS. NEVER give them a name. Refer to them as "she", "he", "they", "the woman across from me", "the man on his fourth day", or "we" / "I" when the persona testifies directly.
+- The protagonist's APPEARANCE varies across scenes. Different ages, races, genders, builds, regions. This is intentional — recovery is collective, not one person's biography.
+- Never name a city, a meeting, a sponsor, a treatment center, or any specific group.
+- Never use a real recovery author or founder as a character or reference.
+
+STORY ARC (a recovery testimony that lands):
+1. ORDINARY MOMENT — open inside something small and specific. A phone ringing at 2am. Hands wrapped around a mug. A car in a parking lot with the engine off. Not a setup, not exposition — drop the listener INSIDE the moment.
+2. RECOGNITION — the protagonist (or the persona observing them) sees something they hadn't seen before. Quiet, not dramatic. The recognition is the emotional core.
+3. SMALL ACTION — they DO something small that shows the recognition has changed them. Not a sweeping life change. A phone call returned. A meeting attended. A sentence spoken out loud that wasn't going to be.
+4. QUOTABLE CLOSE — end on ONE short sentence the listener can carry. Name what was carried, claim dignity, close with a line worth quoting. No literary iceberg ambiguity.
+
+TARGET LENGTH: 650-800 words total (~4 to 5 minutes of narration at conversational pace).
+
+{_RECOVERY_COMPLIANCE_BLOCK}
+
+{_RECOVERY_TITLE_SHAPE_BLOCK}
+
+Output JSON ONLY (no preamble, no code fences):
+{{
+  "title": "{title_field_directive}",
+  "description": "3-4 line YouTube description; can mention the Fellows app in the last line; 3-5 hashtags at the end",
+  "tags": ["8-12 recovery-relevant tags, lowercase, no hashtags"],
+  "story_script": "The complete 650-800 word narration as a single string. Natural pauses via punctuation. No stage directions. No attribution.",
+  "character": "Description telling the art generator that the protagonist's appearance VARIES across scenes — different ages, races, genders, builds, regions — because this is collective testimony, not one person's biography. Under 40 words.",
+  "visual_style": "Brief art direction under 20 words: Hopper/Wyeth American realist palette, ordinary recovery-adjacent settings, warm directional lamplight, no clinical environments.",
+  "closing_attribution": "",
+  "music_mood": "one word for background music mood (e.g. 'contemplative', 'tender', 'steady')",
+  "suno_prompt": "Suno music prompt under 60 words for an ambient recovery-adjacent track"
+}}"""
+
+    user = f"""Write today's recovery testimony story.
+
+TOPIC: {topic}
+{title_directive}{setting_line}
+{mood_line}
+{notes_line}
+
+Remember: this is not literary fiction. It is testimony from the rooms. Plain prose. Ordinary metaphors. Anonymous protagonist. Ending lands."""
+
+    response = _call_anthropic(SONNET_MODEL, system, user, max_tokens=4000,
+                               temperature=0.75)
+    result = _parse_json_response(response)
+
+    if not (result.get("story_script") or "").strip():
+        raise ValueError(
+            f"Recovery story writer returned empty story_script for "
+            f"channel={channel_slug!r}, topic={topic[:60]!r}"
+        )
+
+    result["philosopher"] = persona
+    result["theme"] = theme or topic
+    result["format"] = "story"
+    result["channel_slug"] = channel_slug
+    return result
+
+
 def generate_story_vertical_script(full_story: dict) -> dict:
     """
     Condense a full 6-minute horizontal story into a ~60-second vertical
@@ -1935,7 +2178,8 @@ REMINDER: 60 seconds of narration is VERY short. Every sentence must earn its pl
     return result
 
 
-def generate_art_prompts_from_chunks(story_data: dict, text_chunks: list) -> list:
+def generate_art_prompts_from_chunks(story_data: dict, text_chunks: list,
+                                     channel_slug: str = None) -> list:
     """
     Generate image prompts for each time-chunk of narration text.
 
@@ -1943,8 +2187,14 @@ def generate_art_prompts_from_chunks(story_data: dict, text_chunks: list) -> lis
     time window. Each chunk is ~18-25 seconds of narration.
 
     Args:
-        story_data: The story script dict (has character, visual_style, comic_style)
+        story_data: The story script dict (has character, visual_style)
         text_chunks: List of strings, each being the narration text for one scene
+        channel_slug: Optional channel slug. When "na" or "aa", switches to the
+            recovery aesthetic: `_NA_STYLE` (Hopper/Wyeth) replaces the per-
+            philosopher style card, and the scene-writing rules drop the
+            "main character must appear in every scene" requirement in favor
+            of anonymity-respectful compositions (hands, objects, partial
+            figures, environments — different anonymous person per scene).
 
     Returns:
         List of art_prompt strings, one per chunk.
@@ -1952,18 +2202,32 @@ def generate_art_prompts_from_chunks(story_data: dict, text_chunks: list) -> lis
     character = story_data.get("character", "")
     visual_style = story_data.get("visual_style", "")
     philosopher = story_data.get("philosopher", "")
+    is_recovery = channel_slug in ("na", "aa")
 
-    # Fetch the per-philosopher visual style card (single source of truth is
-    # in orchestrator.PHILOSOPHER_VISUAL_STYLE — we inline-import to avoid a
-    # circular dependency on SUPABASE_KEY env at import time)
-    try:
-        from orchestrator import _get_philosopher_style  # type: ignore
-        philosopher_style_card = _get_philosopher_style(philosopher)
-    except Exception:
-        philosopher_style_card = (
-            "oil painting, chiaroscuro lighting, renaissance master palette, "
-            "painted on linen canvas"
-        )
+    # Style card lookup: recovery channels use the shared _NA_STYLE
+    # (Hopper/Wyeth medium-only); Wisdom/Gibran look up the per-philosopher
+    # card. Inline-imported to avoid circular dependency on SUPABASE_KEY at
+    # ai_writer import time.
+    if is_recovery:
+        try:
+            from orchestrator import _NA_STYLE  # type: ignore
+            style_card = _NA_STYLE
+        except Exception:
+            style_card = (
+                "oil painting in the american realist tradition of edward hopper and "
+                "andrew wyeth, intimate quiet composition, warm golden dawn light, "
+                "muted earth tones with charcoal shadows, single directional light source, "
+                "grounded and anonymous atmosphere, soft painterly brushwork"
+            )
+    else:
+        try:
+            from orchestrator import _get_philosopher_style  # type: ignore
+            style_card = _get_philosopher_style(philosopher)
+        except Exception:
+            style_card = (
+                "oil painting, chiaroscuro lighting, renaissance master palette, "
+                "painted on linen canvas"
+            )
 
     chunks_text = ""
     for i, chunk in enumerate(text_chunks):
@@ -1978,7 +2242,64 @@ def generate_art_prompts_from_chunks(story_data: dict, text_chunks: list) -> lis
         "Output valid JSON only."
     )
 
-    user = f"""Read each narration chunk below. For each one, write a LITERAL scene
+    if is_recovery:
+        user = f"""Read each narration chunk below. For each one, write a LITERAL scene
+description for what the viewer should see on screen while that chunk is narrated.
+
+THIS IS RECOVERY TESTIMONY. Anonymity rules — non-negotiable:
+- The protagonist's appearance VARIES across scenes. Each scene can show a DIFFERENT
+  anonymous person living the same kind of moment — different ages, races, genders, builds,
+  regions. This is intentional; recovery is collective, not one person's biography.
+- Faces are partial, three-quarter from behind, in shadow, in profile, or out of frame.
+  NEVER a clean identifiable front-on portrait.
+- Anchor scenes in HANDS, OBJECTS, and ORDINARY ENVIRONMENTS — coffee mugs, phone screens,
+  doorknobs, parking lots at dawn, kitchen tables, porches in winter, gas stations, folded
+  laundry, ashtrays, the weight of a doorhandle, a steering wheel at midnight.
+- Avoid clinical settings (rehab, hospital, therapy office) unless the chunk explicitly
+  names one. Avoid meeting-room visuals with identifiable 12-step text on banners or chairs.
+- No identifiable text on signs, no city names, no group logos.
+
+PER-STORY MOOD (this informs lighting/weather/color but is secondary to the action):
+{visual_style}
+
+NARRATION CHUNKS:{chunks_text}
+
+FOR EACH CHUNK, WRITE A SCENE DESCRIPTION THAT CONTAINS:
+1. An ANONYMOUS PERSON described by action and partial appearance only ("hands of a woman
+   in her 50s, weathered", "a man from behind, hood up, shoulders heavy"). Different scene,
+   potentially different person.
+2. A specific ACTION the body/hands are doing RIGHT NOW.
+3. The exact SETTING (room type, time of day, weather, specific objects visible). Favor
+   the ordinary recovery-adjacent settings above.
+4. A camera framing hint (close up of hands, over-the-shoulder, wide shot, profile).
+5. The single most important emotional beat of the chunk, shown through body language and
+   environment, NOT described in words.
+
+CRITICAL RULES:
+- The scene MUST match what the narration text literally describes. If the chunk says
+  "she picked up the phone", show a hand picking up a phone.
+- Every scene must be DIFFERENT from the previous one — different action, angle, setting,
+  and (often) a different anonymous person.
+- Describe ACTIONS and OBJECTS, not emotions. "hands folding a letter" not "feeling sad".
+- 40-60 words per scene.
+- DO NOT include any art-style tokens (no "oil painting", "cinematic", "masterpiece", "4k").
+  The style is applied upstream. Just write what's happening.
+
+EXAMPLE (bad): "A contemplative figure in autumn light, mood of solitude"
+EXAMPLE (good): "Close-up of hands of a man in his 40s, weathered and steady, gripping a
+ceramic mug at a kitchen counter, soft amber lamp overhead, his face half-turned toward
+a window where pale dawn light is just starting to lift, the kitchen otherwise dark and still"
+
+Return JSON:
+{{
+  "prompts": [
+    "literal scene description for chunk 1",
+    "literal scene description for chunk 2",
+    "..."
+  ]
+}}"""
+    else:
+        user = f"""Read each narration chunk below. For each one, write a LITERAL scene
 description for what the viewer should see on screen while that chunk is narrated.
 
 CHARACTER (appears in every image with identical physical appearance):
@@ -2030,16 +2351,22 @@ Return JSON:
     result = _parse_json_response(response)
     raw_prompts = result.get("prompts", [])
 
-    # Pad if needed (fallback uses the chunk text verbatim)
+    # Pad if needed (fallback uses the chunk text verbatim). Recovery
+    # channels don't have a fixed character — the fallback uses a generic
+    # anonymous anchor instead of pinning a specific person.
     while len(raw_prompts) < len(text_chunks):
-        raw_prompts.append(
-            f"{character}, {text_chunks[len(raw_prompts)][:100]}"
-        )
+        next_chunk_text = text_chunks[len(raw_prompts)][:100]
+        if is_recovery:
+            raw_prompts.append(
+                f"anonymous person in an ordinary recovery-adjacent setting, {next_chunk_text}"
+            )
+        else:
+            raw_prompts.append(f"{character}, {next_chunk_text}")
 
     # Assemble final prompts: SCENE first (front-loaded in SDXL = emphasis),
-    # composition hints, then the per-philosopher STYLE card at the END,
-    # then quality tokens. This way Claude's scene drives the subject and
-    # the style card only dictates HOW it is painted.
+    # composition hints, then the STYLE card at the END, then quality tokens.
+    # This way Claude's scene drives the subject and the style card only
+    # dictates HOW it is painted.
     prompts = []
     for scene_text in raw_prompts[: len(text_chunks)]:
         scene_text = scene_text.strip().rstrip(",.")
@@ -2047,7 +2374,7 @@ Return JSON:
             f"{scene_text}, "
             f"strong compositional silhouette, rule of thirds, shallow depth of field, "
             f"volumetric light, soft rim light, atmospheric perspective, "
-            f"{philosopher_style_card}, "
+            f"{style_card}, "
             f"ultra detailed, award-winning fine art, masterpiece quality"
         )
         prompts.append(combined)

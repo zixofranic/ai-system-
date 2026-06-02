@@ -396,7 +396,7 @@ def _resolve_writing_style(content: dict, channel_default: str = "in_character")
          pre-existing default behavior)
     """
     style = content.get("writing_style")
-    if style in ("in_character", "narrator"):
+    if style in ("in_character", "narrator", "short_cut"):
         return style
     legacy = content.get("gibran_essay_voice")
     if legacy == "narrator":
@@ -404,6 +404,228 @@ def _resolve_writing_style(content: dict, channel_default: str = "in_character")
     if legacy == "prophet_voice":
         return "in_character"
     return channel_default
+
+
+def _normalize_for_chatterbox(text: str) -> str:
+    """Strip markdown structure + production-metadata blocks that break
+    Chatterbox's chunk splitter and contaminate the spoken output.
+
+    Custom scripts pasted via the dashboard frequently carry:
+      - markdown headers (`# H1`, `## H2`, `### H3`)
+      - timestamp blocks (`[00:00]` or `[00:00] — TITLE`)
+      - horizontal-rule dividers (`---`, `***`, `· · ·`)
+      - inline emphasis (`**bold**`, `*ital*`, `` `code` ``)
+      - PRODUCTION NOTES / VOICE DIRECTION blocks between the title and
+        the first body section, with bullet lists of runtime / pace /
+        TTS instructions
+
+    Chatterbox's text splitter recognizes only PERIODS (and newlines) as
+    natural chunk boundaries. A long passage broken only by markdown
+    forms gets sent as a single oversized chunk that can overflow the
+    T3 model's max sequence length and trigger a CUDA device-side
+    assert at synthesis time.
+
+    The second failure mode (worse, because it produces a "successful"
+    render with garbage audio): production-metadata blocks get narrated
+    verbatim, so Burton reads aloud the runtime, the voice direction,
+    and the "strip them before sending to the engine" instruction. See
+    2026-06-01 rerun of 995ada07 for the cautionary example.
+
+    Two-pass strategy:
+      1. FRONT-MATTER STRIP — if the script uses `[HH:MM]` timestamp
+         markers (the body-content convention), drop everything between
+         the first `---` divider and the first `[HH:MM]` line. Title
+         and subtitle above the first divider are preserved as the
+         intro; body content from the first timestamp on is preserved
+         verbatim.
+      2. LINE NORMALIZATION — strip markdown shell (headers, timestamps,
+         dividers, bullets, inline emphasis, standalone italic flourish
+         lines) into period-terminated prose.
+
+    Idempotent on clean prose — LLM-generated scripts and existing
+    renders are unaffected.
+    """
+    import re
+
+    # --- pass 1: strip front-matter metadata block ---
+    # Many custom scripts open with:
+    #   # TITLE
+    #   ### SUBTITLE
+    #   *flavor note*
+    #   ---
+    #   **PRODUCTION NOTES**
+    #   - target runtime …
+    #   - voice direction …
+    #   - for TTS …
+    #   ---
+    #   ## [00:00] — FIRST SECTION
+    # The body starts at the first `[HH:MM]` line. Everything between
+    # the first `---` and that line is metadata — drop it.
+    #
+    # IMPORTANT: this runs per-scene (cinematic_pipeline normalizes each
+    # scene's narration). The production-notes block frequently lives in
+    # a scene that has NO `[HH:MM]` of its own (the first timestamp is in
+    # the NEXT scene), so the timestamp-anchored strip below would miss
+    # it. Pass 0 therefore drops `---`-fenced metadata blocks by keyword,
+    # independent of any timestamp anchor.
+
+    # --- pass 0: drop editorial/production-metadata blocks (label-anchored) ---
+    # Fence-anchored removal is fragile: the cinematic splitter groups
+    # paragraphs into scenes, so a `---`-fenced PRODUCTION NOTES block can
+    # have its opening fence in scene 1 and its closing fence in scene 2.
+    # Anchoring on the LABEL line instead is scene-split-proof: drop the
+    # label and every following note/bullet/indented line until a blank
+    # line or a real timestamped/prose section.
+    META_LABEL = re.compile(
+        r"^\**\s*(production notes?|voice direction|for tts|target runtime|"
+        r"audio notes?|track sheet|reading speed)\b",
+        re.IGNORECASE,
+    )
+    src_lines = text.split("\n")
+    kept = []
+    i = 0
+    n = len(src_lines)
+    while i < n:
+        if META_LABEL.match(src_lines[i].strip()):
+            # Skip the label line and the contiguous note block that
+            # follows it: blank lines, bullet/dash lines, and `key: value`
+            # continuation lines. Stop at a real narrative line (a
+            # timestamp section, or prose that isn't a note bullet).
+            i += 1
+            while i < n:
+                s = src_lines[i].strip()
+                if not s:
+                    i += 1
+                    continue
+                if re.match(r"^\s*---+\s*$", s):  # closing fence — consume it
+                    i += 1
+                    break
+                if s[:2] in ("- ", "* ", "• ") or META_LABEL.match(s):
+                    i += 1
+                    continue
+                if re.search(r"\[\d{1,2}:\d{2}\]", s) or re.match(r"^#+\s", s):
+                    break  # real section start — stop dropping
+                # A bare note continuation line (no bullet). Drop it too,
+                # but only while we're still inside the note region — i.e.
+                # short lines without sentence-final prose cadence. To stay
+                # safe, stop at the first line that looks like real prose.
+                break
+            kept.append("")  # paragraph break in place of the block
+            continue
+        kept.append(src_lines[i])
+        i += 1
+    text = "\n".join(kept)
+
+    # --- pass 1: timestamp-anchored front-matter strip (belt-and-suspenders) ---
+    lines = text.split("\n")
+    first_ts_idx = None
+    # Timestamp markers may appear bare (`[00:00] — TITLE`) or prefixed
+    # with markdown header marks (`## [00:00] — TITLE`). re.search
+    # finds the timestamp anywhere on the line so both forms count.
+    for i, line in enumerate(lines):
+        if re.search(r"\[\d{1,2}:\d{2}\]", line):
+            first_ts_idx = i
+            break
+    if first_ts_idx is not None:
+        first_div_idx = None
+        for i in range(first_ts_idx):
+            if re.match(r"^\s*---+\s*$", lines[i]):
+                first_div_idx = i
+                break
+        if first_div_idx is not None:
+            # Keep [:first_div_idx] (title/subtitle area) and
+            # [first_ts_idx:] (body content). Drop the metadata block
+            # between them. Insert a blank line as a paragraph break.
+            lines = lines[:first_div_idx] + [""] + lines[first_ts_idx:]
+            text = "\n".join(lines)
+
+    # --- pass 2: line-by-line normalization ---
+    out_lines = []
+    for raw in text.split("\n"):
+        stripped = raw.strip()
+
+        # Standalone italic-only line (single-line flourish wrapped in
+        # `*…*` or `_…_`). Editorial notes for the author, not narration.
+        # e.g. `*An original work composed in the style of the poet*`,
+        # `*[End of narration]*`.
+        if re.match(r"^\*[^*\n]+\*$", stripped) or re.match(r"^_[^_\n]+_$", stripped):
+            continue
+
+        # Blank line — CB treats this like a paragraph break.
+        if not stripped:
+            out_lines.append("")
+            continue
+
+        # ATX markdown header: `# Title` / `## Title` / `### Title`,
+        # with optional closing #s. Drop the marks; append a period so
+        # the title acts as a sentence boundary. If the header content
+        # itself starts with a timestamp block, strip that too.
+        m = re.match(r"^#+\s+(.+?)\s*#*$", stripped)
+        if m:
+            content = m.group(1).strip()
+            ts = re.match(r"^\[\d{1,2}:\d{2}\]\s*[—\-–:]?\s*(.*)$", content)
+            if ts:
+                content = ts.group(1).strip()
+            if not content:
+                out_lines.append("")
+                continue
+            if content[-1] not in ".!?":
+                content += "."
+            out_lines.append(content)
+            continue
+
+        # Timestamp block: `[HH:MM]` or `[HH:MM] — TITLE` / `[HH:MM] - TITLE`.
+        # Drop the timestamp; keep the title (if any) as its own sentence.
+        m = re.match(r"^\[\d{1,2}:\d{2}\]\s*[—\-–:]?\s*(.*)$", stripped)
+        if m:
+            content = m.group(1).strip()
+            if not content:
+                out_lines.append("")
+                continue
+            if content[-1] not in ".!?":
+                content += "."
+            out_lines.append(content)
+            continue
+
+        # Horizontal rule / divider: `---`, `***`, `· · ·`, `• • •`.
+        # Treat as a paragraph break.
+        if re.match(r"^[\-\*·•]+(\s+[\-\*·•]+)*\s*$", stripped):
+            out_lines.append("")
+            continue
+
+        # Bullet / dash list item — keep the content as a sentence,
+        # stripping any inline emphasis markers it carries.
+        if stripped[:2] in ("- ", "* ", "• "):
+            content = stripped[2:].strip()
+            content = re.sub(r"\*\*(.+?)\*\*", r"\1", content)
+            content = re.sub(r"(?<!\w)\*([^*\n]+?)\*(?!\w)", r"\1", content)
+            content = re.sub(r"`([^`\n]+?)`", r"\1", content)
+            content = content.replace("*", "")
+            if not content:
+                continue
+            if content[-1] not in ".!?":
+                content += "."
+            out_lines.append(content)
+            continue
+
+        # Inline emphasis — strip the markers, keep the words.
+        cleaned = re.sub(r"\*\*(.+?)\*\*", r"\1", stripped)
+        cleaned = re.sub(r"(?<!\w)\*([^*\n]+?)\*(?!\w)", r"\1", cleaned)
+        cleaned = re.sub(r"`([^`\n]+?)`", r"\1", cleaned)
+
+        # Residual emphasis markers: multi-line italic spans (a `*` that
+        # opens on one line and closes on another) leave a lone `*` after
+        # the single-line passes above. Asterisks never belong in spoken
+        # or caption prose, so strip any that survive. Same for `_word_`
+        # underscore emphasis. (Observed 2026-06-01: `*Teacher, speak to
+        # us…\n…granary echoes.*` kept its markers and showed up in the
+        # baked captions.)
+        cleaned = cleaned.replace("*", "")
+        cleaned = re.sub(r"(?<!\w)_([^_\n]+?)_(?!\w)", r"\1", cleaned)
+
+        out_lines.append(cleaned)
+
+    return "\n".join(out_lines)
 
 
 def _chatterbox_pause_hints(text: str) -> str:
@@ -423,7 +645,16 @@ def _chatterbox_pause_hints(text: str) -> str:
     PERIODS where the writer intended a real beat, and leave commas /
     colons alone (they're already getting their share). Don't bother
     padding whitespace.
+
+    Markdown stripping runs first via _normalize_for_chatterbox so
+    custom scripts can't produce an unsplittable mega-chunk that
+    overflows CB's CUDA tensor allocation.
     """
+    # Strip markdown structure (headers, timestamp blocks, dividers,
+    # inline emphasis) so CB's chunk splitter has real sentence
+    # boundaries to work with.
+    text = _normalize_for_chatterbox(text)
+
     # Em-dashes — Gibran loves them, CB ignores them. Convert to period
     # for a real ~840ms beat. Both spaced (` — `) and tight (`—`).
     text = text.replace(" — ", ". ").replace("—", ". ")
@@ -2026,7 +2257,7 @@ PHILOSOPHER_VISUAL_STYLE = {
     "Rumi": (
         "Persian miniature painting style, gold leaf accents, illuminated manuscript "
         "aesthetic, intricate decorative borders, jewel-tone palette of lapis and "
-        "turquoise and saffron, ornate detail work, medieval Islamic art tradition"
+        "turquoise and saffron, ornate detail work"
     ),
     "Gibran": (
         "symbolist watercolor painting, warm ochre and earth-tone palette, "
@@ -2045,66 +2276,65 @@ PHILOSOPHER_VISUAL_STYLE = {
         "zen brushwork, subtle grey wash tones, contemplative restraint"
     ),
     "Confucius": (
-        "classical Chinese scholar painting, ink and light color wash on silk, "
-        "restrained palette, calligraphic brushwork, Song dynasty fine art, "
-        "refined atmosphere, painted scroll aesthetic"
+        "ink-and-light-wash painting on silk, restrained palette of bone, ochre, "
+        "and pale jade, calligraphic brushwork with confident single-stroke linework, "
+        "soft edges with negative space, refined contemplative atmosphere, fine-art aesthetic"
     ),
     "Sun Tzu": (
-        "ancient Chinese painting on silk, ink and gold leaf, dynamic composition, "
-        "Tang dynasty aesthetic, heroic mood, dramatic brushwork, "
-        "imperial scroll art, painted with confident ink lines"
+        "ink and gold-leaf painting on silk, dynamic composition, heroic mood, "
+        "dramatic ink brushwork with confident lines, warm metallic accents, "
+        "painterly fine art"
     ),
     "Musashi": (
-        "Japanese ukiyo-e woodblock print style, Hokusai influence, bold outlines, "
-        "flat jewel-tone palette, sumi-e ink accents, Edo period aesthetic, "
-        "compositional clarity, traditional Japanese print"
+        "ukiyo-e woodblock-print style, Hokusai influence, bold outlines, "
+        "flat jewel-tone palette, sumi-e ink accents, compositional clarity, "
+        "graphic woodblock aesthetic"
     ),
     # --- Western Romantics: Hudson River School ---
     "Emerson": (
         "Hudson River School oil painting style, luminous romantic realism, "
         "warm golden-hour light, atmospheric perspective, painterly brushwork, "
-        "Thomas Cole influence, 19th century American landscape tradition"
+        "Thomas Cole influence"
     ),
     "Thoreau": (
         "Hudson River School oil painting style, painterly romantic realism, "
         "warm amber autumn light, atmospheric perspective, visible brushwork, "
-        "luminous palette, Asher Brown Durand influence, 19th century landscape tradition"
+        "luminous palette, Asher Brown Durand influence"
     ),
     # --- Nietzsche & Dostoevsky: dark expressionism ---
     "Nietzsche": (
         "German expressionist oil painting, Caspar David Friedrich influence, "
         "dark romantic sublime palette, heavy impasto brushwork, moody atmospheric lighting, "
-        "dramatic chiaroscuro, 19th century painterly tradition"
+        "dramatic chiaroscuro"
     ),
     "Dostoevsky": (
-        "Russian realist oil painting, Ilya Repin influence, candlelit interior lighting, "
-        "painterly psychological realism, heavy shadow and warm lamplight, "
-        "19th century academic oil technique, muted earth palette"
+        "Russian realist oil painting, Ilya Repin influence, warm directional lamplight, "
+        "painterly psychological realism, heavy shadow against warm highlights, "
+        "muted earth palette"
     ),
     # --- Victorian / Renaissance / Scientific ---
     "Wilde": (
-        "Victorian aesthetic movement oil painting, John Singer Sargent influence, "
-        "jewel-tone palette, opulent textures, decadent lighting, fin-de-siecle atmosphere, "
-        "rich velvet and gilded details in the palette, 19th century portraiture style"
+        "John Singer Sargent-influenced oil painting, jewel-tone palette, "
+        "opulent rich textures, decadent low-key lighting, velvet and gilded color accents, "
+        "painterly portrait aesthetic"
     ),
     "Da Vinci": (
         "high renaissance oil painting, Leonardo da Vinci sfumato technique, "
         "atmospheric perspective, warm earth tones, chiaroscuro modeling, "
-        "soft gradient light, anatomical precision, painted on poplar panel"
+        "soft gradient light, anatomical precision"
     ),
     "Tesla": (
-        "early 20th century oil painting, Ashcan school realism, tungsten and "
-        "electric arc color temperature contrast, moody industrial palette, "
-        "painterly brushwork, period scientific atmosphere"
+        "Ashcan school realist oil painting, tungsten and electric-arc color-temperature "
+        "contrast, moody industrial palette, painterly brushwork"
     ),
     "Franklin": (
-        "colonial American oil painting, John Singleton Copley influence, "
-        "candlelit warmth, period portraiture lighting, painted on linen, "
-        "18th century academic oil technique, warm wood and parchment palette"
+        "John Singleton Copley-influenced oil painting, warm directional lamplight, "
+        "classical academic oil technique, painterly portraiture brushwork, "
+        "warm umber and parchment color palette"
     ),
     "Vivekananda": (
         "Indian miniature painting tradition, saffron and deep red palette, "
-        "gold leaf accents, Rajput court art aesthetic, luminous devotional mood, "
+        "gold leaf accents, Rajput art aesthetic, luminous devotional mood, "
         "ornate detail work, spiritual radiance in the light"
     ),
 }
@@ -2253,7 +2483,11 @@ def _final_video_path(channel_slug: str, format_name: str,
     out_dir.mkdir(parents=True, exist_ok=True)
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     slug = _slugify_title(title)
-    return out_dir / f"{fmt}_{date_str}_{slug}.mp4"
+    # content_id suffix prevents silent cross-row overwrites: two rows on the same
+    # channel+format sharing a title-slug on the same UTC day would otherwise map
+    # to one storage object, and uploads use x-upsert=true (the 2nd clobbers the
+    # 1st). C3 fix, 2026-05-26.
+    return out_dir / f"{fmt}_{date_str}_{slug}_{content_id[:8]}.mp4"
 
 
 # ---------------------------------------------------------------------------
@@ -2290,26 +2524,44 @@ def process_short(content: dict):
     # Wisdom/Gibran keep the Ollama quote -> Haiku metadata pipeline.
     log_step(content_id, "quote", 1, "running")
     na_art_scene_hint = None
+    # short_cut state — populated only when writing_style == "short_cut".
+    is_short_cut = False
+    sc_hook = ""
     try:
         if channel_slug in ("na", "aa"):
             from ai_writer import generate_recovery_short_script
             previous = _fetch_recent_quotes(philosopher)
             recent_hits = _fetch_top_hit_titles(channel_slug)
-            # 60s target -> ~130-175 words. The ShortVideo QuoteOverlay
-            # scrolls long text, so we lean into a monologue-length piece
-            # that gives the scroll + fade animation something to do.
-            script = generate_recovery_short_script(
-                philosopher, topic, channel_slug,
-                target_seconds=60, previous_quotes=previous,
-                recent_hits=recent_hits,
-                style=_resolve_writing_style(content),
-            )
+            writing_style = _resolve_writing_style(content)
+            # SHORT CUT (writing_style="short_cut"): 38s hook-first retention
+            # format. The default long format keeps target_seconds=60 ->
+            # ~130-175 words for the scrolling monologue.
+            if writing_style == "short_cut":
+                sc_target = 38
+                script = generate_recovery_short_script(
+                    philosopher, topic, channel_slug,
+                    target_seconds=sc_target, previous_quotes=previous,
+                    recent_hits=recent_hits, style="short_cut",
+                )
+            else:
+                script = generate_recovery_short_script(
+                    philosopher, topic, channel_slug,
+                    target_seconds=60, previous_quotes=previous,
+                    recent_hits=recent_hits, style=writing_style,
+                )
             quote = sanitize_quote(script.get("quote", ""))
             title = script.get("title") or f"{philosopher}: {topic[:40]}"
             description = script.get("description", "")
             tags = script.get("tags", [])
             na_art_scene_hint = script.get("art_scene") or None
-            print(f"  [quote] Opus {channel_slug} short: {len(quote.split())} words")
+            is_short_cut = bool(script.get("is_short_cut"))
+            if is_short_cut:
+                sc_hook = sanitize_quote(script.get("hook", ""))
+                print(f"  [short-cut] hook: {sc_hook!r}")
+                print(f"  [short-cut] body: {len(quote.split())} words "
+                      f"(+ hook {len(sc_hook.split())} words)")
+            else:
+                print(f"  [quote] Opus {channel_slug} short: {len(quote.split())} words")
         else:
             quote = sanitize_quote(content.get("quote_text") or "")
             if not quote or quote.lower() in ("pending generation", "pending"):
@@ -2330,9 +2582,14 @@ def process_short(content: dict):
         log_step(content_id, "quote", 1, "failed", str(e))
         raise
 
+    # --- Short Cut: the spoken narration is hook + body (hook said first) ---
+    # The body `quote` stays the scroll text; `narration_text` is what TTS
+    # voices. For non-short-cut, they're identical.
+    narration_text = f"{sc_hook} {quote}".strip() if is_short_cut else quote
+
     # --- Compliance screen — fail fast before TTS/art spend (NA/AA only) ---
     _compliance_screen_or_raise(
-        {"quote": quote, "title": title, "description": description},
+        {"quote": narration_text, "title": title, "description": description},
         channel_slug,
     )
 
@@ -2361,7 +2618,9 @@ def process_short(content: dict):
     log_step(content_id, "voice", 3, "running")
     try:
         voice_path = str(work / "voice.wav")
-        generate_voice(quote, voice_path, channel_slug=channel_slug,
+        # short_cut voices hook + body as one continuous file so the open
+        # lands on the payoff. Non-short-cut voices the quote as before.
+        generate_voice(narration_text, voice_path, channel_slug=channel_slug,
                        philosopher=philosopher, slow_factor=short_slow_factor)
         log_step(content_id, "voice", 3, "success")
     except Exception as e:
@@ -2389,6 +2648,10 @@ def process_short(content: dict):
             title=title,
             equalizer_color=eq_color,
             watermark=watermark_for_channel(channel_slug),
+            # Short Cut: collapse the intro pad, show the hook card first,
+            # offset the body scroll. hook="" leaves the default long behavior.
+            short_cut=is_short_cut,
+            hook=sc_hook,
         )
         log_step(content_id, "video", 4, "success")
     except Exception as e:
@@ -2912,6 +3175,10 @@ def _batch_process(items: list):
     print("\n=== PHASE 3: Voice Generation (ElevenLabs) ===")
     for cid, data in list(results.items()):
         content = data["content"]
+        # Rebind philosopher per-row. Without this, a multi-persona NA/AA batch
+        # voices every row with whatever philosopher was left over from the last
+        # Phase-2 iteration (silent wrong-voice render). C2 fix, 2026-05-26.
+        philosopher = content["philosopher"]
         channel = content["channels"]
         channel_slug = channel["slug"]
         work = data["work"]
@@ -3651,136 +3918,75 @@ def main():
             )
         return
 
-    # Process
+    # Process. Every row's pipeline is decided by ONE function —
+    # pipeline_routing.classify() — the single source of truth (remediation M5).
+    # Both dispatch paths below group rows by classify()'s tag, so the two can no
+    # longer drift apart the way they did before (that drift caused the
+    # 2026-05-26 story_vertical bug). classify() reproduces the LIVE behavior
+    # exactly; see test_pipeline_routing.py. Documented divergences from the old
+    # sequential branch (non-custom story_vertical, longform/compilation, unknown
+    # format) are now resolved consistently in favor of the live behavior.
+    from pipeline_routing import classify
+
+    def _reject_story_vertical(content):
+        msg = ("story_vertical can't be generated from the queue — "
+               "use scripts/generate_story_vertical.py with a parent story")
+        print(f"  REJECTED story_vertical: {content['id']}")
+        log_step(content["id"], "publish", 0, "failed", msg)
+        try:
+            update_supabase(content["id"], {
+                "status": "rejected",
+                "rejection_reason": msg,
+            })
+        except Exception:
+            pass
+
+    # Partition the queue — each row lands in exactly one bucket (no skip_ids
+    # juggling, no double-processing possible).
+    buckets = {"reject_story_vertical": [], "cinematic_essay": [],
+               "midform": [], "story": [], "batch_short": []}
+    for content in queued:
+        buckets[classify(content)].append(content)
+
+    for content in buckets["reject_story_vertical"]:
+        _reject_story_vertical(content)
+
     if args.no_batch:
-        # Sequential, one-by-one (simpler, no VRAM optimization)
-        for content in queued:
+        # Sequential, one row at a time (no VRAM batching). Same routing as the
+        # default path; only short handling differs (process_short per row
+        # instead of one VRAM-aware _batch_process call).
+        for content in (buckets["cinematic_essay"] + buckets["midform"]
+                        + buckets["story"] + buckets["batch_short"]):
+            tag = classify(content)
             try:
-                content_type = content.get("format", "short")
-                # story_vertical (Portrait Short, 9:16, ~60s) runs through
-                # the standalone meditation pipeline — Opus writes a
-                # philosopher-voice mini-narrative, SDXL paints scene-per-art,
-                # Whisper aligns word timestamps, Remotion's
-                # StoryVerticalVideo composition renders the 9:16 output.
-                # NO parent story required — works straight from the queue.
-                # 2026-04-18 fix.
-                # Custom Prompts short-circuit — pasted-script rows for
-                # ANY channel (Gibran, Wisdom, NA, AA) bypass the format
-                # dispatch and route to the cinematic essay pipeline. The
-                # `is_custom_script` flag in generation_params is the
-                # routing key; format is purely a length/aspect signal.
-                # Must run BEFORE story_vertical/format dispatch — a
-                # Custom Prompt with format='story_vertical' would
-                # otherwise be intercepted by _run_meditation_pipeline
-                # (wrong renderer; meditation expects an Opus script).
-                if (content.get("generation_params") or {}).get("is_custom_script"):
+                if tag == "cinematic_essay":
                     _run_custom_prompt_pipeline(content)
-                    print(f"  Done (custom-script): {content['id']}")
-                    continue
-                if content_type == "story_vertical":
-                    _run_meditation_pipeline(content)
-                    print(f"  Done: {content['id']}")
-                    continue
-                # Gibran cinematic essay (post-format-gate) — routes any
-                # Gibran non-short row whose gibran_long_form_style='essay'
-                # to the cinematic essay pipeline regardless of nominal
-                # format ("story" / "midform" / "longform"). The format
-                # column is now a length category; style is the renderer.
-                slug = (content.get("channels") or {}).get("slug")
-                if slug == "gibran" and content.get("gibran_long_form_style") == "essay":
-                    _run_custom_prompt_pipeline(content)
-                    print(f"  Done: {content['id']}")
-                    continue
-                if content_type == "story":
-                    _run_story_pipeline(content)
-                elif content_type == "short":
-                    process_short(content)
-                elif content_type in ("longform", "compilation", "midform"):
+                elif tag == "midform":
                     process_midform(content)
-                else:
-                    # Unknown format — refuse rather than guess. Previously
-                    # this defaulted to process_short and silently produced
-                    # the wrong artifact for any format we hadn't enumerated.
-                    msg = f"unknown format '{content_type}' — refusing to guess pipeline"
-                    print(f"  REJECTED: {content['id']} ({msg})")
-                    log_step(content["id"], "publish", 0, "failed", msg)
-                    update_supabase(content["id"], {
-                        "status": "rejected",
-                        "rejection_reason": msg,
-                    })
-                    continue
-                print(f"  Done: {content['id']}")
+                elif tag == "story":
+                    _run_story_pipeline(content)
+                else:  # batch_short
+                    process_short(content)
+                print(f"  Done ({tag}): {content['id']}")
             except Exception as e:
-                print(f"  FAILED: {content['id']} - {e}")
+                print(f"  FAILED ({tag}): {content['id']} - {e}")
                 traceback.print_exc()
                 log_step(content["id"], "publish", 0, "failed", str(e))
                 mark_failed(content["id"], e)
     else:
-        # Reject story_vertical up front — needs parent story, not queue path
-        # (silently rendered as midform before 2026-04-18).
-        story_verticals = [c for c in queued if c.get("format") == "story_vertical"]
-        for content in story_verticals:
-            msg = ("story_vertical can't be generated from the queue — "
-                   "use scripts/generate_story_vertical.py with a parent story")
-            print(f"  REJECTED story_vertical: {content['id']}")
-            log_step(content["id"], "publish", 0, "failed", msg)
-            try:
-                update_supabase(content["id"], {
-                    "status": "rejected",
-                    "rejection_reason": msg,
-                })
-            except Exception:
-                pass
-
-        # Custom Prompts — pasted-script rows for any channel. Pulled out
-        # FIRST because they share the cinematic-essay subprocess and
-        # shouldn't get intercepted by format-based routing below.
-        custom_scripts = [
-            c for c in queued
-            if (c.get("generation_params") or {}).get("is_custom_script")
-        ]
-        for content in custom_scripts:
+        # Default path. Essays and stories each run their own subprocess; shorts
+        # are VRAM-batched together via _batch_process. (Gibran essays and custom
+        # scripts share the cinematic-essay pipeline — classify() merges them.)
+        for content in buckets["cinematic_essay"]:
             try:
                 _run_custom_prompt_pipeline(content)
-                print(f"  Done (custom-script): {content['id']}")
+                print(f"  Done (cinematic-essay): {content['id']}")
             except Exception as e:
-                print(f"  FAILED (custom-script): {content['id']} - {e}")
+                print(f"  FAILED (cinematic-essay): {content['id']} - {e}")
                 traceback.print_exc()
-                mark_failed(content["id"], f"custom script: {e}")
-        custom_script_ids = {c["id"] for c in custom_scripts}
+                mark_failed(content["id"], f"cinematic essay: {e}")
 
-        # Gibran cinematic essays — own subprocess pipeline (mirrors story).
-        # Pulled out before the batched path because they run 10-20 min of
-        # voice + many SDXL renders; batching with shorts wastes the
-        # VRAM-aware optimization. Excludes anything already handled as a
-        # custom-script row (defense in depth — Gibran custom prompts
-        # would also satisfy the gibran/essay predicate).
-        gibran_essays = [
-            c for c in queued
-            if (c.get("channels") or {}).get("slug") == "gibran"
-            and c.get("gibran_long_form_style") == "essay"
-            and c.get("format") != "short"
-            and c["id"] not in custom_script_ids
-        ]
-        for content in gibran_essays:
-            try:
-                _run_custom_prompt_pipeline(content)
-                print(f"  Done (gibran-essay): {content['id']}")
-            except Exception as e:
-                print(f"  FAILED (gibran-essay): {content['id']} - {e}")
-                traceback.print_exc()
-                mark_failed(content["id"], f"gibran essay: {e}")
-        gibran_essay_ids = {c["id"] for c in gibran_essays}
-        skip_ids = custom_script_ids | gibran_essay_ids
-
-        # Midform (treated as longform — up to 20 min). Gibran essays already
-        # handled above; anything else routes to process_midform.
-        non_essay_midforms = [
-            c for c in queued
-            if c.get("format") == "midform"
-            and c["id"] not in skip_ids
-        ]
-        for content in non_essay_midforms:
+        for content in buckets["midform"]:
             try:
                 process_midform(content)
                 print(f"  Done (midform): {content['id']}")
@@ -3789,17 +3995,7 @@ def main():
                 traceback.print_exc()
                 mark_failed(content["id"], f"midform: {e}")
 
-        # Stories run separately (own pipeline), rest go through batch.
-        # Exclude both gibran-essays AND custom-scripts already handled.
-        stories = [c for c in queued
-                   if c.get("format") == "story"
-                   and c["id"] not in skip_ids]
-        non_stories = [
-            c for c in queued
-            if c.get("format") not in ("story", "midform", "story_vertical")
-            and c["id"] not in skip_ids
-        ]
-        for content in stories:
+        for content in buckets["story"]:
             try:
                 _run_story_pipeline(content)
                 print(f"  Done (story): {content['id']}")
@@ -3807,8 +4003,9 @@ def main():
                 print(f"  FAILED (story): {content['id']} - {e}")
                 traceback.print_exc()
                 mark_failed(content["id"], f"story: {e}")
-        if non_stories:
-            _batch_process(non_stories)
+
+        if buckets["batch_short"]:
+            _batch_process(buckets["batch_short"])
 
     elapsed = (datetime.now() - start).total_seconds()
     print(f"\n{'='*60}")

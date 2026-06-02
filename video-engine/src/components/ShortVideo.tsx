@@ -1,4 +1,5 @@
 import { Audio } from "@remotion/media";
+import React, { useLayoutEffect, useRef, useState } from "react";
 import {
   AbsoluteFill,
   Img,
@@ -78,6 +79,10 @@ export const ShortVideo: React.FC<z.infer<typeof shortVideoSchema>> = ({
     (t) => t.role === "attribution",
   );
   const captions = timeline.text.filter((t) => t.role === "caption");
+  // Short Cut hook — the payoff line shown as a large centered card in the
+  // first ~3s before the body scroll. Reuses the AphorismOverlay box style
+  // so the look is identical to the rest of the channel.
+  const hooks = timeline.text.filter((t) => t.role === "hook");
 
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
@@ -132,6 +137,24 @@ export const ShortVideo: React.FC<z.infer<typeof shortVideoSchema>> = ({
           {watermark}
         </div>
       </AbsoluteFill>
+
+      {/* Hook card (Short Cut) — large centered payoff card, first ~3s */}
+      {hooks.map((element, index) => {
+        const { startFrame, duration } = calculateFrameTiming(
+          element.startMs,
+          element.endMs,
+        );
+
+        return (
+          <Sequence
+            key={`hook-${index}`}
+            from={startFrame}
+            durationInFrames={duration}
+          >
+            <HookCard text={element.text} />
+          </Sequence>
+        );
+      })}
 
       {/* Quote text — mode-specific overlay */}
       {quotes.map((element, index) => {
@@ -424,6 +447,83 @@ const AphorismOverlay: React.FC<{ text: string }> = ({ text }) => {
   );
 };
 
+// HookCard — Short Cut payoff card. Shown for the first ~3s while the hook
+// is spoken, then handed off to MonologueOverlay for the body scroll. Reuses
+// the AphorismOverlay box language (dark rounded box, Georgia serif, white
+// bold italic) so the look is identical to the rest of the channel — just a
+// touch larger for impact and with a snappier punch-in entrance. No curly
+// quotes: a hook reads cleaner unquoted.
+function hookFontSize(words: number): number {
+  if (words <= 8) return 76;
+  if (words <= 11) return 68;
+  return 60; // up to ~14 words
+}
+
+const HookCard: React.FC<{ text: string }> = ({ text }) => {
+  const frame = useCurrentFrame();
+  const { fps, durationInFrames } = useVideoConfig();
+
+  // Snappy punch-in: scale 0.9 -> 1 + fade over ~8 frames.
+  const enter = spring({
+    frame,
+    fps,
+    config: { damping: 180, stiffness: 120 },
+    durationInFrames: 8,
+  });
+
+  const fadeOutFrames = Math.min(12, Math.floor(durationInFrames / 4));
+  const fadeOut = interpolate(
+    frame,
+    [durationInFrames - fadeOutFrames, durationInFrames],
+    [1, 0],
+    { extrapolateLeft: "clamp", extrapolateRight: "clamp" },
+  );
+
+  const opacity = Math.min(interpolate(enter, [0, 1], [0, 1]), fadeOut);
+  const scaleVal = interpolate(enter, [0, 1], [0.9, 1]);
+
+  const wordCount = text.split(/\s+/).filter(Boolean).length;
+  const fontSize = hookFontSize(wordCount);
+  const lineHeight = Math.round(fontSize * 1.3);
+
+  return (
+    <AbsoluteFill
+      style={{
+        zIndex: 16,
+        justifyContent: "center",
+        alignItems: "center",
+        padding: "0 50px",
+      }}
+    >
+      <div
+        style={{
+          backgroundColor: "rgba(0, 0, 0, 0.5)",
+          borderRadius: 16,
+          padding: "52px 56px",
+          maxWidth: "92%",
+          opacity,
+          transform: `scale(${scaleVal})`,
+        }}
+      >
+        <div
+          style={{
+            fontSize,
+            lineHeight: `${lineHeight}px`,
+            color: "white",
+            fontFamily: "Georgia, serif",
+            fontWeight: "bold",
+            fontStyle: "italic",
+            textAlign: "center",
+            textShadow: "0 2px 8px rgba(0,0,0,0.6)",
+          }}
+        >
+          {text}
+        </div>
+      </div>
+    </AbsoluteFill>
+  );
+};
+
 // MonologueOverlay — used for NA/AA shorts.
 //
 // Fixed-height dark box with a top + bottom alpha fade. Long character
@@ -459,7 +559,13 @@ const QUOTE_BOTTOM_PAD = 60;
 const QUOTE_BOX_TOP_OFFSET = 160;
 const QUOTE_SCROLL_START_PCT = 0.08;
 const QUOTE_SCROLL_END_PCT = 0.92;
-const WORDS_PER_LINE = 6;
+// WORDS_PER_LINE removed 2026-05-04. The 6-words-per-line heuristic
+// under-estimated wrap (real fit is ~4–5 words at QUOTE_FONT=50, italic
+// Georgia, QUOTE_H_PAD=52), so scrollDistance came up 200–350px short and
+// the last sentence on long NA/AA monologues never reached view. Replaced
+// by a DOM measurement (scrollHeight via useLayoutEffect) inside
+// MonologueOverlay; a deliberately over-estimating local heuristic
+// (HEURISTIC_WPL=4) is kept inline as the frame-zero fallback.
 const LINE_PAD_EXTRA = 1;
 
 const MonologueOverlay: React.FC<{ text: string }> = ({ text }) => {
@@ -486,10 +592,52 @@ const MonologueOverlay: React.FC<{ text: string }> = ({ text }) => {
 
   const quoted = `“${text}”`;
 
-  // Word-count based line estimate. Robust against fitText oddities.
+  // --- Heuristic fallback (only used on frame 0 before useLayoutEffect runs) ---
+  // The old WORDS_PER_LINE=6 estimate UNDER-counted lines because the italic
+  // Georgia font at QUOTE_H_PAD=52 actually fits ~4–5 words/line. Tuned to 4
+  // so the heuristic now OVER-estimates rather than under-estimates: the DOM
+  // measurement supersedes it on every subsequent frame, and an over-estimate
+  // on frame 0 is harmless because frame 0 sits before scrollStart and the
+  // interpolate clamps scrollY to 0 there anyway.
   const wordCount = quoted.split(/\s+/).filter(Boolean).length;
-  const estimatedLines = Math.ceil(wordCount / WORDS_PER_LINE) + LINE_PAD_EXTRA;
-  const textHeight = estimatedLines * QUOTE_FONT * QUOTE_LINE_RATIO;
+  const HEURISTIC_WPL = 4;
+  const estimatedLines =
+    Math.ceil(wordCount / HEURISTIC_WPL) + LINE_PAD_EXTRA;
+  const heuristicTextHeight = estimatedLines * QUOTE_FONT * QUOTE_LINE_RATIO;
+
+  // --- DOM measurement (authoritative) ---
+  // We attach a ref to the inner scrolling <div> and read its scrollHeight in
+  // useLayoutEffect, which fires synchronously after DOM mutation but BEFORE
+  // paint, in both the live preview (browser) and Remotion's headless Chrome
+  // renderer. After mount the measurement is committed to state and reused
+  // for every subsequent frame in this render — Remotion does NOT remount per
+  // frame, it advances `frame` and re-runs the function body with state intact.
+  //
+  // Frame-zero analysis: on frame 0 the measurement state is still 0 because
+  // the layout effect runs after the first render returns. We fall back to
+  // heuristicTextHeight there. With QUOTE_SCROLL_START_PCT=0.08, frame 0 sits
+  // well before scrollStart, so the interpolate clamps scrollY to 0 regardless
+  // of which textHeight value was used — no visible jitter. The heuristic is
+  // also tuned to over-estimate (see above) so even a hypothetical scroll
+  // computed on frame 0 would fail safely (over-scroll, not under-scroll).
+  const textRef = useRef<HTMLDivElement>(null);
+  const [measuredTextHeight, setMeasuredTextHeight] = useState(0);
+
+  useLayoutEffect(() => {
+    if (textRef.current) {
+      const h = textRef.current.scrollHeight;
+      // Guard against pre-paint readings (scrollHeight=0) in any odd CSS
+      // edge case — keep the previous good value rather than collapsing scroll.
+      if (h > 0) {
+        setMeasuredTextHeight(h);
+      }
+    }
+  }, [quoted]);
+
+  // Use the measured height when available; fall back to the (deliberately
+  // over-estimating) heuristic on frame 0 only.
+  const textHeight =
+    measuredTextHeight > 0 ? measuredTextHeight : heuristicTextHeight;
 
   const visibleHeight = QUOTE_BOX_HEIGHT - QUOTE_TOP_PAD - QUOTE_BOTTOM_PAD;
   const scrollDistance = Math.max(0, textHeight - visibleHeight);
@@ -543,6 +691,7 @@ const MonologueOverlay: React.FC<{ text: string }> = ({ text }) => {
         }}
       >
         <div
+          ref={textRef}
           style={{
             fontSize: QUOTE_FONT,
             lineHeight: `${Math.round(QUOTE_FONT * QUOTE_LINE_RATIO)}px`,

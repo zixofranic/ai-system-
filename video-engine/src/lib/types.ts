@@ -47,6 +47,7 @@ const TextElementSchema = TimelineElementSchema.extend({
       z.literal("attribution"),
       z.literal("narration"),
       z.literal("chapter-title"),
+      z.literal("hook"),
     ])
     .optional(),
   attribution: z.string().optional(),
@@ -58,6 +59,17 @@ const AudioElementSchema = TimelineElementSchema.extend({
   audioUrl: z.string(),
 });
 
+// Theme — opt-in cinematic styling for Gibran-channel renders. When
+// `cinematic: true`, components swap from the default Hormozi-style look
+// (BreeSerif uppercase, white text, thick black stroke) to the cinematic
+// look (EB Garamond italic, aged-paper text, thin stroke). Default is
+// false so Wisdom and NA renders keep their original style. Added
+// 2026-04-19 to fix the silent restyle that universally applied Gibran
+// styling to all channels.
+const ThemeSchema = z.object({
+  cinematic: z.boolean().optional(),
+}).optional();
+
 const MetadataSchema = z.object({
   format: z.string().optional(),
   width: z.number().optional(),
@@ -68,6 +80,7 @@ const MetadataSchema = z.object({
   closingAttribution: z.string().optional(),
   watermark: z.string().optional(),
   equalizerColor: z.string().optional(),
+  theme: ThemeSchema,
 });
 
 const TimelineSchema = z.object({
