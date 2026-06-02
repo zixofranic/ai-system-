@@ -2681,10 +2681,12 @@ def process_short(content: dict):
     # --- Step 7b: Generate thumbnail ---
     thumb_drive_url = None
     thumb_storage_path = None
+    yt_thumb_storage_path = None
     try:
         from thumbnail_generator import (generate_thumbnail,
                                           generate_thumbnail_from_video,
-                                          generate_text_only_thumbnail)
+                                          generate_text_only_thumbnail,
+                                          generate_youtube_thumbnail)
         thumb_path = video_path.replace(".mp4", "_thumb.jpg")
         if channel_slug in TEXT_ONLY_THUMBNAIL_CHANNELS:
             generate_text_only_thumbnail(title, thumb_path, 1080, 1920, channel_slug)
@@ -2709,6 +2711,26 @@ def process_short(content: dict):
             if channel.get("google_drive_folder_id") and drive_url:
                 thumb_drive_url = upload_to_drive(thumb_path, channel)
         print(f"  [thumb] {thumb_path}")
+
+        # --- 16:9 YouTube thumbnail (shorts are 9:16; YouTube custom
+        #     thumbnails MUST be 16:9 or they render broken/black — see
+        #     2026-06-02 diagnosis). Build a 1280x720 companion the
+        #     uploader prefers; the 9:16 portrait above stays for the
+        #     dashboard. Derived `_thumb_yt.jpg` path -> no DB column. ---
+        try:
+            yt_thumb_path = video_path.replace(".mp4", "_thumb_yt.jpg")
+            if channel_slug in TEXT_ONLY_THUMBNAIL_CHANNELS:
+                generate_text_only_thumbnail(title, yt_thumb_path, 1280, 720, channel_slug)
+            elif art_path:
+                generate_youtube_thumbnail(art_path, title, yt_thumb_path, channel_slug)
+            else:
+                yt_thumb_path = None
+            if yt_thumb_path and Path(yt_thumb_path).exists():
+                yt_thumb_storage_path = upload_thumb(
+                    yt_thumb_path, "wisdom-thumbnails", channel_slug, "short")
+                print(f"  [thumb] 16:9 YouTube thumb: {yt_thumb_storage_path}")
+        except Exception as yt_e:
+            print(f"  [thumb] 16:9 YouTube thumb failed (non-fatal): {yt_e}")
     except Exception as e:
         print(f"  [thumb] WARNING: {e}")
 

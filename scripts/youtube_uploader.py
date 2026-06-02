@@ -374,9 +374,13 @@ def _youtube_set_thumbnail(access_token: str, video_id: str,
     when thumbnail upload fails — the video is up, that's the win.
 
     YouTube API: POST upload/youtube/v3/thumbnails/set?videoId={id} with
-    image bytes. Max 2MB, JPEG or PNG, 16:9 ratio recommended for Standard
-    but Shorts are 9:16 — YouTube accepts either and pillars/letterboxes
-    as needed.
+    image bytes. Max 2MB, JPEG or PNG.
+
+    ASPECT: the image MUST be 16:9 (1280x720). A 9:16 portrait returns 200
+    here (the endpoint only validates size/format/bytes) but then FAILS
+    YouTube's derivative pipeline — gray broken icon in Studio, black poster
+    on the channel grid (2026-06-02). Callers must pass a 16:9 image; the
+    orchestrator builds a `_thumb_yt.jpg` 1280x720 companion for shorts.
 
     Returns True on success.
     """
@@ -646,30 +650,53 @@ def upload_to_youtube(content_id: str, dry_run: bool = False) -> str:
         raise RuntimeError(err)
 
     # --- 5b. Upload custom thumbnail (best-effort) ---
-    # The orchestrator already generates a PIL thumbnail (scene art + dark
-    # bottom gradient + Georgia bold title overlay) and uploads it to the
-    # wisdom-thumbnails Supabase bucket. Without sending it to YouTube
-    # explicitly, YT auto-generates from a video frame — for NA/AA shorts
-    # that means dark scrolling-text walls (every thumbnail looks identical
-    # and unscannable in the channel grid).
+    # The orchestrator generates a PIL thumbnail (scene art + dark bottom
+    # gradient + Georgia bold title) and uploads it to the wisdom-thumbnails
+    # bucket. Without sending it to YouTube explicitly, YT auto-generates
+    # from a video frame — for NA/AA shorts that means dark scrolling-text
+    # walls (every thumbnail looks identical and unscannable in the grid).
     #
-    # Wrapped in try/except: custom thumbnails on Shorts can be limited by
-    # channel verification status, and a thumbnail failure should not
-    # invalidate a successful video publish. Logged for follow-up.
+    # ASPECT RATIO MATTERS (2026-06-02): YouTube custom thumbnails MUST be
+    # 16:9. The dashboard/storage thumbnail for a short is 9:16 portrait —
+    # thumbnails.set returns 200 on it but YouTube then fails to build the
+    # derivatives (gray broken icon in Studio, black poster on the channel
+    # grid). The orchestrator now also writes a 1280x720 companion at the
+    # same storage path with `_thumb.jpg` -> `_thumb_yt.jpg`. Prefer that
+    # 16:9 file; fall back to the portrait only if the 16:9 isn't there.
+    #
+    # Wrapped in try/except: a thumbnail failure should never invalidate a
+    # successful video publish.
     thumb_storage_path = content.get("thumbnail_storage_path")
     if thumb_storage_path:
-        try:
-            from supabase_storage import download_from_storage as dl_thumb
-            tmp_thumb = str(tmp_dir / f"{content_id[:8]}_thumb.jpg")
-            dl_thumb("wisdom-thumbnails", thumb_storage_path, tmp_thumb)
-            _youtube_set_thumbnail(yt_access_token, video_id, tmp_thumb)
+        from supabase_storage import download_from_storage as dl_thumb
+        yt_path = thumb_storage_path.replace("_thumb.jpg", "_thumb_yt.jpg")
+        # Prefer the 16:9 companion; fall back to the portrait if missing.
+        candidates = []
+        if yt_path != thumb_storage_path:
+            candidates.append(("16:9", yt_path))
+        candidates.append(("portrait-fallback", thumb_storage_path))
+        set_ok = False
+        for label, path in candidates:
             try:
-                Path(tmp_thumb).unlink(missing_ok=True)
+                tmp_thumb = str(tmp_dir / f"{content_id[:8]}_thumb.jpg")
+                dl_thumb("wisdom-thumbnails", path, tmp_thumb)
             except Exception:
-                pass
-        except Exception as thumb_e:
-            print(f"  [yt] WARN: thumbnail upload failed ({thumb_e}); "
-                  f"video published anyway, YT will auto-generate from frame")
+                continue  # not present (e.g. older row has no _yt) — try next
+            try:
+                _youtube_set_thumbnail(yt_access_token, video_id, tmp_thumb)
+                print(f"  [yt] custom thumbnail set ({label}).")
+                set_ok = True
+                break
+            except Exception as thumb_e:
+                print(f"  [yt] WARN: thumbnail set failed on {label} ({thumb_e})")
+            finally:
+                try:
+                    Path(tmp_thumb).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        if not set_ok:
+            print(f"  [yt] thumbnail not set; video published anyway, "
+                  f"YT will auto-generate from frame")
     else:
         print(f"  [yt] No thumbnail_storage_path on row; YT will auto-generate")
 
