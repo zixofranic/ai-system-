@@ -38,6 +38,7 @@ from orchestrator import (
     EQUALIZER_COLORS,
     PERSONA_TO_LORA,
     _get_philosopher_style,
+    _normalize_for_chatterbox,
     generate_art,
     generate_voice,
     pick_music,
@@ -157,6 +158,27 @@ def render_cinematic_essay(
     full_narration, scene_timings, timestamps_path.
     """
     work_dir.mkdir(parents=True, exist_ok=True)
+
+    # 0) Normalize narration ONCE, up front, so captions, scene timing,
+    #    and voice all draw from the same clean text.
+    #
+    #    Why this lives here and not only inside generate_voice: the voice
+    #    path normalizes internally (via _chatterbox_pause_hints), but the
+    #    CAPTION path (whisper alignment + the story_script written to the
+    #    Remotion converter) used the RAW scene narration. Result, observed
+    #    2026-06-01 on "The Seven Habits of Abundance": clean audio but
+    #    captions reading `--- ## [00:00] — INVOCATION Come and sit…` with
+    #    the markdown shell baked in, plus mistimed flashes from the
+    #    timestamp tokens. Cleaning each scene's narration here fixes all
+    #    three consumers at once. The art `direction` field is left
+    #    untouched (it feeds the SDXL prompt, not the spoken/caption text).
+    #
+    #    _normalize_for_chatterbox is idempotent, so the later
+    #    generate_voice → _chatterbox_pause_hints pass is a harmless no-op
+    #    on already-clean text.
+    for s in scenes:
+        if s.get("narration"):
+            s["narration"] = _normalize_for_chatterbox(s["narration"]).strip()
 
     # 1) Art per scene
     art_paths = [str(work_dir / f"art_{i+1}.png") for i in range(len(scenes))]

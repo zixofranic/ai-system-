@@ -87,7 +87,8 @@ def _fetch(content_id: str) -> dict:
 
 
 def _build_script_from_custom_prompt(
-    custom_text: str, target_seconds: int, title: str = None
+    custom_text: str, target_seconds: int, title: str = None,
+    channel_slug: str = "gibran",
 ) -> dict:
     """Format adapter for the Custom Prompts dashboard tile.
 
@@ -97,6 +98,10 @@ def _build_script_from_custom_prompt(
     art directions are auto-generated, anchored to each scene's opening
     words so SDXL paints something topical without any interpreter changing
     the text.
+
+    Scene packing: adjacent paragraphs are merged so each scene's spoken
+    narration lasts ~5-8 sec. Without this, a paste with many short
+    paragraphs produces too many scenes that flash by in 2-4 sec each.
     """
     import re
     text = custom_text.replace("\r\n", "\n").strip()
@@ -111,6 +116,43 @@ def _build_script_from_custom_prompt(
         target_scene_count = max(3, min(20, round(target_seconds / 35)))
         per = max(1, (len(sentences) + target_scene_count - 1) // target_scene_count)
         paragraphs = [" ".join(sentences[i:i + per]) for i in range(0, len(sentences), per)]
+
+    # Scene packing: merge adjacent paragraphs to target ~24-30 sec per scene.
+    # Math mirrors the dashboard's voice-duration estimator
+    # (src/lib/voice-duration.ts): native Chatterbox ~175 WPM, then divided
+    # by per-channel atempo (gibran=0.80, na/aa=0.85, wisdom=1.0). The
+    # constants must stay in sync with CHANNEL_VOICE in orchestrator.py.
+    # Target raised from 5-8s to 24-30s on 2026-05-03 — earlier value made
+    # scenes flash too fast; cinematic essay reads better with longer holds.
+    CHATTERBOX_NATIVE_WPM = 175.0
+    CHANNEL_ATEMPO = {"gibran": 0.80, "na": 0.85, "aa": 0.85, "wisdom": 1.0}
+    TARGET_SCENE_SECONDS = 20.0
+    MAX_SCENE_SECONDS = 25.0
+    atempo = CHANNEL_ATEMPO.get(channel_slug, 0.85)
+
+    def _est_seconds(t: str) -> float:
+        words = max(1, len(t.split()))
+        return (words / CHATTERBOX_NATIVE_WPM) * 60.0 / atempo
+
+    merged: list[str] = []
+    cur = ""
+    cur_sec = 0.0
+    for p in paragraphs:
+        p_sec = _est_seconds(p)
+        # Start a new scene if (a) nothing buffered, OR
+        # (b) adding this paragraph would push the buffer over MAX, OR
+        # (c) the buffer already met the per-scene target.
+        if not cur or (cur_sec + p_sec > MAX_SCENE_SECONDS) or (cur_sec >= TARGET_SCENE_SECONDS):
+            if cur:
+                merged.append(cur)
+            cur = p
+            cur_sec = p_sec
+        else:
+            cur = cur + "\n\n" + p
+            cur_sec += p_sec
+    if cur:
+        merged.append(cur)
+    paragraphs = merged
 
     # Cap at 40 scenes — merge adjacent paragraphs if the paste was very dense.
     # Join with "\n\n" so the user's paragraph breaks survive in the merged
@@ -242,17 +284,13 @@ def main():
     queued_title = row.get("title")
 
     # ---- Aspect ----
-    # Default: infer from duration (2-3 min → PORTRAIT, 10-20 min → LANDSCAPE).
-    # Override: generation_params.force_aspect ('landscape'|'portrait')
-    # is set by the Gibran Generate modal so the user can lock a 2-3 min
-    # midform to landscape (cinematic intro + per-scene art look).
-    forced = (gp.get("force_aspect") or "").strip().lower()
-    if forced == "landscape":
-        is_portrait = False
-    elif forced == "portrait":
-        is_portrait = True
-    else:
-        is_portrait = target_seconds <= 180
+    # Pasted essays default to LANDSCAPE (16:9, renders WITH an intro). Aspect is
+    # a deliberate choice, NOT inferred from estimated duration — the old
+    # `target_seconds <= 180` heuristic forced a ~5-min essay into 9:16 no-intro
+    # shorts mode ("Never Known Life Without You" bug, 2026-05-26). Set
+    # generation_params.force_aspect='portrait' for an intentional 9:16 vertical.
+    from pipeline_routing import resolve_aspect
+    is_portrait = resolve_aspect(gp.get("force_aspect"))
     art_aspect = PORTRAIT if is_portrait else LANDSCAPE
     render_format = "story_vertical" if is_portrait else "story"
 
@@ -302,6 +340,7 @@ def main():
                 custom_text=custom_prompt,
                 target_seconds=target_seconds,
                 title=queued_title,
+                channel_slug=slug,
             )
             script["_source_passages"] = []
             log_step(cid, "quote", 1, "success")
@@ -418,6 +457,9 @@ def main():
             new_params["custom_prompt_source"] = custom_prompt
     updates = {
         "status": "ready",
+        # Persist the format the pipeline actually rendered so the row matches the
+        # video (the dashboard may have stored a duration-guessed 'story_vertical').
+        "format": render_format,
         "quote_text": full_quote,
         "title": title,
         "description": script.get("description", ""),
