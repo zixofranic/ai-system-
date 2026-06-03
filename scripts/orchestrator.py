@@ -3071,6 +3071,14 @@ def _batch_process(items: list):
 
             previous = _fetch_recent_quotes(philosopher)
 
+            # Short Cut state — populated only for NA/AA short_cut rows below.
+            # Initialised per-iteration so the results dict can carry them
+            # for every row (False/"" for non-short-cut). See render_remotion
+            # do_short_cut: BOTH short_cut=True and a non-empty hook are
+            # required to collapse the intro pad to 300ms.
+            is_short_cut = False
+            sc_hook = ""
+
             if content_type == "short":
                 _slug = content["channels"]["slug"]
                 recovery_script = None
@@ -3081,14 +3089,22 @@ def _batch_process(items: list):
                     # process_short() is only reached when orchestrator is
                     # invoked with CLI args, not via the poller's batch path.
                     from ai_writer import generate_recovery_short_script
+                    _ws = _resolve_writing_style(content)
+                    _is_sc = (_ws == "short_cut")
+                    # Short Cut targets 38s (hook-first); full targets 60s.
                     recovery_script = generate_recovery_short_script(
                         philosopher, topic, _slug,
-                        target_seconds=60, previous_quotes=previous,
+                        target_seconds=(38 if _is_sc else 60), previous_quotes=previous,
                         recent_hits=_fetch_top_hit_titles(_slug),
-                        style=_resolve_writing_style(content),
+                        style=_ws,
                     )
                     quote = sanitize_quote(recovery_script.get("quote", ""))
-                    print(f"  [{cid[:8]}] [quote] Opus {_slug} short: {len(quote.split())} words")
+                    is_short_cut = bool(recovery_script.get("is_short_cut"))
+                    sc_hook = sanitize_quote(recovery_script.get("hook", "")) if is_short_cut else ""
+                    if is_short_cut:
+                        print(f"  [{cid[:8]}] [short-cut] hook: {sc_hook!r} | body {len(quote.split())} words")
+                    else:
+                        print(f"  [{cid[:8]}] [quote] Opus {_slug} short: {len(quote.split())} words")
                 else:
                     quote = sanitize_quote(content.get("quote_text") or "")
                     if not quote or quote.lower() in ("pending generation", "pending"):
@@ -3137,6 +3153,12 @@ def _batch_process(items: list):
                 "art_prompts": art_prompts,
                 "content": content,
                 "work": work,
+                # Short Cut (NA/AA 45s): carried into voice + render phases so
+                # the hook is spoken first AND render_remotion collapses the
+                # intro pad. Without these the batch path renders a 2.5s silent
+                # lead-in (the bug that made 45s shorts open on dead air).
+                "is_short_cut": is_short_cut,
+                "sc_hook": sc_hook,
             }
             print(f"  [{cid[:8]}] {len(quotes)} quote(s) ready")
 
@@ -3221,6 +3243,12 @@ def _batch_process(items: list):
                 if i < len(narration_segments) and narration_segments[i]:
                     narration = narration_segments[i].strip() + " "
                 full_text = narration + quote
+                # Short Cut: voice the hook FIRST, as one continuous file with
+                # the body, so the open lands on the payoff. Shorts are a
+                # single clip (i==0); render_remotion splits the on-screen
+                # hook card from the body by word proportion.
+                if data.get("is_short_cut") and i == 0 and data.get("sc_hook"):
+                    full_text = f"{data['sc_hook']} {full_text}".strip()
                 voice_path = str(work / f"voice_{i}.wav")
                 generate_voice(full_text, voice_path,
                                channel_slug=channel_slug,
@@ -3402,6 +3430,11 @@ def _batch_process(items: list):
                     narration_segments=data.get("narration_segments"),
                     equalizer_color=eq_color,
                     watermark=watermark_for_channel(channel_slug),
+                    # Short Cut (NA/AA 45s): collapse the 2.5s intro pad to
+                    # 0.3s, show the hook card first, enforce the 45s ceiling.
+                    # Empty hook leaves the default full-length behavior.
+                    short_cut=data.get("is_short_cut", False),
+                    hook=data.get("sc_hook", ""),
                 )
             log_step(cid, "video", 4, "success")
 
