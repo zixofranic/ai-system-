@@ -135,7 +135,7 @@ def _copy_and_loop_music(music_path: str, dst: str, voice_paths: list):
 
 def _build_short_timeline(
     quotes, philosopher, voice_durations_ms, title, watermark, channel_slug,
-    equalizer_color=None, short_cut=False, hook="",
+    equalizer_color=None, short_cut=False, hook="", max_content_ms=None,
 ):
     """Build timeline for a single-quote short video.
 
@@ -186,10 +186,13 @@ def _build_short_timeline(
     ]
 
     if do_short_cut:
-        # --- Duration guard: warn/fail if content runs past the ceiling. ---
-        if total_ms > SHORT_CUT_MAX_CONTENT_MS:
+        # --- Duration guard: warn if content runs past the variant ceiling
+        # (27s quick_cut / 45s short_cut; callers pass it via max_content_ms,
+        # falling back to the legacy 45s constant). ---
+        ceiling_ms = max_content_ms or SHORT_CUT_MAX_CONTENT_MS
+        if total_ms > ceiling_ms:
             print(f"  [short-cut] WARNING: content is {total_ms/1000:.1f}s, "
-                  f"over the {SHORT_CUT_MAX_CONTENT_MS/1000:.0f}s ceiling. "
+                  f"over the {ceiling_ms/1000:.0f}s ceiling. "
                   f"Script is too long — shorten the body.")
 
         # Split the voice span at the hook/body boundary by word proportion.
@@ -394,8 +397,11 @@ def render_remotion_video(
     # Short Cut mode (NA/AA retention format). When short_cut=True and a
     # non-empty hook is given, the short timeline collapses the intro pad,
     # adds a hook card in the first ~3s, and offsets the body scroll.
+    # short_cut_max_ms sets the variant content ceiling (27000 quick_cut /
+    # 45000 short_cut); None falls back to the legacy 45s constant.
     short_cut: bool = False,
     hook: str = "",
+    short_cut_max_ms: int = None,
     # Ignored (kept for call-site compatibility)
     aspect_ratio: str = None,
     channel_name: str = None,
@@ -469,7 +475,7 @@ def render_remotion_video(
         timeline = _build_short_timeline(
             quotes, philosopher, voice_durations_ms, title, watermark, channel_slug,
             equalizer_color=equalizer_color,
-            short_cut=short_cut, hook=hook,
+            short_cut=short_cut, hook=hook, max_content_ms=short_cut_max_ms,
         )
     else:
         timeline = _build_multipart_timeline(

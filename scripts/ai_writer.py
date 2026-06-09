@@ -297,18 +297,26 @@ def push_weekly_plan_to_supabase(plan: list, channel_map: dict = None) -> str:
         tp_data = tp_resp.json()
         tp_id = tp_data[0]["id"] if isinstance(tp_data, list) else tp_data.get("id")
 
-        # Create matching content row (so it shows on the Plan page)
+        # Create matching content row (so it shows on the Plan page).
+        # Topics get the no-dash treatment here so a planner slip can't
+        # put an em dash into a published title later.
+        clean_topic = _no_dashes(item.get("topic", ""))
         content_payload = {
             "channel_id": channel_id,
-            "title": item.get("topic", ""),
+            "title": clean_topic,
             "philosopher": philosopher,
-            "topic": item.get("topic", ""),
+            "topic": clean_topic,
             "quote_text": None,
             "format": fmt,
             "status": "planned",
             "scheduled_at": scheduled_date + "T09:00:00Z",
             "is_system_generated": True,
         }
+        # NA/AA shorts default to the 22s hook-first cut (2026-06-09).
+        # Stamped explicitly so the dashboard shows the style per row;
+        # the orchestrator resolver also defaults to quick_cut as backstop.
+        if fmt == "short" and channel_slug in ("na", "aa"):
+            content_payload["writing_style"] = "quick_cut"
         if tp_id:
             content_payload["plan_topic_id"] = tp_id
         content_resp = requests.post(
@@ -916,6 +924,33 @@ Output JSON ONLY, no preamble, no code fences:
 }}{dedup}"""
 
 
+def _no_dashes(text: str) -> str:
+    """House rule (Ziad): no em/en dashes in ANYTHING we publish.
+
+    Replaces them with a comma + space, the closest natural read for both
+    the eye and TTS. Applied to every published field (title, description,
+    hook, body) so a model slip can never reach YouTube.
+    """
+    if not text:
+        return text
+    for dash in ("—", "–"):  # em dash, en dash
+        text = text.replace(f" {dash} ", ", ").replace(dash, ", ")
+    return text
+
+
+def _clean_published_title(title: str) -> str:
+    """Sanitize a YouTube title before it can reach the DB/uploader.
+
+    - strips em/en dashes (house rule)
+    - strips legacy '| Philosophy...' style suffixes (library-speak that
+      wastes title space in the Shorts feed and reads as a content
+      catalogue, not a hook)
+    """
+    t = _no_dashes(title or "").strip()
+    t = re.sub(r"\s*\|\s*Philosophy.*$", "", t, flags=re.IGNORECASE).strip()
+    return t
+
+
 def generate_recovery_short_script(persona: str, topic: str,
                                    channel_slug: str,
                                    target_seconds: int = 40,
@@ -936,10 +971,13 @@ def generate_recovery_short_script(persona: str, topic: str,
         channel_slug: "na" or "aa"
         target_seconds: target narration duration; drives word count target
         previous_quotes: recent outputs to dedupe against
-        style: 'in_character' (default — first-person archetype monologue),
-            'narrator' (third-person reflective voice ABOUT recovery), or
+        style: 'in_character' (first-person archetype monologue),
+            'narrator' (third-person reflective voice ABOUT recovery),
             'short_cut' (hook-first 30-45s retention format — returns an
-            extra `hook` field; see _recovery_short_shortcut_system).
+            extra `hook` field; see _recovery_short_shortcut_system), or
+            'quick_cut' (same hook-first shape but tighter: ~22s target /
+            27s ceiling — the DEFAULT for NA/AA shorts since 2026-06-09;
+            zero-gravity channels live or die on completion rate).
         source_script: only used by style='short_cut'. If provided, the
             piece is COMPRESSED from this existing longer narration rather
             than generated fresh from the topic — used for before/after
@@ -951,9 +989,10 @@ def generate_recovery_short_script(persona: str, topic: str,
     For style='short_cut', also includes `hook` (the payoff line) and
     `is_short_cut: True`.
     """
-    if style not in ("in_character", "narrator", "short_cut"):
+    if style not in ("in_character", "narrator", "short_cut", "quick_cut"):
         raise ValueError(
-            f"style='{style}' invalid; must be 'in_character', 'narrator', or 'short_cut'"
+            f"style='{style}' invalid; must be 'in_character', 'narrator', "
+            f"'short_cut', or 'quick_cut'"
         )
 
     persona_voice = _RECOVERY_PERSONA_VOICES.get(
@@ -968,14 +1007,15 @@ def generate_recovery_short_script(persona: str, topic: str,
     # Word targets: ~150 wpm conversational; allow headroom on both sides.
     # For short_cut, the body target is the TOTAL (hook + body) budget, so
     # the body floor/ceiling are pulled in tighter to leave room for the hook.
-    if style == "short_cut":
+    if style in ("short_cut", "quick_cut"):
         # Chatterbox NA voice measured at ~156 wpm (2026-06-01 dry-run).
         # Body budget is deliberately tight so that even a heavy Opus
-        # overshoot stays under the 45s content ceiling once the hook
-        # (~11 words) + 2.5s endcard are added. 38s -> body 52-72 words
-        # (~62 center) -> ~73-word narration -> ~30s voice -> ~34s file.
-        low = int(target_seconds * 1.4)   # 38s -> ~52 words
-        high = int(target_seconds * 1.9)  # 38s -> ~72 words
+        # overshoot stays under the content ceiling once the hook
+        # (~11 words) + 2.5s endcard are added.
+        #   short_cut: 38s -> body 52-72 words (~62 center) -> ~34s file.
+        #   quick_cut: 22s -> body 30-41 words (~35 center) -> ~20s file.
+        low = int(target_seconds * 1.4)
+        high = int(target_seconds * 1.9)
     else:
         low = int(target_seconds * 2.2)   # 40s -> ~88 words floor
         high = int(target_seconds * 2.9)  # 40s -> ~116 words ceiling
@@ -1007,7 +1047,7 @@ def generate_recovery_short_script(persona: str, topic: str,
         "verbatim transcription of the topic phrase."
     )
 
-    if style == "short_cut":
+    if style in ("short_cut", "quick_cut"):
         system = _recovery_short_shortcut_system(
             persona, persona_voice, channel_cue, low, high, center,
             target_seconds, dedup, recent_hits_block=recent_hits_block,
@@ -1058,19 +1098,21 @@ TOPIC:
         raise ValueError(f"Opus returned empty quote for {persona}/{topic}")
 
     hook = (parsed.get("hook") or "").strip()
-    if style == "short_cut" and not hook:
-        raise ValueError(f"short_cut style returned no hook for {persona}/{topic}")
+    if style in ("short_cut", "quick_cut") and not hook:
+        raise ValueError(f"{style} style returned no hook for {persona}/{topic}")
 
     # Normalise to the shape process_short expects: it reads `quote` + metadata,
     # then builds title/description from a SEPARATE Haiku call. We want to skip
     # that here (Opus already wrote them), so return the full dict and let the
     # orchestrator short-circuit the metadata step for na/aa.
     return {
-        "quote": quote,
-        "hook": hook,                       # short_cut only; "" for other styles
-        "is_short_cut": style == "short_cut",
-        "title": parsed.get("title") or f"{persona}: {topic[:40]}",
-        "description": parsed.get("description", ""),
+        "quote": _no_dashes(quote),
+        "hook": _no_dashes(hook),           # cut styles only; "" otherwise
+        "is_short_cut": style in ("short_cut", "quick_cut"),
+        "title": _clean_published_title(
+            parsed.get("title") or f"{persona}: {topic[:40]}"
+        ),
+        "description": _no_dashes(parsed.get("description", "")),
         "tags": parsed.get("tags", ["recovery", "daily meditation", topic]),
         "thumbnail_text": parsed.get("thumbnail_text", ""),
         "music_mood": parsed.get("music_mood", "contemplative"),

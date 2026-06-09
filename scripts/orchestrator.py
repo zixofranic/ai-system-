@@ -396,7 +396,7 @@ def _resolve_writing_style(content: dict, channel_default: str = "in_character")
          pre-existing default behavior)
     """
     style = content.get("writing_style")
-    if style in ("in_character", "narrator", "short_cut"):
+    if style in ("in_character", "narrator", "short_cut", "quick_cut"):
         return style
     legacy = content.get("gibran_essay_voice")
     if legacy == "narrator":
@@ -404,6 +404,19 @@ def _resolve_writing_style(content: dict, channel_default: str = "in_character")
     if legacy == "prophet_voice":
         return "in_character"
     return channel_default
+
+
+# Hook-first retention variants for NA/AA shorts (2026-06-09). Channel data
+# said it plainly: 90-120s monologues died at ~6s (8-36% viewed), and views
+# never left the 85-180 sandbox. Completion rate is the only door out, so
+# the DEFAULT is the tighter cut. short_cut (the 2026-06-02 original) stays
+# available per-row for A/B against quick_cut.
+SHORT_CUT_VARIANTS = {
+    "quick_cut": {"target_s": 22, "max_ms": 27000},  # DEFAULT for na/aa shorts
+    "short_cut": {"target_s": 38, "max_ms": 45000},
+}
+# Default writing style for NA/AA shorts when the row doesn't set one.
+NA_AA_SHORT_DEFAULT_STYLE = "quick_cut"
 
 
 def _normalize_for_chatterbox(text: str) -> str:
@@ -2524,24 +2537,30 @@ def process_short(content: dict):
     # Wisdom/Gibran keep the Ollama quote -> Haiku metadata pipeline.
     log_step(content_id, "quote", 1, "running")
     na_art_scene_hint = None
-    # short_cut state — populated only when writing_style == "short_cut".
+    # short_cut state — populated only for the hook-first cut variants.
     is_short_cut = False
     sc_hook = ""
+    sc_max_ms = None
     try:
         if channel_slug in ("na", "aa"):
             from ai_writer import generate_recovery_short_script
             previous = _fetch_recent_quotes(philosopher)
             recent_hits = _fetch_top_hit_titles(channel_slug)
-            writing_style = _resolve_writing_style(content)
-            # SHORT CUT (writing_style="short_cut"): 38s hook-first retention
-            # format. The default long format keeps target_seconds=60 ->
-            # ~130-175 words for the scrolling monologue.
-            if writing_style == "short_cut":
-                sc_target = 38
+            writing_style = _resolve_writing_style(
+                content, channel_default=NA_AA_SHORT_DEFAULT_STYLE
+            )
+            # Hook-first cut variants (see SHORT_CUT_VARIANTS): quick_cut
+            # (22s, the default) or short_cut (38s). Rows can still opt
+            # into the legacy long format via writing_style="in_character"
+            # (target 60s -> ~130-175 words scrolling monologue).
+            sc_variant = SHORT_CUT_VARIANTS.get(writing_style)
+            if sc_variant:
+                sc_max_ms = sc_variant["max_ms"]
                 script = generate_recovery_short_script(
                     philosopher, topic, channel_slug,
-                    target_seconds=sc_target, previous_quotes=previous,
-                    recent_hits=recent_hits, style="short_cut",
+                    target_seconds=sc_variant["target_s"],
+                    previous_quotes=previous,
+                    recent_hits=recent_hits, style=writing_style,
                 )
             else:
                 script = generate_recovery_short_script(
@@ -2557,8 +2576,8 @@ def process_short(content: dict):
             is_short_cut = bool(script.get("is_short_cut"))
             if is_short_cut:
                 sc_hook = sanitize_quote(script.get("hook", ""))
-                print(f"  [short-cut] hook: {sc_hook!r}")
-                print(f"  [short-cut] body: {len(quote.split())} words "
+                print(f"  [{writing_style}] hook: {sc_hook!r}")
+                print(f"  [{writing_style}] body: {len(quote.split())} words "
                       f"(+ hook {len(sc_hook.split())} words)")
             else:
                 print(f"  [quote] Opus {channel_slug} short: {len(quote.split())} words")
@@ -2652,6 +2671,7 @@ def process_short(content: dict):
             # offset the body scroll. hook="" leaves the default long behavior.
             short_cut=is_short_cut,
             hook=sc_hook,
+            short_cut_max_ms=sc_max_ms,
         )
         log_step(content_id, "video", 4, "success")
     except Exception as e:
@@ -3078,31 +3098,35 @@ def _batch_process(items: list):
             # required to collapse the intro pad to 300ms.
             is_short_cut = False
             sc_hook = ""
+            sc_max_ms = None
 
             if content_type == "short":
                 _slug = content["channels"]["slug"]
                 recovery_script = None
                 if _slug in ("na", "aa"):
-                    # NA/AA shorts use the Opus-grade recovery writer aiming at
-                    # ~60s of narration (130-175 words). This is the path the
-                    # content_poller actually hits — the identical block in
-                    # process_short() is only reached when orchestrator is
-                    # invoked with CLI args, not via the poller's batch path.
+                    # NA/AA shorts use the Opus-grade recovery writer. This is
+                    # the path the content_poller actually hits — the identical
+                    # block in process_short() is only reached when orchestrator
+                    # is invoked with CLI args, not via the poller's batch path.
                     from ai_writer import generate_recovery_short_script
-                    _ws = _resolve_writing_style(content)
-                    _is_sc = (_ws == "short_cut")
-                    # Short Cut targets 38s (hook-first); full targets 60s.
+                    _ws = _resolve_writing_style(
+                        content, channel_default=NA_AA_SHORT_DEFAULT_STYLE
+                    )
+                    _sc_var = SHORT_CUT_VARIANTS.get(_ws)
+                    # quick_cut targets 22s, short_cut 38s; legacy full 60s.
                     recovery_script = generate_recovery_short_script(
                         philosopher, topic, _slug,
-                        target_seconds=(38 if _is_sc else 60), previous_quotes=previous,
+                        target_seconds=(_sc_var["target_s"] if _sc_var else 60),
+                        previous_quotes=previous,
                         recent_hits=_fetch_top_hit_titles(_slug),
                         style=_ws,
                     )
                     quote = sanitize_quote(recovery_script.get("quote", ""))
                     is_short_cut = bool(recovery_script.get("is_short_cut"))
                     sc_hook = sanitize_quote(recovery_script.get("hook", "")) if is_short_cut else ""
+                    sc_max_ms = _sc_var["max_ms"] if (_sc_var and is_short_cut) else None
                     if is_short_cut:
-                        print(f"  [{cid[:8]}] [short-cut] hook: {sc_hook!r} | body {len(quote.split())} words")
+                        print(f"  [{cid[:8]}] [{_ws}] hook: {sc_hook!r} | body {len(quote.split())} words")
                     else:
                         print(f"  [{cid[:8]}] [quote] Opus {_slug} short: {len(quote.split())} words")
                 else:
@@ -3153,12 +3177,13 @@ def _batch_process(items: list):
                 "art_prompts": art_prompts,
                 "content": content,
                 "work": work,
-                # Short Cut (NA/AA 45s): carried into voice + render phases so
+                # Hook-first cut state: carried into voice + render phases so
                 # the hook is spoken first AND render_remotion collapses the
                 # intro pad. Without these the batch path renders a 2.5s silent
                 # lead-in (the bug that made 45s shorts open on dead air).
                 "is_short_cut": is_short_cut,
                 "sc_hook": sc_hook,
+                "sc_max_ms": sc_max_ms,
             }
             print(f"  [{cid[:8]}] {len(quotes)} quote(s) ready")
 
@@ -3430,11 +3455,13 @@ def _batch_process(items: list):
                     narration_segments=data.get("narration_segments"),
                     equalizer_color=eq_color,
                     watermark=watermark_for_channel(channel_slug),
-                    # Short Cut (NA/AA 45s): collapse the 2.5s intro pad to
-                    # 0.3s, show the hook card first, enforce the 45s ceiling.
-                    # Empty hook leaves the default full-length behavior.
+                    # Hook-first cuts: collapse the 2.5s intro pad to 0.3s,
+                    # show the hook card first, enforce the variant ceiling
+                    # (27s quick_cut / 45s short_cut). Empty hook leaves the
+                    # default full-length behavior.
                     short_cut=data.get("is_short_cut", False),
                     hook=data.get("sc_hook", ""),
+                    short_cut_max_ms=data.get("sc_max_ms"),
                 )
             log_step(cid, "video", 4, "success")
 
