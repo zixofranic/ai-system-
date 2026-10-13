@@ -39,6 +39,8 @@ CHATTERBOX_URL = "http://localhost:8004"
 OUTPUT_DIRS = {
     "wisdom": Path("C:/AI/wisdom/videos/story_vertical"),
     "gibran": Path("C:/AI/gibran/videos/story_vertical"),
+    "na": Path("C:/AI/na/videos/story_vertical"),
+    "aa": Path("C:/AI/aa/videos/story_vertical"),
 }
 
 PHILOSOPHER_CHANNEL = {
@@ -84,35 +86,74 @@ def step_condense_script(full_story):
 # Step 2: Generate voice via Chatterbox + Whisper timestamps
 # (matches the parent story pipeline, zero 11labs credit cost)
 # ---------------------------------------------------------------------------
-def step_generate_voice(text, output_path, ts_path):
-    """Generate voice via Chatterbox TTS (Burton clone) + Whisper word timestamps."""
+def step_generate_voice(text, output_path, ts_path, channel_slug=None, philosopher=None):
+    """Generate voice + Whisper word timestamps.
+
+    Wisdom/Gibran: direct Chatterbox call with the Burton-clone reference
+    (legacy behavior; a Gibran-voice fix is its own work item).
+    NA/AA: delegate to orchestrator.generate_voice for channel-aware
+    Chatterbox routing — `philosopher` selects the persona reference clip via
+    _resolve_voice_config, plus per-channel atempo/reverb.
+
+    `philosopher` is required for na/aa. It used to be absent from this
+    signature with "The Voice of the Rooms" hard-coded below, which mis-voiced
+    every recovery story regardless of the archetype the row picked.
+    """
+    if channel_slug in ("na", "aa") and not philosopher:
+        raise ValueError(
+            "step_generate_voice requires philosopher for na/aa — refusing to "
+            "default to an archetype the row didn't pick"
+        )
     if Path(output_path).exists() and Path(ts_path).exists():
         print(f"\n[2/5] Voice exists, loading: {Path(output_path).name}")
         with open(ts_path) as f:
             return json.load(f)
 
-    print("\n[2/5] Generating voice via Chatterbox TTS (Burton clone)...")
     text = _sanitize_text(text)
-    payload = {"text": text, "exaggeration": 0.5, "cfg_weight": 0.5}
-    voice_ref = Path("C:/AI/system/voice/recordings/wisdom_burton_11labs_clip.mp3")
-    if voice_ref.exists():
-        payload["voice_mode"] = "clone"
-        payload["reference_audio_filename"] = voice_ref.name
 
-    resp = requests.post(f"{CHATTERBOX_URL}/tts", json=payload, timeout=300)
-    resp.raise_for_status()
+    if channel_slug in ("na", "aa"):
+        print(f"\n[2/5] Generating voice via Chatterbox (channel={channel_slug})...")
+        from orchestrator import generate_voice as _orch_generate_voice
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        wav_path = (output_path[:-4] + ".wav" if output_path.endswith(".mp3")
+                    else output_path + ".wav")
+        _orch_generate_voice(
+            text=text, output_path=wav_path,
+            channel_slug=channel_slug,
+            philosopher=philosopher,
+        )
+        if output_path.endswith(".mp3"):
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame",
+                 "-b:a", "128k", output_path],
+                check=True, capture_output=True,
+            )
+            print(f"  Voice saved: {output_path}")
+        else:
+            output_path = wav_path
+            print(f"  Voice saved: {output_path}")
+    else:
+        print("\n[2/5] Generating voice via Chatterbox TTS (Burton clone)...")
+        payload = {"text": text, "exaggeration": 0.5, "cfg_weight": 0.5}
+        voice_ref = Path("C:/AI/system/voice/recordings/wisdom_burton_11labs_clip.mp3")
+        if voice_ref.exists():
+            payload["voice_mode"] = "clone"
+            payload["reference_audio_filename"] = voice_ref.name
 
-    wav_path = output_path.replace(".mp3", ".wav")
-    with open(wav_path, "wb") as f:
-        f.write(resp.content)
+        resp = requests.post(f"{CHATTERBOX_URL}/tts", json=payload, timeout=300)
+        resp.raise_for_status()
 
-    # Convert to mp3 for Remotion
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame",
-         "-b:a", "128k", output_path],
-        capture_output=True,
-    )
-    print(f"  Voice saved: {output_path}")
+        wav_path = output_path.replace(".mp3", ".wav")
+        with open(wav_path, "wb") as f:
+            f.write(resp.content)
+
+        # Convert to mp3 for Remotion
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame",
+             "-b:a", "128k", output_path],
+            capture_output=True,
+        )
+        print(f"  Voice saved: {output_path}")
 
     # Extract timestamps via Whisper
     print("  Extracting word timestamps via Whisper...")
@@ -195,15 +236,52 @@ def main():
     with open(full_script_path) as f:
         full_story = json.load(f)
 
-    philosopher = full_story.get("philosopher", "Marcus Aurelius")
-    channel = PHILOSOPHER_CHANNEL.get(philosopher, "wisdom")
+    philosopher = full_story.get("philosopher") or None
+    # Prefer the channel_slug embedded by the parent script generator
+    # (recovery writer sets this explicitly). Fall back to philosopher
+    # mapping for older scripts. Refuse to silently default to wisdom —
+    # channel routing is a correctness invariant.
+    channel = full_story.get("channel_slug")
+    if not channel:
+        if philosopher in PHILOSOPHER_CHANNEL:
+            channel = PHILOSOPHER_CHANNEL[philosopher]
+        else:
+            raise ValueError(
+                f"Channel unknown for philosopher {philosopher!r} and no "
+                "channel_slug embedded in the parent script. Refusing to "
+                "silently default to 'wisdom'."
+            )
+
+    # Recovery verticals inherit the parent story's archetype. Older parent
+    # scripts (written before 2026-07-27) have no philosopher key because the
+    # writer used to stamp its own hard-coded persona instead — for those,
+    # guessing would silently pick the wrong voice, which is the exact bug
+    # this pipeline just got fixed for. Make the operator re-render the parent.
+    if channel in ("na", "aa") and not philosopher:
+        raise ValueError(
+            f"No philosopher in {full_script_path.name}. Recovery verticals "
+            "take their archetype from the parent story; re-render the parent "
+            "so it stamps the row's persona, then retry."
+        )
+    if not philosopher:
+        philosopher = "Marcus Aurelius"   # wisdom-era default, unchanged
+    if channel not in OUTPUT_DIRS:
+        raise ValueError(f"Unknown channel {channel!r}; must be one of {list(OUTPUT_DIRS)}")
     output_dir = OUTPUT_DIRS[channel]
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    music_style = PHILOSOPHER_MUSIC.get(philosopher, "stoic_classical")
-    first_name = philosopher.split()[0].lower()
+    if channel in ("na", "aa"):
+        music_style = "recovery_calm"
+    else:
+        music_style = PHILOSOPHER_MUSIC.get(philosopher, "stoic_classical")
+    # See generate_story_video.py — NA/AA archetypes all slug to "the" on
+    # first-name, colliding same-day artifacts and reusing the wrong audio.
+    if channel in ("na", "aa"):
+        name_slug = "_".join(philosopher.lower().replace("-", " ").split())
+    else:
+        name_slug = philosopher.split()[0].lower()
     date_str = datetime.now().strftime("%Y-%m-%d")
-    prefix = f"{date_str}_story_vertical_{first_name}"
+    prefix = f"{date_str}_story_vertical_{name_slug}"
     output_name = prefix.replace("_", "-")
 
     print(f"\n{'=' * 60}")
@@ -236,6 +314,8 @@ def main():
     timestamps = step_generate_voice(
         vertical["story_script"],
         str(vertical_voice_path), str(vertical_ts_path),
+        channel_slug=channel,
+        philosopher=philosopher,
     )
 
     # 3. Pick music (same style as parent story)

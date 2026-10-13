@@ -20,6 +20,7 @@ import os
 import sys
 import re
 import requests
+from difflib import SequenceMatcher
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
@@ -335,6 +336,180 @@ def push_weekly_plan_to_supabase(plan: list, channel_map: dict = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Topic freshness (2026-07-20, after the subject-repetition audit)
+#
+# The planner used to be memoryless: every Sunday Claude re-sampled the same
+# high-probability subjects ("what sponsors do when you call at 2am" was
+# planned in 6 different weeks on AA). Two defenses now exist:
+#   1. The prompt gets a per-channel "recently used subjects" block.
+#   2. A fuzzy gate rejects near-duplicate topics after generation, with one
+#      replacement pass; still-colliding replacements are dropped.
+# ---------------------------------------------------------------------------
+_TOPIC_STOPWORDS = frozenset("""a an the and or of to in on for with from
+about at by is are was be this that it its as into over under after before
+when what how why your you my we our their his her him he she they them who
+whom out not no do does don doesn didn dont cant wont isnt up down off one
+day at time""".split())
+
+
+def _topic_tokens(title: str) -> set:
+    """Meaningful lowercase tokens of a topic title, for fuzzy comparison."""
+    words = re.sub(r"[^a-z0-9\s]", " ", (title or "").lower()).split()
+    return {w for w in words if w not in _TOPIC_STOPWORDS and len(w) > 2}
+
+
+def _is_near_duplicate(title: str, history_titles: list,
+                       jaccard_threshold: float = 0.5,
+                       ratio_threshold: float = 0.72) -> bool:
+    """True if `title` is the same subject as anything in `history_titles`.
+
+    Thresholds were calibrated against the 2026-07-20 audit pairs: real
+    repeats scored >= 0.55 jaccard or read as containments; genuinely
+    different subjects sharing a theme word scored <= 0.35.
+    """
+    t_tokens = _topic_tokens(title)
+    t_lower = (title or "").lower().strip()
+    if not t_lower:
+        return False
+    for h in history_titles:
+        h_lower = str(h or "").lower().strip()
+        if not h_lower:
+            continue
+        if t_lower == h_lower:
+            return True
+        h_tokens = _topic_tokens(h)
+        if t_tokens and h_tokens:
+            small, big = sorted((t_tokens, h_tokens), key=len)
+            if len(small) >= 3 and small <= big:
+                return True
+            overlap = len(t_tokens & h_tokens) / len(t_tokens | h_tokens)
+            if overlap >= jaccard_threshold:
+                return True
+        if SequenceMatcher(None, t_lower, h_lower).ratio() >= ratio_threshold:
+            return True
+    return False
+
+
+def _filter_repeat_topics(plan: list, history_by_channel: dict) -> tuple:
+    """Split a generated plan into (kept, rejected) by subject freshness.
+
+    Each item is checked against its own channel's history AND against
+    already-kept items from the same plan, so a week can't contain the
+    same subject twice either.
+    """
+    kept, rejected = [], []
+    kept_this_plan = {}
+    for item in plan:
+        ch = item.get("channel", "wisdom")
+        topic = item.get("topic", "")
+        history = list(history_by_channel.get(ch, [])) + kept_this_plan.get(ch, [])
+        if topic and _is_near_duplicate(topic, history):
+            rejected.append(item)
+        else:
+            kept.append(item)
+            kept_this_plan.setdefault(ch, []).append(topic)
+    return kept, rejected
+
+
+def _build_recent_topics_block(history_by_channel: dict, cap: int = 80) -> str:
+    """Prompt block listing recently-used subjects per channel (newest first)."""
+    sections = []
+    for slug, titles in history_by_channel.items():
+        titles = [t for t in titles if t][:cap]
+        if not titles:
+            continue
+        bullets = "\n".join(f'  - "{str(t)[:110]}"' for t in titles)
+        sections.append(f'Channel "{slug}":\n{bullets}')
+    if not sections:
+        return ""
+    return (
+        "\n\nSUBJECTS ALREADY USED RECENTLY (per channel). Do NOT reuse, "
+        "re-title, or closely paraphrase ANY of these. Every new topic must "
+        "be a genuinely different subject — a fresh wording of an old "
+        "subject still counts as a repeat:\n\n" + "\n\n".join(sections)
+    )
+
+
+def _fetch_recent_topic_history(slug_to_id: dict, weeks: int = 8,
+                                cap: int = 80) -> dict:
+    """Fetch each channel's recent subjects: plan_topics titles plus content
+    titles (the latter catches custom/manual items that bypass the planner).
+    Returns {slug: [titles newest-first]}. Failures degrade to empty lists —
+    planning must survive a history outage."""
+    history = {}
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return history
+    cutoff = (datetime.now(timezone.utc) - timedelta(weeks=weeks)).isoformat()
+    headers = _supabase_headers()
+    for slug, ch_id in slug_to_id.items():
+        titles, seen = [], set()
+        try:
+            rows = []
+            for path, select in (("plan_topics", "title,created_at"),
+                                 ("content", "title,topic,created_at")):
+                r = requests.get(
+                    f"{SUPABASE_URL}/rest/v1/{path}",
+                    headers=headers,
+                    params={"select": select,
+                            "channel_id": f"eq.{ch_id}",
+                            "created_at": f"gte.{cutoff}",
+                            "order": "created_at.desc",
+                            "limit": str(cap * 3)},
+                    timeout=30,
+                )
+                r.raise_for_status()
+                rows.extend(r.json())
+            for row in rows:
+                t = (row.get("title") or row.get("topic") or "").strip()
+                if t and t.lower() not in seen:
+                    seen.add(t.lower())
+                    titles.append(t)
+        except Exception as e:
+            print(f"[planner] WARNING: topic history fetch failed for "
+                  f"'{slug}': {e}")
+        history[slug] = titles[:cap]
+    return history
+
+
+def _regenerate_rejected_topics(rejected: list, history_by_channel: dict,
+                                kept_items: list) -> list:
+    """One replacement pass for plan items rejected by the freshness gate.
+    Replacements are re-checked; anything still colliding is dropped —
+    a slightly thinner week beats publishing a repeat."""
+    slots = [{"day": it.get("day"), "channel": it.get("channel"),
+              "philosopher": it.get("philosopher"), "format": it.get("format")}
+             for it in rejected]
+    avoid = {ch: list(titles) for ch, titles in history_by_channel.items()}
+    for it in kept_items:
+        avoid.setdefault(it.get("channel", "wisdom"), []).insert(
+            0, it.get("topic", ""))
+
+    system = (
+        "You are a content strategist. You replace content topics that were "
+        "rejected for repeating recently-used subjects. Output valid JSON only."
+    )
+    user = f"""These plan slots were rejected because their topics repeated a recently-used subject. Provide a REPLACEMENT topic and hook for each slot — a genuinely different subject, not a rewording of anything in the used list.
+
+SLOTS:
+{json.dumps(slots, indent=2)}
+{_build_recent_topics_block(avoid)}
+
+Return a JSON array of exactly {len(slots)} objects with keys: day, channel, philosopher, topic, format, hook."""
+    try:
+        response = _call_anthropic(SONNET_MODEL, system, user, max_tokens=4000)
+        result = _parse_json_response(response)
+    except Exception as e:
+        print(f"[planner] WARNING: replacement topic generation failed: {e}")
+        return []
+    items = result if isinstance(result, list) else []
+    fresh, still_dupes = _filter_repeat_topics(items, avoid)
+    for it in still_dupes:
+        print(f"[planner] dropping still-repeated replacement: "
+              f"[{it.get('channel')}] {it.get('topic')}")
+    return fresh
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -410,6 +585,11 @@ def generate_weekly_plan(trending_topics: list = None,
         else "(no trending feed this week — draw from evergreen themes)"
     )
 
+    # Planner memory: what each channel already covered recently.
+    slug_to_id = {s["slug"]: s["id"] for s in specs}
+    topic_history = _fetch_recent_topic_history(slug_to_id)
+    recent_block = _build_recent_topics_block(topic_history)
+
     # Slug-keyed channel kind hint (for tone rules)
     recovery_slugs = {s["slug"] for s in specs if s["slug"] in ("na", "aa")}
     philo_slugs = {s["slug"] for s in specs if s["slug"] in ("wisdom", "gibran")}
@@ -458,9 +638,10 @@ RULES:
 - Each item is one (day, channel, persona, topic, format) tuple.
 - Distribute each channel's quota sensibly across Mon-Sun (daily = one each day; 5/week = Mon-Fri; 2/week = Tue+Thu; weekly = pick one weekday).
 - Rotate personas within each channel; don't repeat the same persona two days in a row unless the channel has only one persona.
-- Topics must be specific and concrete, not generic. Prefer a narrow angle ("the morning after a hard night", "what sponsors do when you call at 2am") over broad buckets ("on life", "on courage").
+- Topics must be specific and concrete, not generic. Prefer a narrow angle over broad buckets ("on life", "on courage").
+- Every topic must be a NEW subject for its channel. The recently-used list below is off-limits, including rewordings.
 - Output ONLY formats listed in each channel's quota above.
-{tone_rules_text}
+{tone_rules_text}{recent_block}
 
 Return a JSON array of exactly {total_items} objects:
 [
@@ -478,10 +659,21 @@ Return a JSON array of exactly {total_items} objects:
     result = _parse_json_response(response)
     plan = result if isinstance(result, list) else result.get("plan", result.get("raw", []))
 
+    # Freshness gate: reject subjects that repeat recent history (or each
+    # other), try one replacement pass, drop anything still colliding.
+    if isinstance(plan, list) and plan:
+        kept, rejected = _filter_repeat_topics(plan, topic_history)
+        if rejected:
+            print(f"[planner] freshness gate rejected {len(rejected)} repeat "
+                  f"topic(s):")
+            for it in rejected:
+                print(f"    [{it.get('channel')}] {it.get('topic')}")
+            kept.extend(_regenerate_rejected_topics(rejected, topic_history, kept))
+        plan = kept
+
     if isinstance(plan, list) and plan and SUPABASE_URL and SUPABASE_SERVICE_KEY:
         try:
-            slug_map = {s["slug"]: s["id"] for s in specs}
-            push_weekly_plan_to_supabase(plan, channel_map=slug_map)
+            push_weekly_plan_to_supabase(plan, channel_map=slug_to_id)
         except Exception as e:
             print(f"[ai_writer] WARNING: Failed to push weekly plan to Supabase: {e}")
 
@@ -2008,14 +2200,32 @@ def generate_recovery_story_script(topic: str, channel_slug: str,
                                    setting: str = None,
                                    mood: str = None,
                                    notes: str = None,
-                                   queued_title: str = None) -> dict:
+                                   queued_title: str = None,
+                                   persona: str = "The Voice of the Rooms") -> dict:
     """
     Write an original 4-5 min recovery testimony story for NA/AA channels.
 
-    Voice is locked to "The Voice of the Rooms" — collective anonymous testimony
-    drawn from the rooms. The writer style is locked to recovery testimony
-    regardless of the dashboard `mood` arg (same lock pattern as Gibran's
-    PHILOSOPHER_STYLE_OVERRIDE in generate_story_script).
+    `persona` is the archetype the row picked (The Old-Timer / The Sponsor /
+    The Voice of the Rooms / Ziad) and drives the narrator's register, exactly
+    as it already does for shorts via generate_recovery_short_script. It
+    defaults to "The Voice of the Rooms" only so older callers that omit it
+    keep their previous behavior.
+
+    2026-07-27: this used to be hard-locked to "The Voice of the Rooms" and
+    additionally overwrote result["philosopher"] with it, silently discarding
+    the row's pick. The editorial argument for the lock didn't hold up —
+    subject anonymity is enforced unconditionally by the ANONYMITY block and
+    _RECOVERY_COMPLIANCE_BLOCK below, so pinning the *narrator* bought nothing,
+    and shorts had shipped in all three archetypes for months. Note this is NOT
+    the same shape as Gibran's PHILOSOPHER_STYLE_OVERRIDE, which the old
+    docstring cited as precedent: that one is keyed BY the input philosopher and
+    echoes it back unchanged. This one discarded the input. Opposite patterns.
+
+    The writer style is still locked to recovery testimony regardless of the
+    dashboard `mood` arg — that part was always correct.
+
+    A writer must never redefine who is speaking: the row is authoritative
+    downstream. This function reads `persona`; it does not write it back.
 
     Anonymous protagonist: never named (no "Marco", "Sarah", "David"). The
     `character` field deliberately tells the art prompter that appearance
@@ -2031,8 +2241,11 @@ def generate_recovery_story_script(topic: str, channel_slug: str,
             "must be 'na' or 'aa'"
         )
 
-    persona = "The Voice of the Rooms"
-    persona_voice = _RECOVERY_PERSONA_VOICES[persona]
+    # .get() not [] — an unrecognized persona must degrade to a neutral
+    # register, never KeyError mid-render. Matches generate_recovery_short_script.
+    persona_voice = _RECOVERY_PERSONA_VOICES.get(
+        persona, "A calm, experienced recovery voice."
+    )
 
     channel_cue = {
         "na": ("Recovery from addiction, broadly. Avoid language that implies a "
@@ -2128,7 +2341,9 @@ Remember: this is not literary fiction. It is testimony from the rooms. Plain pr
             f"channel={channel_slug!r}, topic={topic[:60]!r}"
         )
 
-    result["philosopher"] = persona
+    # Deliberately does NOT set result["philosopher"]. The row owns that value;
+    # writing it here is what let a hard-coded persona leak downstream and
+    # mis-voice every NA/AA story (2026-07-27).
     result["theme"] = theme or topic
     result["format"] = "story"
     result["channel_slug"] = channel_slug

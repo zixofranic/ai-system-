@@ -26,19 +26,21 @@ export const Background: React.FC<{
   const imgHeight = IMAGE_HEIGHT * coverScale;
   let animScale = 1 + EXTRA_SCALE;
 
-  const currentScaleAnim = item.animations?.find(
-    (anim) =>
-      anim.type === "scale" && anim.startMs <= localMs && anim.endMs >= localMs,
-  );
-
-  if (currentScaleAnim) {
-    const progress =
-      (localMs - currentScaleAnim.startMs) /
-      (currentScaleAnim.endMs - currentScaleAnim.startMs);
+  // 2026-04-20 fix: pick the scale animation regardless of whether
+  // localMs is currently inside its window, then CLAMP progress to [0,1].
+  // The previous version only applied the animation when start<=localMs<=end,
+  // so the moment localMs ticked past `end` the scale snapped from its
+  // end value (~1.26 for even scenes) back to the default 1.2 — visible
+  // as a pop in the last few frames before the crossfade. Clamping holds
+  // the end value through the fade-out so the cut is clean.
+  const scaleAnim = item.animations?.find((anim) => anim.type === "scale");
+  if (scaleAnim) {
+    const span = Math.max(1, scaleAnim.endMs - scaleAnim.startMs);
+    const progress = Math.min(1, Math.max(0, (localMs - scaleAnim.startMs) / span));
     animScale =
       EXTRA_SCALE +
-      progress * (currentScaleAnim.to - currentScaleAnim.from) +
-      currentScaleAnim.from;
+      progress * (scaleAnim.to - scaleAnim.from) +
+      scaleAnim.from;
   }
 
   const imgScale = animScale;

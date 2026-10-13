@@ -214,6 +214,11 @@ const flushSentence = (sentenceWords) => {
   textElements.push({
     startMs: sentenceStartMs,
     endMs: sentenceEndMs,
+    // Preserve case (cinematic restyle 2026-04-19 — see convert-story.js)
+    // Lowercased so the Hormozi-style ProgressiveSubtitle (which applies
+    // textTransform:uppercase) renders clean block-caps. Cinematic theme
+    // for portrait Shorts is opt-in but currently unused — when needed,
+    // mirror the resolveChannelMeta + cinematic block from convert-story.js.
     text: sentenceWords.map((w) => w.word).join(" ").toLowerCase(),
     position: "center",
     words: sentenceWords.map((w) => ({

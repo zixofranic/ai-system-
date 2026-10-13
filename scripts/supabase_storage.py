@@ -120,6 +120,18 @@ def _upload_via_tus(
         "x-upsert": "true",
     }
     create_resp = requests.post(tus_endpoint, headers=create_headers, timeout=30)
+    if create_resp.status_code == 413:
+        # The TUS create POST carries no body — a 413 here is the project's
+        # GLOBAL Storage upload limit rejecting Upload-Length, NOT the bucket
+        # file_size_limit (which can be set far higher and is ignored if the
+        # global cap is lower). Give an actionable message instead of a bare 413.
+        raise RuntimeError(
+            f"Storage upload rejected (413 Maximum size exceeded): file is "
+            f"{file_size / 1024 / 1024:.1f} MB. This is the Fellows project's GLOBAL "
+            f"Storage 'Upload file size limit', not the bucket file_size_limit. Raise it "
+            f"at Supabase Dashboard -> project cujwhqoezvehwhhigxmr -> Settings -> Storage, "
+            f"or lower the render CRF for long videos."
+        )
     if create_resp.status_code not in (200, 201):
         raise RuntimeError(
             f"TUS create failed: {create_resp.status_code} {create_resp.text[:300]}"

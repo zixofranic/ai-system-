@@ -26,14 +26,69 @@ This directory contains shared GPU tools and services used by ALL channels.
 | `generate_story_video.py` | Standalone story pipeline (Remotion, IP-Adapter, Whisper) | manual |
 | `generate_batch.py` | Original standalone batch (Saturday working version) | manual |
 
-## Voice Generation (Primary: ElevenLabs)
+## Voice Generation (Primary: Chatterbox)
 
-- **Provider:** ElevenLabs API (`eleven_multilingual_v2`)
-- **Plan:** Scale (100K credits/month, $22/mo)
-- **Wisdom voice ID:** `0ABJJI7ZYmWZBiUBMHUW` (James Burton)
-- **Gibran voice ID:** `R68HwD2GzEdWfqYZP9FQ`
-- **Chatterbox** is available at port 8004 as future fallback for shorts only. Config in `config.yaml` sets `reference_audio_path: C:\AI\system\voice\recordings`. Reference clips must be under 30 seconds.
-- **DO NOT** use Chatterbox unless explicitly asked — it produced garbage output in testing.
+**All four channels run on Chatterbox today.** `C:\AI\.env` sets
+`WISDOM_TTS_PROVIDER`, `GIBRAN_TTS_PROVIDER`, `NA_TTS_PROVIDER`, and
+`AA_TTS_PROVIDER` all to `chatterbox`. The older "ElevenLabs is primary,
+DO NOT use Chatterbox" guidance is obsolete — it predates the 2026-04-22
+migration. ElevenLabs remains the rollback path and is still hard-wired
+into the `story` format (see the gap table below).
+
+Chatterbox serves at port 8004; `config.yaml` sets
+`reference_audio_path: C:\AI\system\voice\recordings`.
+
+| Channel | Reference clip | Notes |
+|---|---|---|
+| wisdom | `wisdom_burton_long_ref.wav` | atempo 0.80 + reverb + tail fade |
+| gibran | `gibran_long_ref.wav` | do NOT stack Wisdom's slow_factor |
+| na / aa | per-persona, see below | atempo 0.85, exaggeration 0.25 |
+
+ElevenLabs voice IDs (rollback / story path only): Wisdom
+`0ABJJI7ZYmWZBiUBMHUW` (James Burton), Gibran `R68HwD2GzEdWfqYZP9FQ`.
+
+### NA/AA persona voices
+
+NA and AA share four selectable voices. The picker writes
+`content.philosopher`; `_resolve_voice_config` (orchestrator.py) maps it to
+a reference clip via `CHANNEL_VOICE[slug].chatterbox.persona_refs`.
+
+| Persona | Reference clip | Register |
+|---|---|---|
+| The Old-Timer | `na_old_timer_5min.wav` | male, ~103 Hz — 20+ yrs, steady, spare |
+| The Sponsor | `na_sponsor_5min.wav` | male, ~96 Hz — direct, warm, practical |
+| The Voice of the Rooms | `na_rooms_5min.wav` | **female, ~180 Hz — intentional**; the rooms are everyone |
+| Ziad | `ziad_anniversary_25sec.wav` | male, ~87 Hz — channel owner, first year |
+
+All four are valid on every format: short, story, story_vertical, midform.
+
+`Ziad` is the one named voice — Tradition 11 protects *other* members'
+anonymity, not the channel owner's.
+
+The persona list is duplicated in four places. **Keep them in sync:**
+`orchestrator.py` `persona_refs`, `ai_writer.py` `_RECOVERY_PERSONA_VOICES`,
+dashboard `lib/constants.ts` `PHILOSOPHERS.na/.aa`, and dashboard
+`lib/channel-philosopher.ts` `NA_AA_PERSONAS` (the server-side validator —
+a persona missing *here* is rejected on save no matter what the UI offers).
+
+### Two invariants (2026-07-27 — learned the hard way)
+
+Every NA/AA story rendered in the wrong voice for ~10 weeks. The row's
+persona was correct in the database and correct in the log, then discarded
+at the last step. Two rules prevent the whole class of bug:
+
+1. **No writer function may set `result["philosopher"]`.** A writer consumes
+   the persona; it never redefines it. The row is authoritative downstream.
+   If an artifact needs the value stamped on it, the *orchestration* layer
+   does that with the row's value (see `generate_story_video.py`).
+2. **No TTS call site may contain a persona string literal.** Always
+   `generate_voice(philosopher=<row value>)`. Never re-read it back out of
+   the writer's return value — laundering it through the writer is how it
+   got lost.
+
+A third guard now backs these: `_resolve_voice_config` logs a WARNING
+instead of silently falling back to the channel default when a persona
+isn't found in `persona_refs`.
 
 ## Content Generation Flow
 
@@ -97,25 +152,122 @@ Starts: Chatterbox (8004), ComfyUI (8188), Ollama (11434), Content Poller
 
 Each channel is a completely separate project. NEVER mix content, output, or assets between them.
 
-| | Gibran Channel | Wisdom Channel |
-|---|---|---|
-| **Directory** | `C:\AI\gibran\` | `C:\AI\wisdom\` |
-| **Output** | `C:\AI\gibran\output\shorts\` | `C:\AI\wisdom\output\shorts\` |
-| **LoRA** | `gibran_style_v1.safetensors` | `stoic_classical_v1.safetensors` (+ others) |
-| **Voice** | `R68HwD2GzEdWfqYZP9FQ` | `0ABJJI7ZYmWZBiUBMHUW` (James Burton) |
-| **Ollama** | `gibran` | `marcus_aurelius`, `seneca`, etc. |
-| **Texts** | `C:\AI\gibran\scripts\raw\` | `C:\AI\wisdom\authors\` |
+| | Gibran | Wisdom | NA | AA |
+|---|---|---|---|---|
+| **Directory** | `C:\AI\gibran\` | `C:\AI\wisdom\` | `C:\AI\na\` | `C:\AI\aa\` |
+| **Output** | `C:\AI\gibran\videos\` | `C:\AI\wisdom\videos\` | `C:\AI\na\videos\` | `C:\AI\aa\videos\` |
+| **LoRA** | `gibran_style_v1` | `stoic_classical_v1` (+ others) | `_NA_STYLE` art | `_NA_STYLE` art |
+| **Voice (CB ref)** | `gibran_long_ref.wav` | `wisdom_burton_long_ref.wav` | 4 persona refs | same 4 as NA |
+| **Ollama** | `gibran` | `marcus_aurelius`, `seneca`, etc. | `the_old_timer`, etc. | same as NA |
+| **Texts** | `C:\AI\gibran\scripts\raw\` | `C:\AI\wisdom\authors\` | written fresh | written fresh |
 
 When generating content, ALWAYS verify the output path matches the channel.
+
+Voice references are channel-scoped too. NA/AA never borrow Burton or
+Gibran clips, and vice versa — a cross-channel reference is a bug, not a
+fallback. One known live violation: `generate_story_vertical.py` hard-codes
+the Burton clip for *both* wisdom and gibran, so a Gibran story_vertical
+renders in James Burton's voice.
 
 ## Projects Using This Infrastructure
 
 - `C:\AI\gibran\` — Gibran partnership channel (with Elias)
 - `C:\AI\wisdom\` — Wisdom solo channel (Ziad only)
+- `C:\AI\na\` — One Day At A Time (NA recovery shorts → `@OneDayAtATime-26`)
+- `C:\AI\aa\` — Easy Does It (AA recovery shorts → `@EasyDoesIt-26`)
 - `C:\AI\simpler.os\` — Simpler RE OS help video system (Digital Joe tutorials)
+- **`C:\dev\fellows\comrades\`** — FELLOWS app one-off marketing assets (anniversary videos, launch pieces). Reuses this stack for VO + art + render. See "FELLOWS One-Off Asset Generation" section below.
 
-## Known Issues (as of 2026-03-31)
+## FELLOWS One-Off Asset Generation
+
+The FELLOWS app (recoveryfellows.com) has its own personal-voice marketing pieces that don't fit the automated NA/AA channel pipeline. These are one-off scripts authored manually (or drafted by Claude and approved by Ziad), generated through the existing infrastructure, and used on the FELLOWS social accounts and landing page.
+
+**Voice clones available:**
+- Ziad's cloned voice (`gOEUY8IEUhraboLFmcGQ`, "Ziad Instant Clone") — lives in `C:\dev\vibes\pipeline\.env` for the Vibes/Rewire project, reused here for FELLOWS personal-voice content. Verified live on the Vibes account 2026-06-15. This is the ONLY current Ziad EL clone.
+- ~~Backup clone: `HZTk7bUIkiI7yT7FKH4h`~~ — STALE: verified 2026-06-15 that this id is now reassigned to a professional voice ("Brad – Meditation & Relaxation"), NOT a Ziad backup. Do not use it for Ziad.
+
+**Two API keys on this machine:**
+- `C:\AI\.env` → `ELEVENLABS_API_KEY` (AI pipeline). Missing `voices_read` scope.
+- `C:\dev\vibes\pipeline\.env` → `ELEVENLABS_API_KEY` (Vibes/personal). Has full scope.
+- FELLOWS one-off scripts should prefer the Vibes key (try it first, fall back to AI key).
+
+**Existing FELLOWS one-off scripts in `C:\AI\system\scripts\`:**
+- `generate_fellows_promo_vo.py` — launch IG promo VO (eleven_multilingual_v2, James Burton voice)
+- `generate_fellows_anniversary_y1_vo.py` — 1-year anniversary VO (eleven_v3, Ziad clone, with tail silence padding)
+
+**End-to-end FELLOWS video stack** (all on this machine, none external):
+- **Script** — drafted in Claude, saved as a doc under `C:\dev\fellows\comrades\Doc\`, then embedded in a Python generator under `C:\AI\system\scripts\`
+- **Voice** — ElevenLabs v3 (audio tags supported: `[pause]`, `[long pause]`, `[softly]`, `[warmly]`, etc. — but watch for tag bleed, 5-10% rate)
+- **Art** — ComfyUI at port 8188, can use any of the trained LoRAs in `ComfyUI/models/loras/`
+- **Render** — Remotion engine at `C:\AI\system\video-engine\` invoked via `render_remotion.py`. Supports short (1080×1920), story_vertical (1080×1920), midform (1920×1080), longform (1920×1080). Builds timeline.json + metadata.json, copies assets, runs Remotion CLI.
+- **Post** — ffmpeg on PATH (via WinGet's Gyan.FFmpeg). Use `shutil.which("ffmpeg")` in Python scripts, fall back to `C:/ffmpeg/ffmpeg.exe` for backward compat with older code.
+
+**Implication:** CapCut is no longer required for FELLOWS one-off videos. The full chain — script → VO → art → composition → MP4 — can run inside this stack. CapCut stays as a fallback when Ziad wants manual visual control on a specific piece.
+
+## Supabase Free-Tier Quota (2026-10-13) — READ BEFORE ADDING ANY POLLING
+
+The Wisdom Supabase project (`kwyqaewdvvdhodxieqrh`) is on the **Free plan,
+and Ziad will NOT upgrade** — wait for the monthly reset instead of paying.
+Billing cycle resets on the 17th. Free limits: 5 GB egress, 1 GB log
+ingestion (log ingestion was "upcoming"/unenforced as of Oct 2026).
+
+**Cycle Sep 17 – Oct 17 2026 hit 121% egress (6.06 GB) and 517% log
+ingestion (5.17 GB).** Root cause (found by code reading — the Supabase MCP
+here is on the SimplerOS org and cannot see this project; prod DB reads were
+blocked, so not verified against pg_stat_statements):
+
+- `analytics_fetcher.py` ran every 30 min (poller tick 6) over EVERY
+  published row on all channels: per row a `channels?select=*` GET, a
+  `generation_params` GET, and a PATCH sent with
+  `Prefer: return=representation` — echoing the full content row back for
+  nothing. Hundreds of rows × ~3-4 requests × 48 runs/day.
+- Every request is also an edge-log line → the log-ingestion overage.
+
+Fixes shipped 2026-10-13:
+1. `analytics_fetcher.py` HEADERS → `Prefer: return=minimal`.
+2. `get_channel()` cached per run (`_channel_cache`).
+3. `content_poller.py` `ANALYTICS_EVERY_N_TICKS` 6 → 72 (every 6 h).
+   Needs a poller restart to take effect.
+
+Not yet verified that usage dropped — check the Wisdom project's
+Reports → API in the dashboard after a day or two. If it didn't drop,
+next suspects: other scripts still using `return=representation`
+(orchestrator, meta_uploader, tiktok_daily_batch, generate_story_video,
+ai_writer — all low-frequency), and dashboard pages selecting `*` from
+`content`. Rules going forward: never `select=*` on `content` in a loop,
+always `return=minimal` on PATCH unless the response is used, and keep
+any new periodic job at ≥ hourly cadence.
+
+## Known Issues (as of 2026-07-27)
 
 - **Longform (15-25 min) not implemented** — routes to midform as fallback
 - **Content poller may crash** after repeated pipeline failures — restart with `START_ALL.bat`
 - **Older content has no thumbnails** — thumbnail code was added 2026-03-31
+
+### Open voice-routing gaps (found in the 2026-07-27 audit, NOT yet fixed)
+
+These are real and confirmed by reading the code. None affect NA/AA shorts,
+midform, or (post-fix) stories.
+
+- **`story` format ignores `*_TTS_PROVIDER` for wisdom/gibran.**
+  `generate_story_video.py` routes na/aa to Chatterbox but sends everything
+  else straight to ElevenLabs. Wisdom/Gibran stories therefore render on EL
+  even though the env says chatterbox. Right voice identity, wrong provider —
+  and for Gibran, the EL original and the CB clone are not the same voice.
+- **`story_vertical` uses the Burton clip for both wisdom AND gibran**, with
+  `exaggeration 0.5` and none of the atempo/reverb/tail post-chain the other
+  wisdom formats get. So wisdom verticals sound unlike wisdom shorts, and
+  Gibran verticals are outright cross-channel (see channel separation above).
+- **`PERSONA_TO_VOICE_ID` is checked before `CHANNEL_DEFAULT_VOICE_ID`** on
+  the ElevenLabs path, and wisdom's philosopher field is free-form
+  server-side. A wisdom row typed `The Old-Timer` would pull NA's EL voice.
+  Currently masked only because wisdom runs on Chatterbox.
+- **`PERSONA_TO_VOICE_SETTINGS` (orchestrator.py) is dead code** — defined,
+  never read. Per-persona exaggeration is not actually applied.
+- **The EL rollback path is not intact for NA/AA.** `PERSONA_TO_VOICE_ID` has
+  no `Ziad` entry and `CHANNEL_DEFAULT_VOICE_ID` has no `na`/`aa` entry, so
+  flipping `NA_TTS_PROVIDER=elevenlabs` raises ValueError on a Ziad row.
+  Fails loud, not silent — but the documented rollback would not work.
+- **5 Gibran story rows carry `philosopher='Marcus Aurelius'`** (pre-dating
+  the `channel-philosopher.ts` canonicalizer). Voice was unaffected; they got
+  mood-derived writing/art styles instead of the Gibran style card.

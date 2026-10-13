@@ -293,7 +293,11 @@ def build_caption(content, channel_slug):
         first_line = description.split("\n")[0][:200]
         caption = f"{title}\n\n{first_line}"
 
+    # Dedup is case-insensitive — hashtags are case-insensitive on IG/FB,
+    # so "#Recovery" (channel tag) and "#recovery" (AI tag) are the same
+    # tag rendered twice.
     hashtags = []
+    seen = set()
     for tag in tags[:8]:
         # IG/FB hashtags only render when alphanumeric (underscore allowed).
         # Strip everything else — `/`, `.`, `'`, `@`, `#`, dashes, spaces — so
@@ -302,10 +306,12 @@ def build_caption(content, channel_slug):
         if not cleaned:
             continue
         ht = "#" + cleaned
-        if ht not in hashtags:
+        if ht.lower() not in seen:
+            seen.add(ht.lower())
             hashtags.append(ht)
     for ht in CHANNEL_HASHTAGS.get(channel_slug, []):
-        if ht not in hashtags:
+        if ht.lower() not in seen:
+            seen.add(ht.lower())
             hashtags.append(ht)
 
     if hashtags:

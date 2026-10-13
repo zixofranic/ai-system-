@@ -39,6 +39,8 @@ MUSIC_ROOT = Path("C:/AI/system/music")
 OUTPUT_DIRS = {
     "wisdom": Path("C:/AI/wisdom/videos/story"),
     "gibran": Path("C:/AI/gibran/videos/story"),
+    "na": Path("C:/AI/na/videos/story"),
+    "aa": Path("C:/AI/aa/videos/story"),
 }
 
 PHILOSOPHER_CHANNEL = {
@@ -72,16 +74,32 @@ def _sanitize_text(text):
 # ---------------------------------------------------------------------------
 # Step 1: Generate story script
 # ---------------------------------------------------------------------------
-def step_generate_script(philosopher, theme, setting, mood, notes, queued_title=None):
+def step_generate_script(philosopher, theme, setting, mood, notes,
+                         channel_slug, queued_title=None):
     print("\n[1/6] Generating story script via Claude Sonnet...")
     if queued_title:
         print(f"  Honoring queued title: {queued_title!r}")
-    from ai_writer import generate_story_script
-    story = generate_story_script(
-        philosopher=philosopher, theme=theme,
-        setting=setting, mood=mood, notes=notes,
-        queued_title=queued_title,
-    )
+    if channel_slug in ("na", "aa"):
+        print(f"  Routing to recovery story writer "
+              f"(channel={channel_slug}, persona={philosopher!r})")
+        from ai_writer import generate_recovery_story_script
+        story = generate_recovery_story_script(
+            topic=theme,
+            channel_slug=channel_slug,
+            theme=theme,
+            setting=setting,
+            mood=mood,
+            notes=notes,
+            queued_title=queued_title,
+            persona=philosopher,
+        )
+    else:
+        from ai_writer import generate_story_script
+        story = generate_story_script(
+            philosopher=philosopher, theme=theme,
+            setting=setting, mood=mood, notes=notes,
+            queued_title=queued_title,
+        )
     print(f"  Title: {story.get('title', '?')}")
     print(f"  Words: {len(story.get('story_script', '').split())}")
     return story
@@ -95,41 +113,99 @@ ELEVENLABS_VOICE_WISDOM = os.environ.get("ELEVENLABS_VOICE_WISDOM", "0ABJJI7ZYmW
 ELEVENLABS_VOICE_GIBRAN = os.environ.get("ELEVENLABS_VOICE_GIBRAN", "R68HwD2GzEdWfqYZP9FQ")
 
 
-def step_generate_voice(text, output_path, ts_path, channel_slug):
+def step_generate_voice(text, output_path, ts_path, channel_slug, philosopher=None):
     # channel_slug is required — it determines which ElevenLabs voice to use.
     # Wisdom → Burton; Gibran → Gibran voice. No default. This exact pattern
     # matches orchestrator.generate_voice for shorts. Chatterbox was the old
     # path; it clone-cast every story in James Burton's voice regardless of
     # channel (including Gibran), which was a channel-routing bug.
+    #
+    # philosopher is the row's value and is REQUIRED for na/aa — it selects the
+    # persona reference clip. It used to be absent from this signature entirely,
+    # with "The Voice of the Rooms" hard-coded at the call site below, so every
+    # NA/AA story rendered in that persona's voice no matter what was picked.
+    # Pass the value derived from --philosopher, never story["philosopher"]:
+    # laundering it back through the writer is how it got lost the first time.
     if not channel_slug:
         raise ValueError("step_generate_voice requires channel_slug — refusing to default")
+    if channel_slug in ("na", "aa") and not philosopher:
+        raise ValueError(
+            "step_generate_voice requires philosopher for na/aa — refusing to "
+            "default to an archetype the row didn't pick"
+        )
     if Path(output_path).exists() and Path(ts_path).exists():
         print(f"\n[2/6] Voice exists, loading: {Path(output_path).name}")
         with open(ts_path) as f:
             return json.load(f)
 
-    voice_id = ELEVENLABS_VOICE_GIBRAN if channel_slug == "gibran" else ELEVENLABS_VOICE_WISDOM
-    print(f"\n[2/6] Generating voice via ElevenLabs (channel={channel_slug}, voice={voice_id[:8]}...)")
     text = _sanitize_text(text)
 
-    from elevenlabs import ElevenLabs, VoiceSettings
-    client = ElevenLabs(api_key=ELEVENLABS_KEY)
-    audio = client.text_to_speech.convert(
-        voice_id=voice_id,
-        text=text,
-        model_id="eleven_multilingual_v2",
-        voice_settings=VoiceSettings(
-            stability=0.70,
-            similarity_boost=0.85,
-            style=0.25,
-            use_speaker_boost=True,
-        ),
-    )
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "wb") as f:
-        for chunk in audio:
-            f.write(chunk)
-    print(f"  Voice saved: {output_path}")
+    if channel_slug in ("na", "aa"):
+        # Recovery channels delegate to orchestrator.generate_voice for
+        # channel-aware Chatterbox routing (persona-keyed reference clips,
+        # per-channel atempo + reverb). _resolve_voice_config keys the CB
+        # reference off the philosopher we pass here — so it must be the row's
+        # value, straight from --philosopher.
+        print(f"\n[2/6] Generating voice via Chatterbox "
+              f"(channel={channel_slug}, persona={philosopher!r})...")
+        from orchestrator import generate_voice as _orch_generate_voice
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        wav_path = (output_path[:-4] + ".wav" if output_path.endswith(".mp3")
+                    else output_path + ".wav")
+        _orch_generate_voice(
+            text=text, output_path=wav_path,
+            channel_slug=channel_slug,
+            philosopher=philosopher,
+        )
+        # Downstream (Remotion convert step) expects MP3 at output_path.
+        if output_path.endswith(".mp3"):
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame",
+                 "-b:a", "192k", output_path],
+                check=True, capture_output=True,
+            )
+            print(f"  Voice saved: {output_path}")
+        else:
+            output_path = wav_path
+            print(f"  Voice saved: {output_path}")
+    else:
+        voice_id = ELEVENLABS_VOICE_GIBRAN if channel_slug == "gibran" else ELEVENLABS_VOICE_WISDOM
+        print(f"\n[2/6] Generating voice via ElevenLabs (channel={channel_slug}, voice={voice_id[:8]}...)")
+
+        from elevenlabs import ElevenLabs, VoiceSettings
+        client = ElevenLabs(api_key=ELEVENLABS_KEY)
+        audio = client.text_to_speech.convert(
+            voice_id=voice_id,
+            text=text,
+            model_id="eleven_multilingual_v2",
+            voice_settings=VoiceSettings(
+                stability=0.70,
+                similarity_boost=0.85,
+                style=0.25,
+                use_speaker_boost=True,
+            ),
+        )
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "wb") as f:
+            for chunk in audio:
+                f.write(chunk)
+
+        # Gibran voice is 10% faster — default ElevenLabs cadence sounds too slow
+        if channel_slug == "gibran":
+            tmp_path = output_path + ".orig.wav"
+            os.replace(output_path, tmp_path)
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", tmp_path, "-af", "atempo=1.1", output_path],
+                    check=True, capture_output=True,
+                )
+                os.remove(tmp_path)
+                print(f"  Voice saved (atempo=1.1): {output_path}")
+            except subprocess.CalledProcessError:
+                os.replace(tmp_path, output_path)
+                print(f"  Voice saved (atempo failed, kept original): {output_path}")
+        else:
+            print(f"  Voice saved: {output_path}")
 
     # Extract timestamps via Whisper
     print("  Extracting word timestamps via Whisper...")
@@ -172,7 +248,7 @@ def step_generate_voice(text, output_path, ts_path, channel_slug):
 # ---------------------------------------------------------------------------
 # Step 3: Split into time chunks + generate art prompts
 # ---------------------------------------------------------------------------
-def step_generate_art_prompts(story, timestamps, num_chunks=10):
+def step_generate_art_prompts(story, timestamps, num_chunks=10, channel_slug=None):
     print(f"\n[3/6] Splitting narration into {num_chunks} time chunks...")
     total_words = len(timestamps)
     target_chunk_size = total_words // num_chunks
@@ -201,7 +277,7 @@ def step_generate_art_prompts(story, timestamps, num_chunks=10):
 
     print("  Generating art prompts from chunk text via Claude...")
     from ai_writer import generate_art_prompts_from_chunks
-    prompts = generate_art_prompts_from_chunks(story, chunks)
+    prompts = generate_art_prompts_from_chunks(story, chunks, channel_slug=channel_slug)
 
     for i, p in enumerate(prompts):
         print(f"  Prompt {i+1}: {p[:60]}...")
@@ -393,10 +469,26 @@ def main():
         raise ValueError(f"Unknown channel {channel!r}; must be one of {list(OUTPUT_DIRS)}")
     output_dir = OUTPUT_DIRS[channel]
     output_dir.mkdir(parents=True, exist_ok=True)
-    music_style = PHILOSOPHER_MUSIC.get(philosopher, "stoic_classical")
-    first_name = philosopher.split()[0].lower()
+    # Recovery channels (NA/AA) share a single music folder — `recovery_calm` —
+    # rather than mapping per-persona. Wisdom/Gibran continue to map by
+    # philosopher.
+    if channel in ("na", "aa"):
+        music_style = "recovery_calm"
+    else:
+        music_style = PHILOSOPHER_MUSIC.get(philosopher, "stoic_classical")
+    # All three NA/AA archetypes start with "The", so first-name slugging
+    # collapsed every one of them to "the". Two recovery stories on the same
+    # date collided on every artifact path — and because step_generate_voice
+    # returns early when voice+timestamps already exist, the second story would
+    # ship the FIRST story's audio. Slug the whole persona on recovery
+    # channels. Wisdom/Gibran keep first-name slugs so their existing on-disk
+    # artifacts stay discoverable by the --reuse paths.
+    if channel in ("na", "aa"):
+        name_slug = "_".join(philosopher.lower().replace("-", " ").split())
+    else:
+        name_slug = philosopher.split()[0].lower()
     date_str = datetime.now().strftime('%Y-%m-%d')
-    prefix = f"{date_str}_story_{first_name}"
+    prefix = f"{date_str}_story_{name_slug}"
     output_name = prefix.replace("_", "-")
 
     print(f"\n{'='*60}")
@@ -430,13 +522,35 @@ def main():
         philosopher = story.get("philosopher", philosopher)
     else:
         story = step_generate_script(philosopher, args.theme, args.setting, args.mood, args.notes,
+                                     channel_slug=channel,
                                      queued_title=args.queued_title)
+        # Recovery channels: belt-and-suspenders compliance screen on the
+        # generated text before any TTS or art spend. Mirrors the screen
+        # in process_short (orchestrator.py:2333) and process_midform
+        # (orchestrator.py:2537). The recovery writer's prompt already
+        # enforces these rules — this catches anything that slips through.
+        if channel in ("na", "aa"):
+            from orchestrator import _compliance_screen_or_raise
+            _compliance_screen_or_raise({
+                "title": story.get("title", ""),
+                "story_script": story.get("story_script", ""),
+                "description": story.get("description", ""),
+            }, channel)
+        # Stamp the ROW's persona onto the artifact as provenance before it
+        # hits disk. This is the orchestration layer recording what it was
+        # told — NOT the writer redefining who speaks (that's the bug this
+        # replaced). generate_story_vertical.py reads philosopher back out of
+        # this file, so it has to see the row's pick, never a writer default.
+        story["philosopher"] = philosopher
         with open(script_path, "w", encoding="utf-8") as f:
             json.dump(story, f, indent=2, ensure_ascii=False)
 
     # Step 2: Voice
     if not args.reuse_all:
-        timestamps = step_generate_voice(story["story_script"], str(voice_path), str(ts_path), channel_slug=channel)
+        # philosopher here is the --philosopher-derived local, NOT
+        # story["philosopher"] — the row is authoritative for who speaks.
+        timestamps = step_generate_voice(story["story_script"], str(voice_path), str(ts_path),
+                                         channel_slug=channel, philosopher=philosopher)
     else:
         with open(ts_path) as f:
             timestamps = json.load(f)
@@ -444,12 +558,14 @@ def main():
 
     # Step 3: Art prompts
     if not args.reuse_all and not args.reuse_images:
-        chunks, prompts = step_generate_art_prompts(story, timestamps, args.num_scenes)
+        chunks, prompts = step_generate_art_prompts(story, timestamps, args.num_scenes,
+                                                    channel_slug=channel)
     elif art_paths_path.exists():
         print(f"\n[3/6] Reusing art prompts")
         prompts = None
     else:
-        chunks, prompts = step_generate_art_prompts(story, timestamps, args.num_scenes)
+        chunks, prompts = step_generate_art_prompts(story, timestamps, args.num_scenes,
+                                                    channel_slug=channel)
 
     # Step 4: Images
     if not args.reuse_all and not args.reuse_images:
@@ -1037,12 +1153,27 @@ def step_update_supabase(story, video_path, video_drive_url=None, thumbnail_driv
             payload["video_drive_url"] = video_drive_url
         if thumbnail_drive_url:
             payload["thumbnail_drive_url"] = thumbnail_drive_url
+        # Soft-delete guard: refuse to resurrect a row that was tombstoned
+        # MID-GENERATION. Without this, a row deleted at T+30s during a
+        # 10-min Remotion render would still flip to status=ready at
+        # T+10m and the dashboard would hide the resulting orphan video.
+        # Real incident 2026-04-20 — see orchestrator.update_supabase().
+        guard_headers = dict(headers)
+        guard_headers["Prefer"] = "return=representation"
         resp = requests.patch(
-            f"{supabase_url}/rest/v1/content?id=eq.{content_id}",
-            headers=headers, json=payload, timeout=30,
+            f"{supabase_url}/rest/v1/content?id=eq.{content_id}&deleted_at=is.null",
+            headers=guard_headers, json=payload, timeout=30,
         )
         if resp.status_code in (200, 204):
-            print(f"  Updated content [{content_id[:8]}]: {title}")
+            try:
+                body = resp.json() if resp.text else []
+            except Exception:
+                body = []
+            if isinstance(body, list) and len(body) == 0:
+                print(f"  WARN: row [{content_id[:8]}] was soft-deleted "
+                      f"mid-generation — PATCH no-op'd (zombie row prevention).")
+            else:
+                print(f"  Updated content [{content_id[:8]}]: {title}")
         else:
             raise RuntimeError(f"Supabase update failed: {resp.status_code} {resp.text[:200]}")
         return
@@ -1130,12 +1261,23 @@ def step_update_supabase(story, video_path, video_drive_url=None, thumbnail_driv
             payload["video_drive_url"] = video_drive_url
         if thumbnail_drive_url:
             payload["thumbnail_drive_url"] = thumbnail_drive_url
+        # Same soft-delete guard as the upsert branch above.
+        guard_headers = dict(headers)
+        guard_headers["Prefer"] = "return=representation"
         resp = requests.patch(
-            f"{supabase_url}/rest/v1/content?id=eq.{existing_id}",
-            headers=headers, json=payload,
+            f"{supabase_url}/rest/v1/content?id=eq.{existing_id}&deleted_at=is.null",
+            headers=guard_headers, json=payload,
         )
         if resp.status_code in (200, 204):
-            print(f"  Updated content: {title}")
+            try:
+                body = resp.json() if resp.text else []
+            except Exception:
+                body = []
+            if isinstance(body, list) and len(body) == 0:
+                print(f"  WARN: row [{existing_id[:8]}] was soft-deleted "
+                      f"mid-generation — PATCH no-op'd.")
+            else:
+                print(f"  Updated content: {title}")
         else:
             print(f"  Failed to update: {resp.text[:200]}")
 

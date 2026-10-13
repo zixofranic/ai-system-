@@ -338,7 +338,15 @@ def _resolve_voice_config(channel_slug: str, philosopher: str = None) -> dict:
         persona_refs = cb.get("persona_refs") or {}
         if philosopher in persona_refs:
             cb["ref"] = persona_refs[philosopher]
-        # else: keep cb["ref"] as the channel default
+        elif persona_refs:
+            # Falling back to the channel default used to be silent, which is
+            # how a mis-routed persona could ship in the wrong voice with no
+            # trace in the log. If this fires on na/aa, something upstream
+            # dropped or mangled the row's philosopher.
+            print(f"  [voice] WARNING: persona {philosopher!r} not in "
+                  f"persona_refs for channel={channel_slug!r}; falling back to "
+                  f"channel default ref={cb.get('ref')!r}. "
+                  f"Known personas: {sorted(persona_refs)}")
     return {"provider": provider, "chatterbox": cb}
 
 

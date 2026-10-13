@@ -54,26 +54,35 @@ SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 GRAPH_VERSION = os.environ.get("META_GRAPH_API_VERSION", "v21.0").strip()
 GRAPH_BASE = f"https://graph.facebook.com/{GRAPH_VERSION}"
 
-TIKTOK_CLIENT_KEY = os.environ.get("TIKTOK_SANDBOX_CLIENT_KEY") or os.environ.get("TIKTOK_CLIENT_KEY", "")
-TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_SANDBOX_CLIENT_SECRET") or os.environ.get("TIKTOK_CLIENT_SECRET", "")
+TIKTOK_CLIENT_KEY = os.environ.get("TIKTOK_CLIENT_KEY", "")
+TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
-    "Prefer": "return=representation",
+    # minimal: PATCHes return 204 instead of echoing the full content row
+    # back — the echo was most of this script's Supabase egress.
+    "Prefer": "return=minimal",
 }
 
 
 # --- Supabase helpers -----------------------------------------------------
 
 
+_channel_cache = {}
+
+
 def get_channel(channel_id):
-    r = requests.get(
-        f"{SUPABASE_URL}/rest/v1/channels?id=eq.{channel_id}&select=*",
-        headers=HEADERS, timeout=10,
-    ).json()
-    return r[0] if r else None
+    # Cached per run: was re-fetched for every row. Token refreshes mutate
+    # channel["settings"] in place, so the cached dict stays current.
+    if channel_id not in _channel_cache:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/channels?id=eq.{channel_id}&select=*",
+            headers=HEADERS, timeout=10,
+        ).json()
+        _channel_cache[channel_id] = r[0] if r else None
+    return _channel_cache[channel_id]
 
 
 def fetch_rows_with_published_content(single_id=None):
@@ -136,8 +145,12 @@ def persist_stats_bundle(content_id, stats_by_platform, dry_run=False):
     existing.update(normalized)
     params["platform_stats"] = existing
     params["platform_stats_fetched_at"] = now_iso
+    # Soft-delete guard — analytics writes to a tombstoned row are
+    # benign noise but pollute generation_params on a row the user
+    # already abandoned. Match the same guard used by orchestrator's
+    # update_supabase + generate_story_video's content writers.
     r = requests.patch(
-        f"{SUPABASE_URL}/rest/v1/content?id=eq.{content_id}",
+        f"{SUPABASE_URL}/rest/v1/content?id=eq.{content_id}&deleted_at=is.null",
         headers=HEADERS, json={"generation_params": params}, timeout=15,
     )
     if r.status_code not in (200, 204):
@@ -204,6 +217,14 @@ def _tiktok_access_token(channel):
     settings = channel.get("settings") or {}
     access = settings.get("tiktok_access_token")
     expiry = settings.get("tiktok_token_expiry", 0)
+    # Dashboard callback stores ISO-8601; the uploader stores epoch seconds.
+    # Accept both (mirrors tiktok_uploader.get_tiktok_token).
+    if isinstance(expiry, str):
+        try:
+            from datetime import datetime as _dt
+            expiry = _dt.fromisoformat(expiry.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            expiry = 0
     if access and isinstance(expiry, (int, float)) and expiry > time.time() + 300:
         return access
 
@@ -259,6 +280,157 @@ def fetch_tiktok_stats(channel, video_id):
         "comments": int(v.get("comment_count", 0) or 0),
         "shares": int(v.get("share_count", 0) or 0),
     }
+
+
+# --- TikTok inbox reconcile -------------------------------------------------
+
+# Inbox-mode uploads store the publish_id ("v_inbox_file~...") in
+# tiktok_video_id at upload time. That only means "sent to the user's
+# TikTok inbox" — NOT "posted". The user completes (or forgets) the draft
+# in the TikTok app; the in-app notification expires after ~24h — but the
+# status API keeps answering SEND_TO_USER_INBOX indefinitely (observed
+# 47h+ on 2026-08-14), so expiry must be detected by age, not by status.
+INBOX_ID_PREFIX = "v_inbox"
+
+# Past this age an unposted draft is treated as dead: the app-side
+# notification is long gone, and a draft the user DID post would have
+# flipped to PUBLISH_COMPLETE. Clearing frees one of the account's 5
+# pending-share slots so the daily batch can flag a replacement.
+INBOX_DRAFT_MAX_AGE_H = 48
+
+
+def _inbox_publish_age_hours(publish_id):
+    """Age of an inbox publish_id in hours, or None if unparseable.
+
+    TikTok publish/video ids are snowflakes: id >> 32 = unix seconds
+    (verified against known upload times on 2026-08-14). The numeric part
+    is everything after the last '.' in "v_inbox_file~v2.<id>".
+    """
+    try:
+        raw = int(str(publish_id).rsplit(".", 1)[-1])
+    except (ValueError, TypeError):
+        return None
+    ts = raw >> 32
+    if not (1.5e9 < ts < 4e9):  # sanity: 2017..2096
+        return None
+    return (time.time() - ts) / 3600.0
+
+
+def reconcile_inbox_share(channel, row, dry_run=False):
+    """Resolve an inbox-mode publish_id into its final state.
+
+      PUBLISH_COMPLETE -> swap the real public video id into
+                          tiktok_video_id (stats start working, dashboard
+                          shows truly-published)
+      FAILED           -> clear tiktok_video_id + surface the error so the
+                          row can be re-flagged from the dashboard (the
+                          draft expired unposted)
+      anything else    -> still sitting in the inbox; leave untouched
+
+    Returns the real video id when published, else None.
+    """
+    publish_id = row["tiktok_video_id"]
+    cid = row["id"]
+    token = _tiktok_access_token(channel)
+    if not token:
+        return None
+    r = requests.post(
+        "https://open.tiktokapis.com/v2/post/publish/status/fetch/",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json={"publish_id": publish_id},
+        timeout=30,
+    ).json()
+    data = r.get("data") or {}
+    status = data.get("status")
+
+    def _merged_params():
+        cur = requests.get(
+            f"{SUPABASE_URL}/rest/v1/content?id=eq.{cid}&select=generation_params",
+            headers=HEADERS, timeout=10,
+        ).json()
+        params = (cur[0].get("generation_params") or {}) if cur else {}
+        if isinstance(params, str):
+            params = json.loads(params)
+        return params
+
+    if status == "PUBLISH_COMPLETE":
+        real_ids = data.get("publicaly_available_post_id") or []
+        real_id = real_ids[0] if isinstance(real_ids, list) and real_ids else None
+        if not real_id:
+            return None
+        print(f"    [tiktok] inbox draft was POSTED -> video {real_id}")
+        if not dry_run:
+            params = _merged_params()
+            params["tiktok_inbox_publish_id"] = publish_id
+            params["tiktok_posted_confirmed_at"] = datetime.now(timezone.utc).isoformat()
+            params.pop("tiktok_last_error", None)
+            params.pop("tiktok_error_at", None)
+            requests.patch(
+                f"{SUPABASE_URL}/rest/v1/content?id=eq.{cid}&deleted_at=is.null",
+                headers=HEADERS,
+                json={"tiktok_video_id": str(real_id),
+                      "generation_params": params},
+                timeout=15,
+            )
+        return str(real_id)
+
+    if status in ("FAILED", "PUBLISH_FAILED"):
+        reason = data.get("fail_reason", "unknown")
+        print(f"    [tiktok] inbox draft dead ({reason}) — clearing so it can be re-sent")
+        if not dry_run:
+            params = _merged_params()
+            params["tiktok_inbox_publish_id"] = publish_id
+            params["tiktok_last_error"] = (
+                f"Inbox draft expired or failed ({reason}). "
+                "Re-flag TikTok publish to resend it."
+            )
+            params["tiktok_error_at"] = datetime.now(timezone.utc).isoformat()
+            requests.patch(
+                f"{SUPABASE_URL}/rest/v1/content?id=eq.{cid}&deleted_at=is.null",
+                headers=HEADERS,
+                json={"tiktok_video_id": None, "generation_params": params},
+                timeout=15,
+            )
+        return None
+
+    if status == "SEND_TO_USER_INBOX":
+        # Still "pending" per the API — but the API never expires these
+        # (see INBOX_DRAFT_MAX_AGE_H above), so old ones are dead drafts
+        # holding a slot. Only this exact status is age-cleared: API
+        # errors (bad token etc.) must never clear a row.
+        age_h = _inbox_publish_age_hours(publish_id)
+        if age_h is not None and age_h > INBOX_DRAFT_MAX_AGE_H:
+            print(f"    [tiktok] inbox draft expired unposted "
+                  f"({age_h:.0f}h old) — clearing so it can be re-flagged")
+            if not dry_run:
+                params = _merged_params()
+                params["tiktok_inbox_publish_id"] = publish_id
+                params["tiktok_last_error"] = (
+                    f"Inbox draft expired unposted after {age_h:.0f}h. "
+                    "Slot freed; the daily batch can re-send it."
+                )
+                params["tiktok_error_at"] = datetime.now(timezone.utc).isoformat()
+                requests.patch(
+                    f"{SUPABASE_URL}/rest/v1/content?id=eq.{cid}&deleted_at=is.null",
+                    headers=HEADERS,
+                    json={"tiktok_video_id": None, "generation_params": params},
+                    timeout=15,
+                )
+            return None
+        age_note = f", {age_h:.0f}h old" if age_h is not None else ""
+        print(f"    [tiktok] inbox draft still pending (status={status}{age_note})")
+        return None
+
+    err = r.get("error") or {}
+    if err.get("code") and err["code"] != "ok":
+        print(f"    [tiktok] inbox status fetch error: {err.get('code')} "
+              f"{str(err.get('message',''))[:80]}")
+    else:
+        print(f"    [tiktok] inbox draft still pending (status={status})")
+    return None
 
 
 # --- Facebook Page video --------------------------------------------------
@@ -364,7 +536,15 @@ def process_row(row, dry_run=False):
     if row.get("youtube_video_id"):
         tasks.append(("youtube", row["youtube_video_id"], fetch_youtube_stats))
     if row.get("tiktok_video_id"):
-        tasks.append(("tiktok", row["tiktok_video_id"], fetch_tiktok_stats))
+        tk_id = str(row["tiktok_video_id"])
+        if tk_id.startswith(INBOX_ID_PREFIX):
+            # Inbox publish_id, not a video id — resolve it first. Stats
+            # only fetchable once the user actually posted the draft.
+            real_id = reconcile_inbox_share(channel, row, dry_run=dry_run)
+            if real_id:
+                tasks.append(("tiktok", real_id, fetch_tiktok_stats))
+        else:
+            tasks.append(("tiktok", tk_id, fetch_tiktok_stats))
     fb = params.get("meta_fb_post_id")
     if fb:
         tasks.append(("facebook", fb, fetch_facebook_stats))

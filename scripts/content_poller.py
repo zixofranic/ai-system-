@@ -28,8 +28,10 @@ TIKTOK_UPLOADER = Path("C:/AI/system/scripts/tiktok_uploader.py")
 META_UPLOADER = Path("C:/AI/system/scripts/meta_uploader.py")
 ANALYTICS_FETCHER = Path("C:/AI/system/scripts/analytics_fetcher.py")
 
-# Analytics runs every Nth poller tick. Poller ticks every 5 min, so 6 = 30 min.
-ANALYTICS_EVERY_N_TICKS = 6
+# Analytics runs every Nth poller tick. Poller ticks every 5 min, so 72 = 6 h.
+# Was 6 (30 min) — that pass touched every published row 48x/day and blew
+# the Supabase free-tier egress + log-ingestion quotas (2026-10-13).
+ANALYTICS_EVERY_N_TICKS = 72
 _tick_count = 0
 COMFYUI_DIR = Path("C:/AI/system/ComfyUI")
 COMFYUI_PORT = 8188

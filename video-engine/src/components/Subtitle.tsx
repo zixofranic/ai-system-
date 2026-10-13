@@ -7,7 +7,10 @@ import {
 } from "remotion";
 import { Word } from "./Word";
 
-const Subtitle: React.FC<{ text: string }> = ({ text }) => {
+const Subtitle: React.FC<{ text: string; cinematic?: boolean }> = ({
+  text,
+  cinematic = false,
+}) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
 
@@ -23,10 +26,10 @@ const Subtitle: React.FC<{ text: string }> = ({ text }) => {
   return (
     <AbsoluteFill>
       <AbsoluteFill>
-        <Word stroke enterProgress={enter} text={text} />
+        <Word stroke enterProgress={enter} text={text} cinematic={cinematic} />
       </AbsoluteFill>
       <AbsoluteFill>
-        <Word enterProgress={enter} text={text} stroke={false} />
+        <Word enterProgress={enter} text={text} stroke={false} cinematic={cinematic} />
       </AbsoluteFill>
     </AbsoluteFill>
   );

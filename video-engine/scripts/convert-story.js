@@ -35,6 +35,30 @@ const musicPath = args.music || null;
 const outputName = args.output || "story";
 const format = args.format || "story"; // story | short | midform | longform
 
+// --- Channel + theme resolution (used by both captions and metadata) ---
+const { resolveChannelMeta } = require("./lib/channel-meta");
+const { channel: resolvedChannel, watermark: resolvedWatermark } =
+  resolveChannelMeta(script);
+
+// Theme — opt-in cinematic styling for the Gibran channel. AIVideo, Subtitle
+// and ProgressiveSubtitle all default to the original Hormozi look (white
+// BreeSerif uppercase + 20px black stroke) and only switch to cinematic
+// (EBGaramond italic, aged-paper, thin stroke, dark backplate, equalizer)
+// when this flag is true. Default per channel: cinematic for gibran, off
+// for everything else. Override via script.theme.cinematic.
+const channelDefaultsCinematic = resolvedChannel === "gibran";
+const cinematic = script.theme && typeof script.theme.cinematic === "boolean"
+  ? script.theme.cinematic
+  : channelDefaultsCinematic;
+
+// Captions: preserve case in cinematic mode (sentence-case EBGaramond reads
+// as prose). In default mode, force lowercase so Word.tsx's
+// textTransform:uppercase produces clean block-caps with no mid-sentence
+// outliers — matches the original Hormozi-style behavior.
+function caseFor(text) {
+  return cinematic ? text : text.toLowerCase();
+}
+
 // Scene-first path: when the Python pipeline emitted scene timings derived
 // from the storyboarded scenes, use those exact boundaries instead of
 // even-splitting the audio. Each image then aligns with the narration
@@ -253,16 +277,14 @@ const flushSentence = (sentenceWords) => {
       sentenceWords[sentenceWords.length - 1].end * 1000 + VOICE_START_MS,
     ) + SENTENCE_HOLD_MS;
 
+  // Case is theme-dependent: see caseFor() above.
   textElements.push({
     startMs: sentenceStartMs,
     endMs: sentenceEndMs,
-    text: sentenceWords
-      .map((w) => w.word)
-      .join(" ")
-      .toLowerCase(),
+    text: caseFor(sentenceWords.map((w) => w.word).join(" ")),
     position: "center",
     words: sentenceWords.map((w) => ({
-      word: w.word.toLowerCase(),
+      word: caseFor(w.word),
       startMs: Math.round(w.start * 1000 + VOICE_START_MS),
       endMs: Math.round(w.end * 1000 + VOICE_START_MS),
     })),
@@ -335,15 +357,28 @@ if (musicPath && fs.existsSync(musicPath)) {
 }
 
 // --- Timeline + metadata ---
+// Channel/theme already resolved at the top of the file (resolvedChannel,
+// resolvedWatermark, cinematic). 2026-04-19 fix: metadata must be inside
+// `timeline` (not just in the separate metadata.json) because AIVideo
+// reads `timeline.metadata?.*` at render time — watermark,
+// equalizerColor, theme, etc.
 const timeline = {
   shortTitle: script.title,
   elements,
   text: textElements,
   audio: audioElements,
+  metadata: {
+    format,
+    width: config.width,
+    height: config.height,
+    fps: config.fps,
+    philosopher: script.philosopher,
+    channel: resolvedChannel,
+    watermark: resolvedWatermark,
+    equalizerColor: script.equalizerColor,
+    theme: { cinematic },
+  },
 };
-
-const { resolveChannelMeta } = require("./lib/channel-meta");
-const { channel, watermark } = resolveChannelMeta(script);
 
 const metadata = {
   format,
@@ -351,9 +386,9 @@ const metadata = {
   height: config.height,
   fps: config.fps,
   philosopher: script.philosopher,
-  channel,
+  channel: resolvedChannel,
   closingAttribution: script.closing_attribution,
-  watermark,
+  watermark: resolvedWatermark,
 };
 
 fs.writeFileSync(

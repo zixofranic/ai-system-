@@ -1,6 +1,8 @@
 """
-Trend Scanner — Scans Google Trends, Reddit, and news for trending topics
+Trend Scanner — Scans Google Trends and news for trending topics
 related to philosophy, wisdom, self-improvement, and motivation.
+(Reddit source dropped 2026-07-20: it was blocked/rate-limited and
+returned 0 topics every week — not worth the auth complications.)
 
 Maps trends to philosophers and generates weekly content suggestions.
 
@@ -107,38 +109,6 @@ def scan_google_trends():
     return trends
 
 
-def scan_reddit():
-    """Fetch top posts from philosophy and self-improvement subreddits."""
-    print("  Scanning Reddit...")
-    trends = []
-    subreddits = [
-        "philosophy", "Stoicism", "selfimprovement", "getdisciplined",
-        "DecidingToBeBetter", "ZenHabits", "Meditation",
-    ]
-    for sub in subreddits:
-        try:
-            resp = requests.get(
-                f"https://www.reddit.com/r/{sub}/hot.json?limit=5",
-                timeout=10,
-                headers={"User-Agent": "WisdomBot/1.0"},
-            )
-            if resp.status_code == 200:
-                posts = resp.json().get("data", {}).get("children", [])
-                for post in posts:
-                    title = post["data"]["title"]
-                    score = post["data"]["score"]
-                    if score > 50:
-                        trends.append({
-                            "topic": title,
-                            "source": f"reddit/r/{sub}",
-                            "score": score,
-                        })
-        except Exception as e:
-            pass  # Reddit rate limits are common
-    print(f"    Found {len(trends)} Reddit topics")
-    return trends
-
-
 def scan_news():
     """Fetch philosophy/self-help related news headlines."""
     print("  Scanning news...")
@@ -212,8 +182,9 @@ def generate_weekly_plan_from_trends(themes):
     while len(trending) < 7:
         trending.append(evergreen[len(trending) % len(evergreen)])
 
-    channels = ["Deep Echoes of Wisdom", "Gibran Khalil Gibran"]
-    plan = generate_weekly_plan(trending, channels)
+    # Channels are fetched from Supabase by the planner itself (it reads
+    # every channel row + settings.frequency to compute per-channel quotas).
+    plan = generate_weekly_plan(trending_topics=trending)
     return plan
 
 
@@ -235,7 +206,6 @@ def main():
     # Step 1: Scan all sources
     all_trends = []
     all_trends.extend(scan_google_trends())
-    all_trends.extend(scan_reddit())
     all_trends.extend(scan_news())
     print(f"\n  Total raw trends: {len(all_trends)}")
 
