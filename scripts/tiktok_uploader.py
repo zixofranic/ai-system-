@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 
+from caption_tags import build_caption
+
 load_dotenv("C:/AI/.env")
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
@@ -78,7 +80,7 @@ def _get_content(content_id):
 
 
 def update_tiktok_state(content_id, tiktok_id=None, error=None,
-                        halt_auto_retry=False):
+                        halt_auto_retry=False, caption=None):
     """Merge TikTok upload result into the row. Parallel to update_content_meta
     in meta_uploader.
 
@@ -100,6 +102,10 @@ def update_tiktok_state(content_id, tiktok_id=None, error=None,
     params = current.get("generation_params") or {}
     if isinstance(params, str):
         params = json.loads(params)
+
+    if caption:
+        # Inbox mode can't send a caption, so the dashboard shows this to paste.
+        params["tiktok_caption"] = caption
 
     if error:
         params["tiktok_last_error"] = str(error)[:500]
@@ -411,69 +417,9 @@ def upload_to_tiktok(video_path, title, token, open_id):
         raise TikTokPostInitError(e, publish_id) from e
 
 
-CHANNEL_HASHTAGS = {
-    "wisdom": ["#Philosophy", "#Wisdom", "#Shorts", "#DeepEchoesOfWisdom"],
-    "gibran": ["#Gibran", "#KhalilGibran", "#TheProphet", "#Shorts"],
-    # Recovery channels share the same TikTok account. Copy must stay
-    # compliant: no NA/AA endorsement claims, recovery-community language.
-    # Mirrors meta_uploader.CHANNEL_HASHTAGS.
-    "na": ["#Recovery", "#OneDayAtATime", "#SoberLife", "#RecoveryCommunity"],
-    "aa": ["#Recovery", "#EasyDoesIt", "#SoberLife", "#RecoveryCommunity"],
-}
-
-
 def build_tiktok_caption(content, channel_slug="wisdom"):
-    """Build TikTok caption from title, description, and tags."""
-    title = content.get("title", "")
-    description = content.get("description", "")
-    params = content.get("generation_params") or {}
-    if isinstance(params, str):
-        params = json.loads(params)
-    tags = params.get("tags", [])
-
-    # Build caption: title + key hashtags (TikTok limit ~2200 chars)
-    caption = title
-    if description:
-        # Take first 1-2 sentences of description
-        first_line = description.split("\n")[0][:200]
-        caption = f"{title}\n\n{first_line}"
-
-    # Add hashtags from AI-generated tags. Same cleaning rule as
-    # meta_uploader: hashtags only render when alphanumeric (underscore
-    # allowed) — strip `/`, `.`, `'`, dashes, spaces, etc.
-    # Dedup is case-insensitive: hashtags are case-insensitive on TikTok,
-    # so "#Recovery" and "#recovery" are the same tag shown twice.
-    hashtags = []
-    seen = set()
-
-    def _add(ht, front=False):
-        if ht.lower() in seen:
-            return
-        seen.add(ht.lower())
-        hashtags.insert(0, ht) if front else hashtags.append(ht)
-
-    if tags:
-        for tag in tags[:8]:
-            cleaned = "".join(ch for ch in tag if ch.isalnum() or ch == "_")
-            if cleaned:
-                _add("#" + cleaned)
-
-    # Add channel-specific hashtags. No wisdom fallback — a channel
-    # missing from the map gets no channel tags rather than another
-    # channel's (never leak #Philosophy onto the recovery account).
-    for ht in CHANNEL_HASHTAGS.get(channel_slug, []):
-        _add(ht)
-
-    philosopher = content.get("philosopher", "")
-    if philosopher:
-        # Same alnum cleaning — NA/AA personas contain dashes
-        # ("The Old-Timer") which break hashtag rendering.
-        cleaned = "".join(ch for ch in philosopher if ch.isalnum() or ch == "_")
-        if cleaned:
-            _add("#" + cleaned, front=True)
-
-    caption += "\n\n" + " ".join(hashtags)
-    return caption[:2200]
+    """Build the TikTok caption. Rules live in caption_tags (shared with Meta)."""
+    return build_caption(content, channel_slug)
 
 
 def process_content(content, dry_run=False):
@@ -547,7 +493,7 @@ def process_content(content, dry_run=False):
         caption = build_tiktok_caption(content, channel_slug=channel_slug)
         tiktok_id = upload_to_tiktok(video_path, caption, token, open_id)
 
-        update_tiktok_state(content_id, tiktok_id=tiktok_id)
+        update_tiktok_state(content_id, tiktok_id=tiktok_id, caption=caption)
         print(f"    TikTok published: {tiktok_id}")
 
         # Clean up temp file

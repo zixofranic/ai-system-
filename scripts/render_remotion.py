@@ -376,6 +376,32 @@ def _build_multipart_timeline(
     }
 
 
+def _run_remotion_render(render_cmd: str, cwd: str, attempts: int = 2):
+    """Run the Remotion CLI, retrying once.
+
+    The poller's console output isn't saved, so Remotion's own error goes in
+    the exception, which ends up on the row's rejection_reason. On 2026-11-04
+    two renders failed with only an exit code, and the same renders then passed.
+    """
+    error_tail = ""
+    for attempt in range(1, attempts + 1):
+        result = subprocess.run(
+            render_cmd,
+            cwd=cwd,
+            timeout=600,
+            shell=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode == 0:
+            return
+        error_tail = (result.stderr or result.stdout or "")[-800:].strip()
+        print(f"  Remotion render failed (attempt {attempt}/{attempts}): {error_tail}")
+    raise RuntimeError(f"Remotion render failed after {attempts} attempts: {error_tail}")
+
+
 def render_remotion_video(
     quotes: list,
     philosopher: str,
@@ -510,13 +536,7 @@ def render_remotion_video(
     render_cmd = f'"{remotion_cmd}" render {project_id} "{output_path}" --codec=h264 --crf=24'
     print(f"  Rendering: {render_cmd}")
 
-    subprocess.run(
-        render_cmd,
-        cwd=str(VIDEO_ENGINE),
-        check=True,
-        timeout=600,
-        shell=True,
-    )
+    _run_remotion_render(render_cmd, str(VIDEO_ENGINE))
 
     # --- Post-process: append FELLOWS end card for na/aa shorts ---
     _maybe_append_fellows_endcard(output_path, channel_slug)

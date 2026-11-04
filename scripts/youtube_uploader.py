@@ -325,7 +325,9 @@ def _build_video_metadata(content: dict) -> dict:
     (set by ai_writer.generate_youtube_metadata during orchestration).
     Tags come from generation_params.tags.
     """
-    title = content.get("title") or ""
+    from caption_tags import clean_title, filter_platform_tags
+    channel_slug = (content.get("channels") or {}).get("slug", "")
+    title = clean_title(content.get("title") or "", channel_slug)
     description = content.get("description") or ""
     philosopher = content.get("philosopher", "")
     topic = content.get("topic", "")
@@ -342,7 +344,7 @@ def _build_video_metadata(content: dict) -> dict:
     if not tags:
         tags = [philosopher, topic, "philosophy", "wisdom", "quotes"]
     # YouTube allows max 500 chars total for tags; trim defensively
-    tags = [str(t)[:100] for t in tags[:20]]
+    tags = [str(t)[:100] for t in filter_platform_tags(tags, channel_slug)[:20]]
 
     return {
         "snippet": {

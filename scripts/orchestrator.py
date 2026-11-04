@@ -1053,6 +1053,23 @@ def update_supabase(content_id: str, updates: dict, *,
         url += "&deleted_at=is.null"
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
     headers = _supabase_headers()
+    # A render's final write replaces generation_params whole. The daily email
+    # and /publish find rows by auto_queued_on, so it has to survive that write.
+    if isinstance(updates.get("generation_params"), dict):
+        try:
+            stamp_resp = requests.get(
+                f"{SUPABASE_URL}/rest/v1/content?id=eq.{content_id}"
+                "&select=auto_queued_on:generation_params->>auto_queued_on,"
+                "auto_queued_at:generation_params->>auto_queued_at",
+                headers=headers, timeout=30)
+            stamp_resp.raise_for_status()
+            stamps = stamp_resp.json()
+            for key, value in (stamps[0] if stamps else {}).items():
+                if value:
+                    updates["generation_params"].setdefault(key, value)
+        except requests.RequestException as e:
+            print(f"  [{content_id[:8]}] WARN: couldn't read the auto-queue stamp, "
+                  f"so this video may not appear in the daily email: {e}")
     headers["Prefer"] = "return=representation"
     resp = requests.patch(url, headers=headers, json=updates, timeout=30)
     resp.raise_for_status()
@@ -3192,6 +3209,10 @@ def _batch_process(items: list):
                 "is_short_cut": is_short_cut,
                 "sc_hook": sc_hook,
                 "sc_max_ms": sc_max_ms,
+                # Keep the stash from above. Replacing this entry without it
+                # sent every NA/AA short to the philosopher metadata prompt,
+                # which put "philosophy" in recovery titles and tags.
+                "recovery_script": results.get(cid, {}).get("recovery_script"),
             }
             print(f"  [{cid[:8]}] {len(quotes)} quote(s) ready")
 

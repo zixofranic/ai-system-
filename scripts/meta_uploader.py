@@ -48,6 +48,8 @@ import requests
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
+from caption_tags import build_caption as shared_build_caption
+
 load_dotenv("C:/AI/.env")
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
@@ -133,17 +135,6 @@ def set_publish_in_flight(content_id, side):
         )
     except Exception as e:
         print(f"    WARN: failed to set {side} in-flight marker: {e}")
-
-
-# Per-channel caption / hashtag config. Keep copy compliant with the memory
-# rules: no NA/AA endorsement claims, no trademarked logos, no identifiable
-# member names. Recovery-community language, not medical.
-CHANNEL_HASHTAGS = {
-    "wisdom": ["#Philosophy", "#Wisdom", "#DeepEchoesOfWisdom"],
-    "gibran": ["#Gibran", "#KhalilGibran", "#TheProphet"],
-    "na": ["#Recovery", "#OneDayAtATime", "#SoberLife", "#RecoveryCommunity"],
-    "aa": ["#Recovery", "#EasyDoesIt", "#SoberLife", "#RecoveryCommunity"],
-}
 
 
 # --- Supabase helpers -----------------------------------------------------
@@ -281,42 +272,8 @@ def resolve_public_thumbnail_url(content):
 
 
 def build_caption(content, channel_slug):
-    title = content.get("title", "")
-    description = content.get("description", "") or ""
-    params = content.get("generation_params") or {}
-    if isinstance(params, str):
-        params = json.loads(params)
-    tags = params.get("tags", []) or []
-
-    caption = title
-    if description:
-        first_line = description.split("\n")[0][:200]
-        caption = f"{title}\n\n{first_line}"
-
-    # Dedup is case-insensitive — hashtags are case-insensitive on IG/FB,
-    # so "#Recovery" (channel tag) and "#recovery" (AI tag) are the same
-    # tag rendered twice.
-    hashtags = []
-    seen = set()
-    for tag in tags[:8]:
-        # IG/FB hashtags only render when alphanumeric (underscore allowed).
-        # Strip everything else — `/`, `.`, `'`, `@`, `#`, dashes, spaces — so
-        # `"AI/ML"` → `#AIML` rather than the broken `#AI/ML`.
-        cleaned = "".join(ch for ch in tag if ch.isalnum() or ch == "_")
-        if not cleaned:
-            continue
-        ht = "#" + cleaned
-        if ht.lower() not in seen:
-            seen.add(ht.lower())
-            hashtags.append(ht)
-    for ht in CHANNEL_HASHTAGS.get(channel_slug, []):
-        if ht.lower() not in seen:
-            seen.add(ht.lower())
-            hashtags.append(ht)
-
-    if hashtags:
-        caption += "\n\n" + " ".join(hashtags)
-    return caption[:2200]
+    """Rules live in caption_tags (shared with TikTok)."""
+    return shared_build_caption(content, channel_slug)
 
 
 # --- Facebook Page video upload ------------------------------------------

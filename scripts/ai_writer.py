@@ -390,25 +390,278 @@ def _is_near_duplicate(title: str, history_titles: list,
     return False
 
 
-def _filter_repeat_topics(plan: list, history_by_channel: dict) -> tuple:
-    """Split a generated plan into (kept, rejected) by subject freshness.
+# Channels that post to the same account share one subject memory. NA and AA
+# both publish to "Recovery Fellows", so a subject used by either is used.
+_SHARED_MEMORY_GROUPS = {"na": "recovery", "aa": "recovery"}
 
-    Each item is checked against its own channel's history AND against
-    already-kept items from the same plan, so a week can't contain the
-    same subject twice either.
+# Formula phrasing found in the 2026-11-04 audit ("sponsees who" was in 162 of
+# the last 473 topics). Most specific first; a match rejects the topic.
+_STOCK_TOPIC_PHRASES = (
+    "sponsees who", "long enough to", "has finally", "has quietly",
+    "never once", "has spent", "have spent", "spent years", "spent their",
+    "the man who", "the person who", "the woman who", "the one who",
+    "what i tell", "what i have noticed", "what i have learned",
+    "what i have seen", "what i have watched", "what the room holds",
+    "what the prophet says", "what sand and foam says", "the midform on",
+    "the emperor's private note",
+)
+
+_TOPIC_STYLE_RULES = (
+    "TOPIC STYLE (a topic breaking these is rejected automatically):\n"
+    "- Under 14 words. Name one concrete situation, object, or moment, not a "
+    "psychological portrait of a type of person.\n"
+    "- Never use these phrases: "
+    + "; ".join(f'"{p}"' for p in _STOCK_TOPIC_PHRASES) + ".\n"
+    "- No two topics for the same channel may start with the same three "
+    "words. Vary how topics open.\n"
+    "- Channels na and aa share one audience. A subject used by either "
+    "counts as used by both, this week and in the used list.\n"
+    "- Never name a day of the week in a topic.\n"
+    "- Never invent a story, character, passage, or saying and attribute it "
+    "to a real book or thinker. Name the author's real theme and bring your "
+    "own concrete image to it, for example 'Gibran on grief and the empty "
+    "chair at the table', not 'the empty chair in Sand and Foam' or 'why "
+    "Gibran said'."
+)
+
+_WEEKDAY_RE = re.compile(
+    r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.I)
+_PLAN_DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+              "Saturday", "Sunday")
+
+
+def _memory_group(slug: str) -> str:
+    return _SHARED_MEMORY_GROUPS.get(slug, slug)
+
+
+def _stock_phrase_in(topic: str):
+    """Return the first banned stock phrase in `topic`, or None."""
+    lowered = (topic or "").lower()
+    for phrase in _STOCK_TOPIC_PHRASES:
+        if phrase in lowered:
+            return phrase
+    weekday = _WEEKDAY_RE.search(lowered)
+    return weekday.group(1) if weekday else None
+
+
+def _topic_opener(topic: str, philosopher: str = "") -> str:
+    """First three words after any leading "<philosopher> on the", so a
+    philosopher's second video this week doesn't count as a repeated opening."""
+    words = re.sub(r"[^a-z0-9\s]", " ", (topic or "").lower()).split()
+    name_words = set(re.sub(r"[^a-z0-9\s]", " ", (philosopher or "").lower()).split())
+    if words and words[0] in name_words:
+        while words and words[0] in name_words:
+            words.pop(0)
+        while words and words[0] in ("on", "the", "a", "an"):
+            words.pop(0)
+    return " ".join(words[:3])
+
+
+def _missing_daily_short_slots(plan: list, specs: list) -> list:
+    """Slots for days Claude skipped on a channel with a daily short quota.
+    Without these, the daily job would have no topic for that day."""
+    slots = []
+    for spec in specs:
+        if spec.get("quotas", {}).get("short", 0) < 7:
+            continue
+        covered = {it.get("day") for it in plan
+                   if it.get("channel") == spec["slug"] and it.get("format") == "short"}
+        personas = spec.get("personas") or [""]
+        for index, day in enumerate(_PLAN_DAYS):
+            if day not in covered:
+                slots.append({"day": day, "channel": spec["slug"], "format": "short",
+                              "philosopher": personas[index % len(personas)]})
+    return slots
+
+
+def _merge_shared_history(history_by_channel: dict) -> dict:
+    """Give channels in the same memory group one combined history, keeping
+    the newest titles from each channel near the front."""
+    grouped = {}
+    for slug, titles in history_by_channel.items():
+        grouped.setdefault(_memory_group(slug), []).append(list(titles))
+    merged_by_group = {}
+    for group, lists in grouped.items():
+        merged, seen = [], set()
+        for position in range(max((len(l) for l in lists), default=0)):
+            for titles in lists:
+                if position < len(titles):
+                    title = titles[position]
+                    if str(title).lower() not in seen:
+                        seen.add(str(title).lower())
+                        merged.append(title)
+        merged_by_group[group] = merged
+    return {slug: list(merged_by_group[_memory_group(slug)])
+            for slug in history_by_channel}
+
+
+def _history_for_prompt(history_by_channel: dict) -> dict:
+    """One prompt section per memory group, so shared titles aren't listed twice."""
+    members = {}
+    for slug in history_by_channel:
+        members.setdefault(_memory_group(slug), []).append(slug)
+    return {" + ".join(slugs): history_by_channel[slugs[0]]
+            for slugs in members.values()}
+
+
+def _filter_repeat_topics(plan: list, history_by_channel: dict,
+                          already_kept: list = None) -> tuple:
+    """Split a generated plan into (kept, rejected).
+
+    A topic is rejected if it repeats its channel's history, repeats another
+    topic for the same audience in this plan, uses stock phrasing, or opens
+    with the same three words as another topic for that audience.
     """
     kept, rejected = [], []
-    kept_this_plan = {}
+    kept_this_plan, openers = {}, {}
+
+    def _remember(item):
+        group = _memory_group(item.get("channel", "wisdom"))
+        kept_this_plan.setdefault(group, []).append(item.get("topic", ""))
+        openers.setdefault(group, set()).add(
+            _topic_opener(item.get("topic", ""), item.get("philosopher", "")))
+
+    for item in already_kept or []:
+        _remember(item)
     for item in plan:
         ch = item.get("channel", "wisdom")
+        group = _memory_group(ch)
         topic = item.get("topic", "")
-        history = list(history_by_channel.get(ch, [])) + kept_this_plan.get(ch, [])
-        if topic and _is_near_duplicate(topic, history):
+        history = list(history_by_channel.get(ch, [])) + kept_this_plan.get(group, [])
+        if topic and (_is_near_duplicate(topic, history)
+                      or _stock_phrase_in(topic)
+                      or _topic_opener(topic, item.get("philosopher", ""))
+                      in openers.get(group, set())):
             rejected.append(item)
         else:
             kept.append(item)
-            kept_this_plan.setdefault(ch, []).append(topic)
+            _remember(item)
     return kept, rejected
+
+
+def _judge_repeat_subjects(items: list, history_by_channel: dict,
+                           already_kept: list = None) -> set:
+    """Ask Claude which items repeat a subject by MEANING, which word overlap
+    misses ("giving advice in meetings" vs "offering guidance in the rooms").
+    Returns the flagged indexes into `items`. Any failure returns an empty
+    set: the word-based gate has already run, so planning continues."""
+    if not items:
+        return set()
+    candidates = "\n".join(
+        f'{i}. [{_memory_group(it.get("channel", "wisdom"))}] {it.get("topic", "")}'
+        for i, it in enumerate(items))
+    used = {_memory_group(slug): list(titles)
+            for slug, titles in history_by_channel.items()}
+    for it in already_kept or []:
+        used.setdefault(_memory_group(it.get("channel", "wisdom")), []).append(
+            it.get("topic", ""))
+    used_text = "\n\n".join(
+        f"[{group}]\n" + "\n".join(f"- {str(t)[:110]}" for t in titles[:300])
+        for group, titles in used.items() if titles)
+    system = ("You judge whether content topics repeat earlier subjects. "
+              "Output valid JSON only.")
+    user = f"""Decide which CANDIDATE topics cover the same subject as a USED topic in the same [group], or as a lower-numbered candidate in the same [group].
+
+Same subject means a viewer would feel they had already seen this idea: the same situation or the same lesson, even in different words. Sharing a broad theme such as grief or meetings is not enough.
+
+CANDIDATES:
+{candidates}
+
+USED:
+{used_text or "(none)"}
+
+Return JSON: {{"repeats": [<candidate numbers that are repeats>]}}"""
+    try:
+        result = _parse_json_response(
+            _call_anthropic(SONNET_MODEL, system, user, max_tokens=1500))
+        raw = result.get("repeats", []) if isinstance(result, dict) else []
+    except Exception as e:
+        print(f"[planner] WARNING: meaning check failed, using word check only: {e}")
+        return set()
+    return {i for i in raw
+            if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(items)}
+
+
+def _split_judged(items: list, history_by_channel: dict,
+                  already_kept: list = None) -> tuple:
+    flagged = _judge_repeat_subjects(items, history_by_channel, already_kept)
+    return ([it for i, it in enumerate(items) if i not in flagged],
+            [it for i, it in enumerate(items) if i in flagged])
+
+
+def _slot_key(item: dict) -> tuple:
+    return (item.get("day"), item.get("channel"), item.get("format"))
+
+
+def _apply_freshness_gate(plan: list, history_by_channel: dict,
+                          max_passes: int = 3, missing_slots: list = None) -> list:
+    """Run the word, phrasing and meaning checks, then refill rejected slots.
+    Slots still unfilled after `max_passes` are dropped: a thinner week beats
+    publishing a repeat, and the daily job handles a day with no topic."""
+    kept, rejected = _filter_repeat_topics(plan, history_by_channel)
+    kept, judged = _split_judged(kept, history_by_channel)
+    rejected.extend(judged)
+    if rejected:
+        print(f"[planner] freshness gate rejected {len(rejected)} topic(s):")
+        for it in rejected:
+            print(f"    [{it.get('channel')}] {it.get('topic')}")
+    if missing_slots:
+        print(f"[planner] filling {len(missing_slots)} day(s) the plan skipped")
+        rejected.extend(missing_slots)
+
+    for _ in range(max_passes):
+        if not rejected:
+            break
+        fresh = _regenerate_rejected_topics(rejected, history_by_channel, kept)
+        fresh, _judged = _split_judged(fresh, history_by_channel, kept)
+        open_slots = [_slot_key(it) for it in rejected]
+        accepted = []
+        for it in fresh:
+            if _slot_key(it) in open_slots:
+                open_slots.remove(_slot_key(it))
+                accepted.append(it)
+        kept.extend(accepted)
+        still_open = []
+        for it in rejected:
+            if _slot_key(it) in open_slots:
+                open_slots.remove(_slot_key(it))
+                still_open.append(it)
+        rejected = still_open
+
+    for it in rejected:
+        print(f"[planner] WARNING: slot left empty after {max_passes} passes: "
+              f"{it.get('day')} [{it.get('channel')}] {it.get('format')}")
+    return kept
+
+
+def _channels_with_plan_for_week(slug_to_id: dict, week_start) -> set:
+    """Slugs that already have planner rows for the week, so a second planner
+    or a re-run can't double a channel's quota (each of NA and AA was getting
+    14 shorts a week against a quota of 7). A failed check returns nothing:
+    an outage shouldn't cost the whole week's plan."""
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return set()
+    week_end = week_start + timedelta(days=7)
+    planned = set()
+    for slug, channel_id in slug_to_id.items():
+        try:
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/content",
+                headers=_supabase_headers(),
+                params=[("select", "id"), ("channel_id", f"eq.{channel_id}"),
+                        ("is_system_generated", "is.true"),
+                        ("scheduled_at", f"gte.{week_start.isoformat()}"),
+                        ("scheduled_at", f"lt.{week_end.isoformat()}"),
+                        ("limit", "1")],
+                timeout=15,
+            )
+            r.raise_for_status()
+            if r.json():
+                planned.add(slug)
+        except Exception as e:
+            print(f"[planner] WARNING: could not check existing plan for "
+                  f"'{slug}': {e}")
+    return planned
 
 
 def _build_recent_topics_block(history_by_channel: dict, cap: int = 80) -> str:
@@ -430,8 +683,8 @@ def _build_recent_topics_block(history_by_channel: dict, cap: int = 80) -> str:
     )
 
 
-def _fetch_recent_topic_history(slug_to_id: dict, weeks: int = 8,
-                                cap: int = 80) -> dict:
+def _fetch_recent_topic_history(slug_to_id: dict, weeks: int = 26,
+                                cap: int = 300) -> dict:
     """Fetch each channel's recent subjects: plan_topics titles plus content
     titles (the latter catches custom/manual items that bypass the planner).
     Returns {slug: [titles newest-first]}. Failures degrade to empty lists —
@@ -474,8 +727,8 @@ def _fetch_recent_topic_history(slug_to_id: dict, weeks: int = 8,
 def _regenerate_rejected_topics(rejected: list, history_by_channel: dict,
                                 kept_items: list) -> list:
     """One replacement pass for plan items rejected by the freshness gate.
-    Replacements are re-checked; anything still colliding is dropped —
-    a slightly thinner week beats publishing a repeat."""
+    Replacements get the same checks; anything still colliding is left out,
+    and _apply_freshness_gate decides whether to try that slot again."""
     slots = [{"day": it.get("day"), "channel": it.get("channel"),
               "philosopher": it.get("philosopher"), "format": it.get("format")}
              for it in rejected]
@@ -488,11 +741,13 @@ def _regenerate_rejected_topics(rejected: list, history_by_channel: dict,
         "You are a content strategist. You replace content topics that were "
         "rejected for repeating recently-used subjects. Output valid JSON only."
     )
-    user = f"""These plan slots were rejected because their topics repeated a recently-used subject. Provide a REPLACEMENT topic and hook for each slot — a genuinely different subject, not a rewording of anything in the used list.
+    user = f"""These plan slots were rejected because their topics repeated a recently-used subject or used stock phrasing. Provide a REPLACEMENT topic and hook for each slot — a genuinely different subject, not a rewording of anything in the used list.
 
 SLOTS:
 {json.dumps(slots, indent=2)}
-{_build_recent_topics_block(avoid)}
+
+{_TOPIC_STYLE_RULES}
+{_build_recent_topics_block(_history_for_prompt(avoid), cap=150)}
 
 Return a JSON array of exactly {len(slots)} objects with keys: day, channel, philosopher, topic, format, hook."""
     try:
@@ -502,7 +757,7 @@ Return a JSON array of exactly {len(slots)} objects with keys: day, channel, phi
         print(f"[planner] WARNING: replacement topic generation failed: {e}")
         return []
     items = result if isinstance(result, list) else []
-    fresh, still_dupes = _filter_repeat_topics(items, avoid)
+    fresh, still_dupes = _filter_repeat_topics(items, avoid, already_kept=kept_items)
     for it in still_dupes:
         print(f"[planner] dropping still-repeated replacement: "
               f"[{it.get('channel')}] {it.get('topic')}")
@@ -564,6 +819,16 @@ def generate_weekly_plan(trending_topics: list = None,
         print("[planner] No channels with non-zero quotas — nothing to plan")
         return []
 
+    # One plan per channel per week, whichever script or re-run asks.
+    already_planned = _channels_with_plan_for_week(
+        {s["slug"]: s["id"] for s in specs}, _monday_of_next_week())
+    if already_planned:
+        print(f"[planner] Skipping channels already planned for next week: "
+              f"{sorted(already_planned)}")
+        specs = [s for s in specs if s["slug"] not in already_planned]
+        if not specs:
+            return []
+
     # Build Claude prompt dynamically
     channel_blocks = []
     total_items = 0
@@ -587,8 +852,9 @@ def generate_weekly_plan(trending_topics: list = None,
 
     # Planner memory: what each channel already covered recently.
     slug_to_id = {s["slug"]: s["id"] for s in specs}
-    topic_history = _fetch_recent_topic_history(slug_to_id)
-    recent_block = _build_recent_topics_block(topic_history)
+    topic_history = _merge_shared_history(_fetch_recent_topic_history(slug_to_id))
+    recent_block = _build_recent_topics_block(
+        _history_for_prompt(topic_history), cap=150)
 
     # Slug-keyed channel kind hint (for tone rules)
     recovery_slugs = {s["slug"] for s in specs if s["slug"] in ("na", "aa")}
@@ -641,7 +907,9 @@ RULES:
 - Topics must be specific and concrete, not generic. Prefer a narrow angle over broad buckets ("on life", "on courage").
 - Every topic must be a NEW subject for its channel. The recently-used list below is off-limits, including rewordings.
 - Output ONLY formats listed in each channel's quota above.
-{tone_rules_text}{recent_block}
+{tone_rules_text}
+
+{_TOPIC_STYLE_RULES}{recent_block}
 
 Return a JSON array of exactly {total_items} objects:
 [
@@ -659,17 +927,11 @@ Return a JSON array of exactly {total_items} objects:
     result = _parse_json_response(response)
     plan = result if isinstance(result, list) else result.get("plan", result.get("raw", []))
 
-    # Freshness gate: reject subjects that repeat recent history (or each
-    # other), try one replacement pass, drop anything still colliding.
+    # Freshness gate: word, phrasing and meaning checks, with replacements.
     if isinstance(plan, list) and plan:
-        kept, rejected = _filter_repeat_topics(plan, topic_history)
-        if rejected:
-            print(f"[planner] freshness gate rejected {len(rejected)} repeat "
-                  f"topic(s):")
-            for it in rejected:
-                print(f"    [{it.get('channel')}] {it.get('topic')}")
-            kept.extend(_regenerate_rejected_topics(rejected, topic_history, kept))
-        plan = kept
+        plan = _apply_freshness_gate(
+            plan, topic_history,
+            missing_slots=_missing_daily_short_slots(plan, specs))
 
     if isinstance(plan, list) and plan and SUPABASE_URL and SUPABASE_SERVICE_KEY:
         try:

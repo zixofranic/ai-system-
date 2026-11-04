@@ -238,6 +238,41 @@ ai_writer — all low-frequency), and dashboard pages selecting `*` from
 always `return=minimal` on PATCH unless the response is used, and keep
 any new periodic job at ≥ hourly cadence.
 
+## Daily Automation (2026-11-04)
+
+Ziad only presses Publish. Everything before that runs on this machine.
+
+| Time | Task | What it does |
+|---|---|---|
+| Sun 4:00 PM | `AI_WeeklyPlanner` | Plans the week. Skips channels already planned that week |
+| 5:00 AM | `AI_DailyAutoGen` | `daily_autogen.py`: queues today's short per channel from the current week's plan only |
+| 8:30 AM | `AI_DailyPublishDigest` | `daily_publish_digest.py`: emails what's ready, with a link to `/publish` |
+| 9:00 AM | `AI_TikTokDailyBatch` | Sends backlog to TikTok, leaving `RESERVED_FOR_TODAY` slots free |
+
+`PlanNAAA Weekly` is disabled: it planned NA and AA a second time every week.
+
+- **Nothing here publishes.** Publishing only happens from the Publish button
+  (`publishEverywhere` in the dashboard), and never on a page load, so opening
+  an email link can't post anything.
+- **`auto_queued_on` marks a row as automatic.** The digest and `/publish` both
+  filter on it. A render's final write replaces `generation_params` whole, so
+  `update_supabase` carries the stamp across. Don't remove that.
+- **`daily_autogen.py` stops at `MAX_UNREVIEWED` (7) per channel**, so unreviewed
+  videos can't pile up if Ziad is away.
+- **Email goes through the Gmail connector**, to `ziadfeg@gmail.com` by default.
+  The connector only exists inside Claude, so the digest starts `claude -p` with
+  that one tool. It depends on Claude Code staying logged in on this machine. If
+  it fails, the task exits 1 and the log says `EMAIL FAILED`. Optional in
+  `C:\AI\.env`: `PUBLISH_EMAIL_TO`, `PUBLISH_PAGE_URL`.
+- **Captions and hashtags live in one place:** `caption_tags.py`, used by the
+  TikTok, Meta and YouTube uploaders. At most 5 tags, from curated per-channel
+  lists. Recovery tags never name NA or AA programs.
+- **Planner freshness:** `_apply_freshness_gate` in `ai_writer.py` checks subjects
+  against 26 weeks of history by word overlap, then by meaning with Claude. NA and
+  AA share one history. Stock phrases and weekday names are rejected.
+- Logs: `scripts\logs\daily_autogen_*.log`, `daily_publish_digest_*.log`.
+  Tests: `test_content_automation.py`, `test_plan_dedup.py`.
+
 ## Known Issues (as of 2026-07-27)
 
 - **Longform (15-25 min) not implemented** — routes to midform as fallback
