@@ -39,6 +39,8 @@ from urllib.parse import urlparse, parse_qs
 import requests
 from dotenv import load_dotenv
 
+from publish_claim import claim_upload, release_upload
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -527,7 +529,26 @@ def _youtube_resumable_upload(
 # ---------------------------------------------------------------------------
 # Core upload function
 # ---------------------------------------------------------------------------
-def upload_to_youtube(content_id: str, dry_run: bool = False) -> str:
+def upload_to_youtube(content_id: str, dry_run: bool = False):
+    """Upload one video, once. Returns its URL, or None if another uploader has
+    it or it's already on YouTube. See publish_claim for why this is needed."""
+    if dry_run:
+        return _upload_to_youtube(content_id, dry_run=True)
+    token = claim_upload(content_id, "youtube")
+    if not token:
+        return None
+    try:
+        # Re-read after winning: another uploader may have finished just before.
+        existing = _fetch_content(content_id).get("youtube_video_id")
+        if existing:
+            print(f"  [{content_id[:8]}] Already on YouTube ({existing}), skipping")
+            return None
+        return _upload_to_youtube(content_id)
+    finally:
+        release_upload(content_id, "youtube", token)
+
+
+def _upload_to_youtube(content_id: str, dry_run: bool = False) -> str:
     """
     Upload the video for a specific content item to its YouTube channel.
 

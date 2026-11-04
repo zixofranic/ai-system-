@@ -273,6 +273,26 @@ Ziad only presses Publish. Everything before that runs on this machine.
 - Logs: `scripts\logs\daily_autogen_*.log`, `daily_publish_digest_*.log`.
   Tests: `test_content_automation.py`, `test_plan_dedup.py`.
 
+## One Upload Per Video (2026-11-04) — READ BEFORE TOUCHING AN UPLOADER
+
+For months two `content_poller.py` processes ran at once: the elevated
+`AI_ContentPoller` task and `WisdomPipeline.bat` in the Startup folder. The
+poller's lock read "access denied" on the elevated PID as "dead", so both ran and
+both uploaded every approved video. That left 129 extra copies on YouTube and
+similar doubles on Facebook and Instagram.
+
+- **Only the Startup folder window should run the poller.** `AI_ContentPoller`
+  should stay disabled. It shares a session with ComfyUI and Chatterbox, so it
+  needs Ziad's Windows user logged in.
+- **Every uploader must win `publish_claim.claim_upload` before posting**, then
+  re-read the row, and release only after saving the platform's id. Checking
+  whether a video was posted isn't enough, because two processes can both check
+  first. Tested with 8 processes racing on a real row: one winner every round.
+- **A claim left by a crash is never taken over.** After 2 hours the row is halted
+  with `<platform>_last_error`, because the upload may have gone through.
+- **`Get-CimInstance` hides elevated command lines from a normal shell.** A blank
+  `python.exe` in session 0 can be a poller.
+
 ## Known Issues (as of 2026-07-27)
 
 - **Longform (15-25 min) not implemented** — routes to midform as fallback

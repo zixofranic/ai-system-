@@ -48,6 +48,8 @@ import requests
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
+from publish_claim import claim_upload, release_upload
+
 from caption_tags import build_caption as shared_build_caption
 
 load_dotenv("C:/AI/.env")
@@ -391,6 +393,24 @@ def publish_to_instagram_reel(ig_user_id, page_token, video_url, caption, cover_
 
 
 def process_content(content, dry_run=False, fb_only=False, ig_only=False):
+    """Post one video, once. See publish_claim for why the claim is needed."""
+    if dry_run:
+        return _process_content(content, dry_run=True, fb_only=fb_only, ig_only=ig_only)
+    token = claim_upload(content["id"], "meta")
+    if not token:
+        return False
+    try:
+        # Re-read after winning: the post ids that stop a repost are on the row,
+        # and this list may be minutes old.
+        fresh = get_content(content["id"])
+        if not fresh:
+            return False
+        return _process_content(fresh, fb_only=fb_only, ig_only=ig_only)
+    finally:
+        release_upload(content["id"], "meta", token)
+
+
+def _process_content(content, dry_run=False, fb_only=False, ig_only=False):
     content_id = content["id"]
     title = content.get("title", "")
     print(f"\n  [{content_id[:8]}] {title[:60]}")

@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 
+from publish_claim import claim_upload, release_upload
+
 from caption_tags import build_caption
 
 load_dotenv("C:/AI/.env")
@@ -423,6 +425,19 @@ def build_tiktok_caption(content, channel_slug="wisdom"):
 
 
 def process_content(content, dry_run=False):
+    """Send one video, once. See publish_claim for why the claim is needed."""
+    if dry_run:
+        return _process_content(content, dry_run=True)
+    token = claim_upload(content["id"], "tiktok")
+    if not token:
+        return False
+    try:
+        return _process_content(content)
+    finally:
+        release_upload(content["id"], "tiktok", token)
+
+
+def _process_content(content, dry_run=False):
     """Process a single content item for TikTok upload."""
     content_id = content["id"]
     title = content.get("title", "")

@@ -160,6 +160,166 @@ def test_ai_tags_cannot_assign_the_wrong_school():
 
 
 # ---------------------------------------------------------------------------
+# One upload per video per platform
+# ---------------------------------------------------------------------------
+
+class _FakeClaimDb:
+    """Applies the claim's conditional writes like Postgres does, one at a time."""
+
+    def __init__(self, params=None):
+        self.params = dict(params or {})
+
+    def get(self, url, headers=None, params=None, timeout=None):
+        return _ClaimResponse([{"generation_params": dict(self.params)}])
+
+    def patch(self, url, headers=None, params=None, json=None, timeout=None):
+        for name, condition in (params or {}).items():
+            if "->>" not in name:
+                continue
+            current = self.params.get(name.split("->>")[1])
+            matches = current is None if condition == "is.null" else condition == f"eq.{current}"
+            if not matches:
+                return _ClaimResponse([])
+        self.params = dict(json["generation_params"])
+        return _ClaimResponse([{"id": "x"}])
+
+
+class _ClaimResponse:
+    def __init__(self, body):
+        self.body = body
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self.body
+
+
+def _with_claim_db(db, action):
+    import publish_claim
+    original = publish_claim.requests.get, publish_claim.requests.patch
+    publish_claim.requests.get, publish_claim.requests.patch = db.get, db.patch
+    try:
+        return action(publish_claim)
+    finally:
+        publish_claim.requests.get, publish_claim.requests.patch = original
+
+
+def test_second_claim_on_a_row_loses():
+    db = _FakeClaimDb()
+    def action(pc):
+        return pc.claim_upload("x", "youtube"), pc.claim_upload("x", "youtube")
+    first, second = _with_claim_db(db, action)
+    assert first and second is None
+
+
+def test_claim_lost_in_the_race_after_reading_empty():
+    """Both read "free", then one writes first. This is the case that doubled uploads."""
+    db = _FakeClaimDb()
+    real_get = db.get
+    def get_then_rival_claims(*args, **kwargs):
+        response = real_get(*args, **kwargs)
+        db.params["youtube_upload_claim"] = "2026-11-04T00:00:00+00:00|rival"
+        return response
+    db.get = get_then_rival_claims
+    assert _with_claim_db(db, lambda pc: pc.claim_upload("x", "youtube")) is None
+    assert db.params["youtube_upload_claim"].endswith("|rival")
+
+
+def test_claims_are_per_platform_and_reusable_after_release():
+    db = _FakeClaimDb({"keep": 1})
+    def action(pc):
+        youtube = pc.claim_upload("x", "youtube")
+        tiktok = pc.claim_upload("x", "tiktok")
+        pc.release_upload("x", "youtube", youtube)
+        return youtube, tiktok, pc.claim_upload("x", "youtube")
+    youtube, tiktok, again = _with_claim_db(db, action)
+    assert youtube and tiktok and again and db.params["keep"] == 1
+
+
+def test_release_only_clears_our_own_claim():
+    db = _FakeClaimDb({"youtube_upload_claim": "2026-11-04T00:00:00+00:00|rival"})
+    _with_claim_db(db, lambda pc: pc.release_upload("x", "youtube", "mine"))
+    assert db.params["youtube_upload_claim"].endswith("|rival")
+
+
+def test_abandoned_claim_halts_instead_of_uploading_again():
+    db = _FakeClaimDb({"youtube_upload_claim": "2020-01-01T00:00:00+00:00|dead",
+                       "youtube_publish_requested": True})
+    assert _with_claim_db(db, lambda pc: pc.claim_upload("x", "youtube")) is None
+    assert db.params["youtube_retry_halted"] is True
+    assert "youtube_publish_requested" not in db.params
+    assert "youtube_upload_claim" not in db.params
+    assert "posted twice" in db.params["youtube_last_error"]
+
+
+def test_claim_error_counts_as_losing():
+    import publish_claim
+    def boom(*args, **kwargs):
+        raise publish_claim.requests.ConnectionError("down")
+    original = publish_claim.requests.get
+    publish_claim.requests.get = boom
+    try:
+        assert publish_claim.claim_upload("x", "meta") is None
+    finally:
+        publish_claim.requests.get = original
+
+
+def _uploader_skips_without_claim(module, entry, inner, *args):
+    """Without a claim the entry point must never reach the code that posts."""
+    calls = []
+    original = module.claim_upload, getattr(module, inner)
+    module.claim_upload = lambda *a: None
+    setattr(module, inner, lambda *a, **k: calls.append(a))
+    try:
+        getattr(module, entry)(*args)
+    finally:
+        module.claim_upload = original[0]
+        setattr(module, inner, original[1])
+    return calls
+
+
+def test_every_uploader_needs_the_claim():
+    import meta_uploader
+    import tiktok_uploader
+    import youtube_uploader
+    assert not _uploader_skips_without_claim(
+        youtube_uploader, "upload_to_youtube", "_upload_to_youtube", "x")
+    assert not _uploader_skips_without_claim(
+        tiktok_uploader, "process_content", "_process_content", {"id": "x"})
+    assert not _uploader_skips_without_claim(
+        meta_uploader, "process_content", "_process_content", {"id": "x"})
+
+
+def test_lock_treats_an_elevated_process_as_alive():
+    """Access denied on another poller's PID means it exists. Reading that as dead
+    is how two pollers ended up running."""
+    import ast
+    import ctypes
+    import os
+    import sys
+    source = open("content_poller.py", encoding="utf-8").read()
+    node = next(n for n in ast.parse(source).body
+                if isinstance(n, ast.FunctionDef) and n.name == "_pid_is_alive")
+    namespace = {"sys": sys, "os": os}
+    exec(compile(ast.Module([node], []), "content_poller", "exec"), namespace)
+    alive = namespace["_pid_is_alive"]
+    assert alive(os.getpid()) is True
+    assert alive(999999) is False
+
+    class DeniedKernel:
+        def OpenProcess(self, *args):
+            return 0
+    original_dll, original_error = ctypes.WinDLL, ctypes.get_last_error
+    ctypes.WinDLL = lambda *a, **k: DeniedKernel()
+    ctypes.get_last_error = lambda: 5
+    try:
+        assert alive(12345) is True
+    finally:
+        ctypes.WinDLL, ctypes.get_last_error = original_dll, original_error
+
+
+# ---------------------------------------------------------------------------
 # Remotion: one retry, and the real error reaches the row
 # ---------------------------------------------------------------------------
 

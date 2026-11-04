@@ -613,6 +613,35 @@ def run_youtube_uploader():
 PID_FILE = Path("C:/AI/system/scripts/content_poller.pid")
 
 
+def _pid_is_alive(pid: int) -> bool:
+    """True if the process exists, including one we aren't allowed to inspect.
+
+    A normal process gets "access denied" when opening an elevated one. Treating
+    that as dead let two pollers run from 2026-10-28, one from the elevated task
+    and one from the Startup folder, and every YouTube upload went out twice.
+    """
+    if sys.platform != "win32":
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+    import ctypes
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    ERROR_ACCESS_DENIED = 5
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+    exit_code = ctypes.c_ulong()
+    kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+    kernel32.CloseHandle(handle)
+    return exit_code.value == STILL_ACTIVE
+
+
 def _acquire_singleton_lock():
     # Refuse to start if another content_poller is already running.
     # Two parallel pollers caused duplicate YouTube uploads (both cycles
@@ -626,26 +655,7 @@ def _acquire_singleton_lock():
         except (ValueError, OSError):
             prev_pid = None
         if prev_pid and prev_pid != os.getpid():
-            alive = False
-            try:
-                # On Windows, signal 0 doesn't exist; use psutil-style check
-                # via os.kill with signal 0 (raises OSError if dead).
-                if sys.platform == "win32":
-                    import ctypes
-                    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-                    h = ctypes.windll.kernel32.OpenProcess(
-                        PROCESS_QUERY_LIMITED_INFORMATION, False, prev_pid
-                    )
-                    if h:
-                        exit_code = ctypes.c_ulong()
-                        ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(exit_code))
-                        ctypes.windll.kernel32.CloseHandle(h)
-                        alive = exit_code.value == 259  # STILL_ACTIVE
-                else:
-                    os.kill(prev_pid, 0)
-                    alive = True
-            except (OSError, PermissionError):
-                alive = False
+            alive = _pid_is_alive(prev_pid)
             if alive:
                 print(f"FATAL: another content_poller is already running (PID {prev_pid}).")
                 print(f"       Stop it first, or delete {PID_FILE} if you're sure it's dead.")
