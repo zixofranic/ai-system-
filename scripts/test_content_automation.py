@@ -498,6 +498,12 @@ def test_email_session_gets_only_the_gmail_send_tool():
     assert digest.DEFAULT_EMAIL_TO in seen["input"]
 
 
+def test_digest_publish_link_is_readable_without_styles():
+    _, _, html = build_digest([_digest_row()], "2026-11-04", "https://x.test/publish")
+    assert "color:#fff" not in html and "background" not in html
+    assert ">https://x.test/publish</a>" in html
+
+
 def test_digest_reports_failures_and_unfinished_work():
     subject, text, _ = build_digest(
         [_digest_row(status="failed", rejection_reason="voice step: 500"),

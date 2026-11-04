@@ -68,10 +68,13 @@ def build_digest(rows: list, today: str, page_url: str) -> tuple:
     lines, parts = [], []
     if ready:
         lines += [f"{len(ready)} video(s) ready. Review and publish here:", page_url, ""]
+        # Dark text, no background: the delivered email lost its button background,
+        # which left white text on white. This stays readable if styles are removed.
+        escaped_url = html_lib.escape(page_url)
         parts.append(
-            f'<p><a href="{html_lib.escape(page_url)}" style="display:inline-block;'
-            'padding:12px 20px;background:#059669;color:#fff;border-radius:8px;'
-            f'text-decoration:none;font-weight:600">Review and publish {len(ready)}</a></p>')
+            f'<p style="font-size:18px"><a href="{escaped_url}" style="color:#047857;'
+            f'font-weight:700">Review and publish {len(ready)} video(s)</a></p>'
+            f'<p><a href="{escaped_url}">{escaped_url}</a></p>')
     elif not rows:
         lines.append("No videos were made for review today.")
         parts.append("<p>No videos were made for review today.</p>")
