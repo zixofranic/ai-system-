@@ -247,7 +247,7 @@ Ziad only presses Publish. Everything before that runs on this machine.
 | Sun 4:00 PM | `AI_WeeklyPlanner` | Plans the week. Skips channels already planned that week |
 | 5:00 AM | `AI_DailyAutoGen` | `daily_autogen.py`: queues today's short per channel from the current week's plan only |
 | 8:30 AM | `AI_DailyPublishDigest` | `daily_publish_digest.py`: emails what's ready, with a link to `/publish` |
-| 9:00 AM | `AI_TikTokDailyBatch` | Sends backlog to TikTok, leaving `RESERVED_FOR_TODAY` slots free |
+| 9:00 AM | `AI_TikTokDailyBatch` | **Disabled 2026-11-04.** Sent old backlog to TikTok, which used up the 5 draft slots |
 
 `PlanNAAA Weekly` is disabled: it planned NA and AA a second time every week.
 
@@ -272,6 +272,20 @@ Ziad only presses Publish. Everything before that runs on this machine.
   AA share one history. Stock phrases and weekday names are rejected.
 - Logs: `scripts\logs\daily_autogen_*.log`, `daily_publish_digest_*.log`.
   Tests: `test_content_automation.py`, `test_plan_dedup.py`.
+
+## TikTok Drafts (2026-11-05)
+
+- **Captions must be pasted by hand.** Inbox drafts can't carry our caption. Posts
+  show `#RecoveryComrades` unless it's replaced. That tag isn't in our scripts, so
+  TikTok probably adds it from the app name (not confirmed).
+- **`analytics_fetcher.py` reads every row in pages.** A flat limit of 500 used to
+  skip rows, which got no stats and stayed listed as drafts after being posted.
+- **Dead drafts clear after 48 hours**, for both `SEND_TO_USER_INBOX` and
+  `PROCESSING_UPLOAD`. The status API never reports them as expired.
+- **`/publish` lists drafts sent in the last 30 hours**, newest first. A posted
+  draft can stay listed until the next analytics run, up to 6 hours.
+- **The app lacks TikTok's read scopes**, so there are no TikTok view counts and
+  posted captions and bios can only be read from the public profile page.
 
 ## One Upload Per Video (2026-11-04) — READ BEFORE TOUCHING AN UPLOADER
 

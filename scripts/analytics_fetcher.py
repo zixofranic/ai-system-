@@ -85,6 +85,9 @@ def get_channel(channel_id):
     return _channel_cache[channel_id]
 
 
+ROW_PAGE_SIZE = 500
+
+
 def fetch_rows_with_published_content(single_id=None):
     """Rows that have at least one platform ID set."""
     if single_id:
@@ -99,17 +102,29 @@ def fetch_rows_with_published_content(single_id=None):
         "generation_params->meta_fb_post_id.not.is.null,"
         "generation_params->meta_ig_post_id.not.is.null)"
     )
-    return requests.get(
-        f"{SUPABASE_URL}/rest/v1/content",
-        headers=HEADERS,
-        params={
-            "select": "id,title,channel_id,youtube_video_id,tiktok_video_id,generation_params",
-            "or": or_clause,
-            "deleted_at": "is.null",
-            "limit": "500",
-        },
-        timeout=30,
-    ).json()
+    # Paged and ordered: a flat limit dropped whichever rows the database
+    # returned last, so some videos never got stats or a draft reconcile.
+    rows, offset = [], 0
+    while True:
+        page = requests.get(
+            f"{SUPABASE_URL}/rest/v1/content",
+            headers=HEADERS,
+            params={
+                "select": "id,title,channel_id,youtube_video_id,tiktok_video_id,generation_params",
+                "or": or_clause,
+                "deleted_at": "is.null",
+                "order": "created_at.desc,id.asc",
+                "limit": str(ROW_PAGE_SIZE),
+                "offset": str(offset),
+            },
+            timeout=30,
+        )
+        page.raise_for_status()
+        batch = page.json()
+        rows.extend(batch)
+        if len(batch) < ROW_PAGE_SIZE:
+            return rows
+        offset += ROW_PAGE_SIZE
 
 
 def persist_stats_bundle(content_id, stats_by_platform, dry_run=False):
@@ -396,11 +411,12 @@ def reconcile_inbox_share(channel, row, dry_run=False):
             )
         return None
 
-    if status == "SEND_TO_USER_INBOX":
+    if status in ("SEND_TO_USER_INBOX", "PROCESSING_UPLOAD"):
         # Still "pending" per the API — but the API never expires these
         # (see INBOX_DRAFT_MAX_AGE_H above), so old ones are dead drafts
-        # holding a slot. Only this exact status is age-cleared: API
-        # errors (bad token etc.) must never clear a row.
+        # holding a slot. Uploads can also stay PROCESSING_UPLOAD forever
+        # (observed 12 days on 2026-11-05). Only these exact statuses are
+        # age-cleared: API errors (bad token etc.) must never clear a row.
         age_h = _inbox_publish_age_hours(publish_id)
         if age_h is not None and age_h > INBOX_DRAFT_MAX_AGE_H:
             print(f"    [tiktok] inbox draft expired unposted "
@@ -409,8 +425,8 @@ def reconcile_inbox_share(channel, row, dry_run=False):
                 params = _merged_params()
                 params["tiktok_inbox_publish_id"] = publish_id
                 params["tiktok_last_error"] = (
-                    f"Inbox draft expired unposted after {age_h:.0f}h. "
-                    "Slot freed; the daily batch can re-send it."
+                    f"Inbox draft expired unposted after {age_h:.0f}h "
+                    f"(last status {status}). Re-flag TikTok publish to resend it."
                 )
                 params["tiktok_error_at"] = datetime.now(timezone.utc).isoformat()
                 requests.patch(
